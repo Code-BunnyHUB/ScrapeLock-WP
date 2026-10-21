@@ -1,0 +1,71 @@
+# ScrapeLock CI: on every push to main and every pull request it checks PHP syntax (7.4 and 8.3),
+# runs the WordPress Coding Standards from phpcs.xml.dist and builds the zip to check it holds only the plugin.
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: PHP ${{ matrix.php }} syntax (php -l)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.3']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+      - name: Syntax check
+        run: find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 php -l > /dev/null
+
+  phpcs:
+    name: WordPress Coding Standards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          tools: composer
+      - name: Install WPCS and PHPCompatibilityWP
+        run: |
+          composer global config --no-interaction allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+          composer global require --no-interaction --no-progress wp-coding-standards/wpcs:"^3.1" phpcompatibility/phpcompatibility-wp:"^2.1"
+      - name: Run phpcs
+        run: |
+          bin="$(composer global config bin-dir --absolute --quiet)"
+          "$bin/phpcs" -q --report=full
+
+  zip:
+    name: Build scrapelock.zip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and check the zip (only the plugin, see .gitattributes)
+        run: |
+          git archive --format=zip --prefix=scrapelock/ -o scrapelock.zip HEAD
+          unzip -l scrapelock.zip
+          unzip -l scrapelock.zip | grep -q 'scrapelock/scrapelock.php' || { echo "::error::scrapelock.php missing from the zip"; exit 1; }
+          if unzip -l scrapelock.zip | grep -qE 'tests/|docs/|wporg-assets/|\.github/|\.po$|\.mo$'; then
+            echo "::error::Files that are not part of the plugin are in the zip"; exit 1
+          fi
