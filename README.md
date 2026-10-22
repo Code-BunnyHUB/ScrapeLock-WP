@@ -4,7 +4,7 @@
 
 # ScrapeLock – Content & AI Bot Protection
 
-Server-side anti-scraping and site lockdown for WordPress and WooCommerce, by **CodeBunny**.
+Server-side anti-scraping and site lockdown for WordPress and WooCommerce, by **CodeBunny**. Formerly **Content Protect**.
 
 Most content protection plugins disable right click in the browser. Scrapers and AI crawlers never use a browser, so they are not affected. ScrapeLock works on the server, where automated copying actually happens, and keeps real visitors, customers and search engines unaffected. **Lockdown** adds what no firewall does: once you are logged in, nothing can be changed until you unlock the site with a code from your phone.
 
@@ -16,7 +16,8 @@ Most content protection plugins disable right click in the browser. Scrapers and
 ### Bots and limits
 - **Real search engines vs. fakes.** Googlebot, Bingbot, Applebot and Yandex are verified against their official IP lists and with reverse + forward DNS. Real crawlers are never limited; impostors get a 403.
 - **AI training vs. AI search.** Training crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended, Bytespider…) are blocked; AI search assistants (OAI-SearchBot, ChatGPT-User, PerplexityBot…) can be allowed with one option and verified against their official IP lists.
-- **Per-IP limits** for pages, searches, REST / GraphQL, 404s and sitemaps (IPv6: per /64), with temporary blocks for repeat offenders and an invisible bot trap.
+- **Per-IP limits** for pages, searches, REST / GraphQL, 404s and sitemaps (IPv6: per /64, optionally also per /56), with temporary blocks for repeat offenders and an invisible bot trap.
+- **Stricter limit for data centers:** visitors from the published addresses of AWS, Google Cloud, Oracle Cloud, DigitalOcean and Akamai / Linode (where scrapers run, people rarely browse) get a lower page limit.
 - **Human check** without a captcha: a light proof-of-work after the first real interaction; visitors without it get a stricter limit, not a block.
 - **Headless and fake browsers** that reveal themselves in their headers are blocked.
 - **Country rules** from Cloudflare's or Bunny CDN's country header, or the free DB-IP Lite database.
@@ -26,6 +27,8 @@ Most content protection plugins disable right click in the browser. Scrapers and
 - **Text hidden from the REST API, WPGraphQL and full-text RSS** for visitors.
 - **Private XML feeds** (price comparison sites, Google Merchant, ERP) protected with a token in a header or the URL. Only the token hash is stored; rotation with a grace period.
 - Optional: hide the REST API index from visitors, turn off pingbacks, and see which REST routes anyone can call.
+- **Hide versions** of WordPress, PHP and the plugins (generator tags, `?ver=`, X-Powered-By, and readme / changelog files through the server rules), so scanners cannot match them against lists of known vulnerabilities.
+- Optional: excerpts instead of the full text on lists of articles (home, categories, search), and blocking of web archives (Wayback Machine).
 - Usernames hidden from `?author=N`, the users endpoint, the sitemap and oEmbed.
 
 ### On the page and images
@@ -36,7 +39,7 @@ Most content protection plugins disable right click in the browser. Scrapers and
 ### Server and CDN
 - Ready-made **Nginx, Apache and Cloudflare rules** generated for your own site and settings.
 - Optional **early check** (mu-plugin) and **pre-cache check** (one line in `wp-config.php`) so pages served from a page cache are protected too.
-- **Emergency Mode:** one click for stricter limits during an attack, for 1 hour to 3 days.
+- **Emergency Mode:** one click for stricter limits during an attack, for 1 hour to 3 days, or **automatically** when the whole site gets five times its usual pages per minute for 3 minutes in a row (a scraper spread over many IPs).
 
 ### Lockdown
 Freeze the whole site with one click and a code from your authenticator app (Google Authenticator, Microsoft Authenticator, Authy…).
@@ -47,6 +50,8 @@ Freeze the whole site with one click and a code from your authenticator app (Goo
 - TOTP (RFC 6238), each code accepted once even under concurrent requests (database compare-and-set), the secret encrypted with libsodium using the keys in `wp-config.php`, ten one-time recovery codes stored only as hashes, wrong-code limits and an email on every unlock.
 - Temporary unlock (15 minutes to 2 hours, then it locks again by itself). A clear "The site is locked" page with an unlock button for administrators.
 - No WP-CLI command and no ability can unlock it.
+- **File integrity:** a fingerprint of every PHP, `.htaccess` and `.user.ini` file is taken when you lock and checked every hour; WordPress and the plugins from WordPress.org are also compared with their official checksums. A new or changed file (usually a backdoor uploaded through a vulnerable plugin) is emailed to you; optional quarantine deactivates the plugin and renames new PHP files in the uploads folder.
+- **No PHP in the uploads folder:** `.htaccess` for Apache and a rule for Nginx.
 
 Lockdown complements a firewall such as Wordfence: the firewall and two-factor login guard the door, Lockdown guards what happens after someone is inside, for example with a stolen session cookie.
 
@@ -66,6 +71,8 @@ Forms, cart, checkout, the WooCommerce Store API and payment webhooks are never 
 | Block log: summary by reason, top IPs and User-Agents | Bots and limits: AI crawlers, fake search engines, bot trap |
 | ![Feeds and API](wporg-assets/screenshot-3.png) | ![Server rules](wporg-assets/screenshot-4.png) |
 | Token-protected feeds, text hidden from REST, GraphQL and RSS | Cloudflare, Nginx and Apache rules for your own site |
+| ![Presets and Emergency Mode](wporg-assets/screenshot-5.png) | ![Dashboard widget](wporg-assets/screenshot-6.png) |
+| Presets, Emergency Mode and on-page protection | Dashboard widget: protection status and the last 24 hours |
 
 ## Installation
 
@@ -73,32 +80,37 @@ Forms, cart, checkout, the WooCommerce Store API and payment webhooks are never 
 2. In WordPress: **Plugins → Add New → Upload Plugin**, choose the zip, then **Activate**.
 3. Open **Settings → ScrapeLock**, pick a preset (Balanced is a good start) and check the **Real visitor IP** setting if your site is behind a CDN.
 
-A detailed guide is in [`docs/user-guide.md`](docs/user-guide.md).
+The full description for the WordPress.org directory is in [`readme.txt`](readme.txt). A user guide in Greek is in [`docs/user-guide-el.md`](docs/user-guide-el.md).
+
+### Upgrading from Content Protect
+
+Deactivate Content Protect (folder `content-protect`) and activate ScrapeLock. Settings, feed tokens and the block log are kept. If you pasted the old Apache rules, replace the `# BEGIN Content Protect` block with the new `# BEGIN ScrapeLock` block from the "Server rules" tab.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | `scrapelock.php`, `includes/`, `assets/`, `languages/`, `uninstall.php`, `readme.txt` | The plugin, as installed in `wp-content/plugins/scrapelock/` |
-| `docs/` | User guide |
+| `tests/` | Tests on a real WordPress (HTTP, watermark, admin, Lockdown, WP-CLI) and in Chromium |
+| `translations/` | Greek translation (`.po`), for translate.wordpress.org |
 | `wporg-assets/` | Icon, banner and screenshots for the WordPress.org page |
+| `docs/` | User guide in Greek |
 | `CHANGELOG.md` | Changes per version |
 
-GitHub's **Download ZIP** and `git archive` contain only the plugin (`.gitattributes` leaves the rest out).
+GitHub's **Download ZIP** and `git archive` contain only the plugin (`.gitattributes` leaves the rest out), but the folder from Download ZIP must be renamed to `scrapelock` before installing.
 
-## Development
+## Build and checks
 
 ```sh
-# Build the plugin zip
-git archive --format=zip --prefix=scrapelock/ -o scrapelock.zip HEAD
-
-# WordPress Coding Standards (phpcs.xml.dist)
-phpcs
+mkdir -p dist
+git archive --format=zip --prefix=scrapelock/ -o dist/scrapelock-$(sed -n 's/^ \* Version: *//p' scrapelock.php).zip HEAD
+phpcs                 # WordPress Coding Standards (phpcs.xml.dist)
+cd tests && WP_DIR=/path/to/wordpress BASE=http://127.0.0.1:8099 ./run-all.sh
 ```
 
-Every pull request runs `php -l`, WordPress Coding Standards and builds the zip (`.github/workflows/ci.yml`). To publish a release: **Actions → Release → Run workflow** on `main`; it checks that `Version`, `PNCP_VERSION` and `Stable tag` match, builds the zip and attaches it to the release.
+The same checks run on GitHub Actions for every pull request (`.github/workflows/ci.yml`). The plugin zip is kept as an artifact for 3 days, then deleted automatically. The plugin passes the official WordPress Plugin Check with no errors and no warnings.
 
-The plugin passes the official WordPress Plugin Check with no errors and no warnings.
+To publish a release: **Actions → Release → Run workflow** on `main`, or push a version tag such as `v2.8.2`. `.github/workflows/release.yml` checks that the version matches `Version`, `PNCP_VERSION` and `Stable tag`, builds the zip and attaches it to the release.
 
 ## Privacy
 
