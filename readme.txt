@@ -4,7 +4,7 @@ Tags: anti-scraping, ai bots, bot protection, rate limit, content protection
 Requires at least: 6.2
 Tested up to: 7.2
 Requires PHP: 7.4
-Stable tag: 2.8.2
+Stable tag: 3.0.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -54,6 +54,8 @@ Nothing can stop a determined human: whatever a visitor sees has already reached
 * RSS with a short excerpt only, or disabled. With full text, an optional "The post … first appeared on …" line links republished copies back to the original.
 * Private XML feeds (Skroutz, BestPrice, Google Merchant, ERP) protected with a token in a header or URL. Only the token hash is stored. Token rotation with a grace period and per-feed statistics.
 * Optional: hide the REST API map (/wp-json/ and the links to it) from visitors, and turn off pingbacks over XML-RPC. A list shows the REST routes on your site that anyone can call without logging in.
+* Hide the versions of WordPress, PHP and the plugins: no generator tags, no X-Powered-By, a code instead of "?ver=7.1.3", and readme / changelog files refused by the server rules.
+* Optional: excerpts instead of the full text on lists of articles, an IPv6 limit per /56 network, and blocking of web archives (Wayback Machine).
 * With "Hide usernames" on, oEmbed shows the site's name and address instead of the author's username.
 
 = Site Health, WP-CLI and AI agents =
@@ -86,6 +88,7 @@ Generated Nginx, Apache and Cloudflare rules for your own site, so cached pages 
 * Frozen: installing, updating, deleting, activating and deactivating plugins and themes; WordPress core and automatic updates; the file editor; new users, role changes, new administrators; staff email and password changes and resets; new application passwords; all settings; posts, pages, products, media and menus.
 * Also enforced against code: if another plugin is exploited, it cannot activate plugins, change the site address or the admin email, add an administrator or unlock the lock.
 * Visitors and customers are not affected: they browse, order, pay, register as customers and comment as usual.
+* File integrity: when you lock, ScrapeLock keeps a fingerprint of every PHP, .htaccess and .user.ini file (WordPress, plugins, themes, uploads, wp-config.php) and checks it every hour. A new or changed file while locked (usually a backdoor uploaded through a vulnerable plugin) is emailed to you, logged and shown in Site Health. WordPress and the plugins from WordPress.org are also compared with their official checksums, which finds changes made before you locked. Optional quarantine deactivates the affected plugin and renames new PHP files in the uploads folder.
 * Unlock for 15 minutes to 2 hours (it locks again by itself) or until you lock it again. Locking and unlocking are logged and emailed to the site's admin address.
 * Lost your phone: ten one-time recovery codes, or `define( 'SCRAPELOCK_UNLOCK', true );` in wp-config.php as a last resort.
 * The QR code is drawn in your browser and the secret is stored encrypted with the keys in wp-config.php: it is never sent anywhere.
@@ -106,6 +109,10 @@ ScrapeLock downloads public lists of IP addresses, only for the features that us
 * **Perplexity** bot IP ranges (PerplexityBot, Perplexity-User), to tell the real bots from fakes. Downloaded once a day only when "Allow AI search engines and assistants" and "Verify AI search bots" are on, from https://www.perplexity.com/perplexitybot.json and https://www.perplexity.com/perplexity-user.json. Provided by Perplexity AI, Inc.: [Terms of service](https://www.perplexity.ai/hub/legal/terms-of-service), [Privacy policy](https://www.perplexity.ai/hub/legal/privacy-policy).
 * **Anthropic** bot IP ranges (Claude-SearchBot, Claude-User), to tell the real bots from fakes. Downloaded once a day only when "Allow AI search engines and assistants" and "Verify AI search bots" are on, from https://claude.com/crawling/bots.json. Provided by Anthropic PBC: [Terms of service](https://www.anthropic.com/legal/consumer-terms), [Privacy policy](https://www.anthropic.com/legal/privacy).
 * **DB-IP Lite** country database, to apply the country rules. Downloaded once a month only when "Download the free country database" is on, from https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.csv.gz (the current or the previous month). Lookups happen on your server. Licensed under CC BY 4.0 ("IP Geolocation by DB-IP"). Provided by db-ip.com: [Terms of service](https://db-ip.com/tos.php), [Privacy policy](https://db-ip.com/privacy.php), [License](https://creativecommons.org/licenses/by/4.0/).
+
+* **Data center IP ranges** (AWS EC2, Google Cloud, Oracle Cloud, DigitalOcean, Akamai / Linode), to apply the stricter "Data center limit" to visitors coming from cloud servers. Downloaded once a day only while protection is enabled and "Data center limit" is above 0, from https://ip-ranges.amazonaws.com/ip-ranges.json (Amazon Web Services, Inc.: [Terms](https://aws.amazon.com/service-terms/), [Privacy policy](https://aws.amazon.com/privacy/)), https://www.gstatic.com/ipranges/cloud.json (Google LLC: [Terms of service](https://policies.google.com/terms), [Privacy policy](https://policies.google.com/privacy)), https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json (Oracle Corporation: [Terms of use](https://www.oracle.com/legal/terms/), [Privacy policy](https://www.oracle.com/legal/privacy/)), https://digitalocean.com/geo/google.csv (DigitalOcean, LLC: [Terms of service](https://www.digitalocean.com/legal/terms-of-service-agreement), [Privacy policy](https://www.digitalocean.com/legal/privacy-policy)) and https://geoip.linode.com/ (Akamai Technologies, Inc.: [Terms of service](https://www.linode.com/legal-tos/), [Privacy policy](https://www.akamai.com/legal/privacy-statement)).
+
+Lockdown's file check also compares WordPress and the plugins hosted on WordPress.org with their official checksums. This happens when you lock the site or press "Check now" on the Lockdown tab, and then at most once a day while the site stays locked, through the same WordPress.org services WordPress itself uses for updates. The requests contain the WordPress version and language (https://api.wordpress.org/core/checksums/1.0/) and, for each installed plugin, its slug and version (https://downloads.wordpress.org/plugin-checksums/SLUG/VERSION.json); no other data about your site, your content or your visitors is sent. Provided by WordPress.org: [Privacy policy](https://wordpress.org/about/privacy/).
 
 If a list has not been downloaded, ScrapeLock verifies search engine bots with reverse DNS, and uses a built-in copy of the Cloudflare ranges. AI search bots are not verified until their list has been downloaded. Reverse DNS lookups are made only for requests that claim to be a search engine, through your server's own DNS resolver.
 
@@ -174,7 +181,7 @@ Type one of your recovery codes in the unlock field instead of an app code. If y
 
 = Can someone with access to my server bypass Lockdown? =
 
-Yes. Lockdown protects the site against changes through WordPress (wp-admin, the REST API, XML-RPC and code running inside WordPress). Whoever can edit files or the database on your server controls the site anyway, which is also why the server line is the last-resort unlock.
+Yes. Lockdown protects the site against changes through WordPress (wp-admin, the REST API, XML-RPC and code running inside WordPress). Whoever can edit files or the database on your server controls the site anyway, which is also why the server line is the last-resort unlock. The file integrity check is there for that case: a file written behind WordPress' back is found within the hour and emailed to you. Code that already runs on the server could also stop ScrapeLock itself, so "No PHP in the uploads folder" (a server rule) is what stops most backdoors from running in the first place.
 
 = Can I unlock Lockdown from WP-CLI or with an AI agent? =
 
@@ -194,6 +201,30 @@ No. A small script waits for the first real interaction (scroll, tap, key or mou
 6. Dashboard widget with the protection status and the last 24 hours.
 
 == Changelog ==
+
+= 3.0.0 =
+* New: Lockdown file integrity. When you lock the site, ScrapeLock keeps a fingerprint (SHA-256) of every PHP, .htaccess and .user.ini file in WordPress, the plugins, the themes, the uploads folder and wp-config.php, and checks it every hour while the site stays locked. Nobody can install or update anything while locked, so a new or changed file means something wrote it by itself, usually a backdoor uploaded through a vulnerable plugin. You get one email per new finding, an entry in the lockdown log, a notice in wp-admin and a critical Site Health result. After a temporary unlock (when updates are allowed) a new fingerprint is taken instead of an alarm. Caches and the updater's folders are left out (filter `pncp_integrity_exclude`).
+* New: WordPress and the plugins hosted on WordPress.org are compared once a day with their official checksums (the lists WP-CLI's verify-checksums uses), which also finds a change made before the site was locked. Premium and custom plugins are listed as "cannot be compared".
+* New: optional Quarantine (Lockdown tab, saved with the app code): deactivates a plugin whose files changed while locked and renames new PHP files in the uploads folder so they no longer run. Nothing is deleted; ScrapeLock itself is never deactivated.
+* New: automatic Emergency Mode (Bots and limits tab, Limits). The limits per IP cannot see a scraper spread over hundreds of IPs; the whole site can. ScrapeLock learns how many pages per minute the site usually serves and, when that is exceeded five times over for 3 minutes in a row (never below a minimum, 300 by default), starts Emergency Mode for 1 hour and emails you. Verified search engines and exempt staff are not counted; an attack does not raise the learned average. On for new installs, off on existing sites.
+* New: stricter page limit for data centers (Bots and limits tab, Limits): visitors from the published addresses of AWS (servers only, not CloudFront), Google Cloud, Oracle Cloud, DigitalOcean and Akamai / Linode get a lower limit (15 pages per minute for new installs, 5 in Emergency Mode). The lists are downloaded once a day and indexed, so the check costs well under a millisecond. Always-allowed User-Agents and verified search engines are not affected. Off on existing sites.
+* New: "No PHP in the uploads folder" (Feeds and API tab): written into the .htaccess of the uploads folder for Apache, between ScrapeLock's own markers, and added to the Nginx and Apache rules. On for new installs, off on existing sites.
+* Tests: the Lockdown test suite stops at once when the test server does not answer, instead of changing the test site for real.
+
+= 2.9.0 =
+* New: "Hide the versions of WordPress, PHP and the plugins" (Feeds and API tab). Removes the generator tags (page head, feeds, and plugins that use them, e.g. WooCommerce) and the X-Powered-By header, and replaces "?ver=7.1.3" on the site's own CSS and JS with a code tied to the site that changes with the version, so caches keep working. The Nginx and Apache rules now refuse readme.html, license.txt and the readme / changelog files of plugins and themes (404). On for new installs.
+* New: "Lists of articles: an excerpt and a link instead of the full text". Many themes print every article in full on the home page, categories, archives and search, so one request gave a scraper ten articles. Article pages, feeds and exempt staff are not affected; password-protected articles never show their text. Off by default.
+* New: "IPv6: also limit the whole /56 network". A new /64 for every request no longer gets past the page limit: the /56 is limited to four times the page limit, with a 429 and no block. Off by default (mobile networks may share a /56).
+* New: "Block web archives (Wayback Machine)": blocks ia_archiver, archive.org_bot and heritrix and asks them in robots.txt. Off by default.
+* Emergency Mode now also turns on the excerpts in lists and the IPv6 /56 limit.
+* Site Health: the new settings appear in the ScrapeLock section of the Info tab.
+* Existing sites: the new settings stay off until you turn them on.
+
+= 2.8.3 =
+* Security fix: the per-minute page limit could be bypassed from a single IP, with no strike and no ban, by sending the browser's prefetch headers (Sec-Fetch-Dest with Sec-Purpose or Purpose: prefetch) or by a POST with a cookie named wordpress_logged_in_… or woocommerce_… Any script can send these. Now every page request counts, in the normal check and in the pre-cache check. A prefetch has a limit of its own, three times the page limit and never a strike, so speed plugins that prefetch links (Flying Pages, instant.page, speculative loading) do not stop real visitors. WooCommerce AJAX, cart and checkout still do not count, and logged-in staff are still exempt by their role.
+* More bots blocked: more than 100 AI crawlers and agents (DeepSeek, Grok, Qwen, Doubao, ERNIE, Mistral, meta-webindexer, NotebookLM, Gemini Deep Research and others, from ai.robots.txt) are now built into the plugin, blocked by name and listed in robots.txt. The list is updated with each version and does not take room in your own bot list. A few that act for your visitors or tools (e.g. PetalBot, AmazonBuyForMe) are only asked in robots.txt.
+* The bot list now also blocks the default User-Agent of HTTP libraries that passed before: Node.js fetch, Ruby, Java HttpClient, Apache HttpClient, Guzzle, Bun, Deno, Dart, Perl HTTP::Tiny, PowerShell, Faraday and Mechanize. Added to existing lists on update; your own lines stay. A line that starts with "=" must be the whole User-Agent (e.g. "=node").
+* Fix: addresses with non-Latin characters (e.g. Greek) were logged without them (/άρθρο-8/ as /-8/), so the "pages scrapers were after" report missed them. They are now logged as sent and shown readable.
 
 = 2.8.2 =
 * The plugin now includes the full text of its license (GPL-2.0) in a LICENSE file. No code changes.

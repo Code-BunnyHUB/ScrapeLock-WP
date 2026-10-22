@@ -661,7 +661,26 @@ final class PNCP_Admin {
 						?>
 					</p>
 					<p><a class="button" href="<?php echo esc_url( PNCP_Status::emergency_stop_url() ); ?>"><?php esc_html_e( 'End now', 'scrapelock' ); ?></a></p>
+					<?php
+					$auto = PNCP_Surge::last();
+					if ( $auto && (int) $auto[0]['time'] + (int) $auto[0]['hours'] * HOUR_IN_SECONDS >= $until - 60 ) {
+						/* translators: 1: pages per minute, 2: threshold */
+						echo '<p class="description">' . esc_html( sprintf( __( 'Started automatically: %1$d pages per minute, above %2$d.', 'scrapelock' ), (int) $auto[0]['count'], (int) $auto[0]['threshold'] ) ) . '</p>';
+					}
+					?>
 				<?php else : ?>
+					<?php
+					$state = PNCP_Surge::state();
+					if ( ! empty( $s['auto_emergency'] ) ) {
+						echo '<p class="description">' . esc_html(
+							$state['samples'] >= PNCP_Surge::WARMUP
+								/* translators: 1: usual pages per minute, 2: threshold */
+								? sprintf( __( 'Automatic start: on. Usually %1$s pages per minute; it starts above %2$d.', 'scrapelock' ), number_format_i18n( $state['avg'], 1 ), PNCP_Surge::threshold( $state, $s ) )
+								/* translators: %d: threshold */
+								: sprintf( __( 'Automatic start: on, still learning the usual rate; until then it starts above %d pages per minute.', 'scrapelock' ), PNCP_Surge::threshold( $state, $s ) )
+						) . '</p>';
+					}
+					?>
 					<?php self::action_form_open( PNCP_Status::EMERGENCY, PNCP_Status::EMERGENCY ); ?>
 						<p>
 							<label for="pncp-emergency-hours"><?php esc_html_e( 'Duration:', 'scrapelock' ); ?></label>
@@ -711,7 +730,7 @@ final class PNCP_Admin {
 				self::checkbox( $s, 'require_browser_headers', __( 'Browsers only: 403 for pages without Accept-Language or without “Mozilla/” in the User-Agent', 'scrapelock' ), __( 'Stops most scripts. Link previews (Facebook, Viber, WhatsApp etc.) in the “Always allowed” list pass.', 'scrapelock' ) );
 				self::checkbox( $s, 'block_headless', __( 'Block headless and fake browsers', 'scrapelock' ), __( 'Blocks Chrome running without a window when it says so in its headers (“HeadlessChrome”), and, on HTTPS, scripts that copy the User-Agent of Chrome, Edge or Firefox without the Sec-Fetch headers every modern browser sends. It catches common tools and cheap scrapers, not every automated browser: one that is carefully disguised (e.g. Puppeteer with “stealth”, or Selenium with a visible Chrome) sends the same headers as a person. The page limits, the human check and the bot trap still apply to those. In-app browsers (Android WebView) are not checked.', 'scrapelock' ) );
 				self::checkbox( $s, 'trap_enabled', __( 'Bot trap', 'scrapelock' ), __( 'Invisible link on every page, disallowed in robots.txt. Whoever opens it is blocked temporarily, even if it pretends to be a browser. Visitors do not see it, and another site cannot trap them.', 'scrapelock' ) );
-				self::textarea( $s, 'bot_list', __( 'User-Agents to block (one per line, matches anywhere in the User-Agent, case-insensitive):', 'scrapelock' ), __( 'It contains two AI categories: training crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended etc.) and AI search / assistants (OAI-SearchBot, ChatGPT-User, Claude-SearchBot, PerplexityBot etc.). You can allow the second one in the next section.', 'scrapelock' ), 10, true );
+				self::textarea( $s, 'bot_list', __( 'User-Agents to block (one per line, matches anywhere in the User-Agent, case-insensitive):', 'scrapelock' ), __( 'It contains two AI categories: training crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended etc.) and AI search / assistants (OAI-SearchBot, ChatGPT-User, Claude-SearchBot, PerplexityBot etc.). You can allow the second one in the next section.', 'scrapelock' ) . ' ' . sprintf( /* translators: %s: number of AI crawlers */ __( 'In addition, %s more AI crawlers and agents (DeepSeek, Grok, Qwen, Mistral, NotebookLM and others) are blocked by name: that list is built into ScrapeLock and updated with each version, so it is not shown here. A line that starts with “=” must be the whole User-Agent, e.g. “=node”.', 'scrapelock' ), number_format_i18n( count( PNCP_Bots::known_ai_agents() ) ) ), 10, true );
 				?>
 		<?php self::row_close(); ?>
 		<?php self::row_open( 'ai', __( 'AI search and training', 'scrapelock' ) ); ?>
@@ -719,6 +738,7 @@ final class PNCP_Admin {
 				self::checkbox( $s, 'allow_ai_search', __( 'Allow AI search engines and assistants (not training crawlers)', 'scrapelock' ), sprintf( /* translators: %s: list of User-Agents */ __( 'So the site appears in AI search answers with a link, without being given for model training. Allowed: %s. They are also removed from the robots.txt Disallow and from the server rules. The page limit still applies, because the User-Agent can be spoofed.', 'scrapelock' ), implode( ', ', PNCP_Options::ai_search_agents() ) ) );
 				self::checkbox( $s, 'verify_ai_bots', __( 'Verify AI search bots with their official IP lists (OpenAI, Perplexity, Anthropic)', 'scrapelock' ), __( 'With AI search allowed: the real OAI-SearchBot, ChatGPT-User, PerplexityBot, Perplexity-User, Claude-SearchBot and Claude-User are never limited or blocked, and requests that only use their name get a 403 (“Fake AI search bot”). The lists are downloaded once a day; until then nothing changes.', 'scrapelock' ) );
 				self::checkbox( $s, 'robots_ai_block', __( 'Declare AI crawlers in robots.txt (Disallow)', 'scrapelock' ), __( 'Applies to the virtual robots.txt of WordPress. If a physical robots.txt file exists, it takes precedence.', 'scrapelock' ) );
+				self::checkbox( $s, 'block_archivers', __( 'Block web archives (Wayback Machine)', 'scrapelock' ), __( 'The Internet Archive keeps a public copy of every page it visits, and that copy can be scraped without ever reaching your site. This blocks its crawlers (ia_archiver, archive.org_bot, heritrix) and asks them in robots.txt. Copies already in the archive stay there. Leave it off if you want your site to be archived.', 'scrapelock' ) );
 				self::checkbox( $s, 'content_signal', __( 'Content Signals in robots.txt: search yes, AI training no', 'scrapelock' ), __( 'A line that says what the content may be used for (contentsignals.org): search=yes, ai-train=no, and ai-input according to “Allow AI search engines”. It does not block anything; it is a statement of your terms that well-behaved companies read.', 'scrapelock' ) );
 				?>
 		<?php self::row_close(); ?>
@@ -742,6 +762,10 @@ final class PNCP_Admin {
 				self::number( $s, 'rate_limit_rest', __( 'REST API (/wp-json/) and GraphQL requests per minute (0 = off):', 'scrapelock' ), __( 'Only read requests from visitors. Cart, checkout and forms (POST) do not count. Starting value: 60.', 'scrapelock' ) );
 				self::number( $s, 'rate_limit_404', __( '“Page not found” (404) per minute (0 = off):', 'scrapelock' ), __( 'Scrapers guess addresses (?p=1, 2, 3…, old product URLs) to find content. Missing images, CSS, scripts and the favicon do not count. Starting value: 30.', 'scrapelock' ) );
 				self::number( $s, 'rate_limit_sitemap', __( 'Sitemaps per minute (0 = off):', 'scrapelock' ), __( 'Scrapers read the sitemap first to find every page. Covers the sitemaps of WordPress, Rank Math, Yoast and similar plugins. Google, Bing and the other verified search engines are never limited. Starting value: 5.', 'scrapelock' ) );
+				self::checkbox( $s, 'ipv6_wide', __( 'IPv6: also limit the whole /56 network (four times the page limit)', 'scrapelock' ), __( 'Pages are counted per /64, because one connection usually gets a whole /64. A server or a home connection often has a /56 or more, so a scraper can take a new /64 for every request. This also counts the /56 the /64 belongs to, up to four times the page limit (429 above it, without a block). Some mobile networks give neighbouring phones addresses of the same /56: on a site with many visitors from them, keep it off. Always on in Emergency Mode.', 'scrapelock' ) );
+				self::number( $s, 'rate_limit_datacenter', __( 'Pages per minute from data centers (0 = off):', 'scrapelock' ), __( 'People rarely browse from a server; scrapers very often run on one. Visitors from the published addresses of AWS, Google Cloud, Oracle Cloud, DigitalOcean and Akamai / Linode get this stricter limit instead of the normal one. The lists are downloaded from the providers once a day. Some VPNs use these providers, so their users get this limit too: it is meant for reading, not for blocking. The always-allowed User-Agents (monitoring, price platforms) and verified search engines are not affected. Starting value: 15. 5 in Emergency Mode.', 'scrapelock' ) );
+				self::checkbox( $s, 'auto_emergency', __( 'Start Emergency Mode automatically during an attack', 'scrapelock' ), __( 'The limits per IP cannot see a scraper that spreads its requests over hundreds of IPs. The whole site can: ScrapeLock learns how many pages per minute your site usually serves, and when that is exceeded five times over for 3 minutes in a row (and never below the minimum below), it starts Emergency Mode for 1 hour and emails you. Verified search engines and exempt staff are not counted. Pages served from a page cache without reaching WordPress are not counted either.', 'scrapelock' ) );
+				self::number( $s, 'auto_emergency_min', __( 'Minimum pages per minute for the automatic start:', 'scrapelock' ), __( 'Below this the site is never considered under attack, however quiet it usually is. Starting value: 300 (5 pages per second).', 'scrapelock' ) );
 				?>
 		<?php self::row_close(); ?>
 		<?php self::row_open( 'human', __( 'Human check', 'scrapelock' ) ); ?>
@@ -1050,6 +1074,7 @@ final class PNCP_Admin {
 					)
 				);
 				self::checkbox( $s, 'feed_source_link', __( 'Full text: add “The post … first appeared on …” at the end', 'scrapelock' ), __( 'Sites that republish the feed automatically then link back to the original article, so search engines see where it first appeared.', 'scrapelock' ) );
+				self::checkbox( $s, 'list_excerpts', __( 'Lists of articles: an excerpt and a link instead of the full text', 'scrapelock' ), __( 'Many themes print the whole text of every article on the home page, in categories, archives and search, so one request gives a scraper ten articles. With this on, visitors see an excerpt and a “Read the full article” link there, and each article has to be opened (and counted toward the page limit) on its own. The article pages do not change; the staff in “Who is exempt” see the full text. Changes how your lists look, so check them after turning it on. Always on in Emergency Mode.', 'scrapelock' ) );
 				?>
 			</td>
 		</tr>
@@ -1057,6 +1082,18 @@ final class PNCP_Admin {
 			<th scope="row"><?php esc_html_e( 'XML-RPC', 'scrapelock' ); ?></th>
 			<td>
 				<?php self::checkbox( $s, 'disable_pingback', __( 'Turn off pingbacks', 'scrapelock' ), __( 'pingback.ping stays open even when XML-RPC is "disabled", and is used to make your site send requests to other sites or to check which pages exist. This removes the two pingback methods and the X-Pingback header; other XML-RPC methods (e.g. Jetpack) keep working. You no longer receive pingbacks from other blogs.', 'scrapelock' ) ); ?>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php esc_html_e( 'Versions', 'scrapelock' ); ?></th>
+			<td>
+				<?php self::checkbox( $s, 'hide_versions', __( 'Hide the versions of WordPress, PHP and the plugins', 'scrapelock' ), __( 'Scanners read these versions and look them up in lists of known vulnerabilities. This removes the “generator” tag from the page head and the feeds, the X-Powered-By header with the PHP version, and replaces “?ver=7.1.3” on CSS and JS files with a code that changes when the version changes, so caches still work. The readme and changelog files of WordPress and the plugins are static files: the Nginx and Apache rules in the “Server rules” tab refuse them. It does not fix any vulnerability: keep WordPress and the plugins updated.', 'scrapelock' ) ); ?>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php esc_html_e( 'Uploads', 'scrapelock' ); ?></th>
+			<td>
+				<?php self::checkbox( $s, 'block_upload_php', __( 'No PHP in the uploads folder', 'scrapelock' ), __( 'Files uploaded to the site (images, documents) never need to run as code. A backdoor uploaded through a vulnerable plugin usually lands in the uploads folder, so this refuses every PHP file there. On Apache it is written into the .htaccess of the uploads folder at once; on Nginx add the rule from the “Server rules” tab. If a plugin of yours really runs PHP from the uploads folder (rare), leave it off.', 'scrapelock' ) ); ?>
 			</td>
 		</tr>
 		<?php
@@ -1596,7 +1633,7 @@ final class PNCP_Admin {
 							</td>
 							<td><?php echo esc_html( ( isset( $reasons[ $row['reason'] ] ) ? $reasons[ $row['reason'] ] : $row['reason'] ) . ' (' . $row['code'] . ')' ); ?></td>
 							<td><?php echo esc_html( number_format_i18n( (int) $row['hits'] ) ); ?></td>
-							<td><code><?php echo esc_html( $row['path'] ); ?></code></td>
+							<td><code><?php echo esc_html( PNCP_Log::display_path( $row['path'] ) ); ?></code></td>
 							<td class="pncp-ua">
 								<?php
 								echo esc_html( $row['ua'] );
@@ -1652,7 +1689,7 @@ final class PNCP_Admin {
 		foreach ( $rows as $row ) {
 			printf(
 				'<tr><td><code>%1$s</code></td><td class="num">%2$s</td><td class="num">%3$s</td></tr>',
-				esc_html( $row['path'] ),
+				esc_html( PNCP_Log::display_path( $row['path'] ) ),
 				esc_html( number_format_i18n( $row['hits'] ) ),
 				esc_html( number_format_i18n( $row['ips'] ) )
 			);
