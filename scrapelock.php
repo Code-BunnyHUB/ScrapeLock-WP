@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       ScrapeLock – Content & AI Bot Protection
  * Description:       Protects your content: makes copying text and images harder, hides the text in the REST API, GraphQL and RSS, blocks scrapers, AI bots and fake Googlebots, temporarily blocks persistent IPs, protects XML feeds with a token and adds an optional watermark. Lockdown freezes every change to the site until it is unlocked with an authenticator app. Forms, cart, checkout and search engines are not affected.
- * Version:           3.0.0
+ * Version:           3.3.0
  * Requires at least: 6.2
  * Requires PHP:      7.4
  * Author:            CodeBunny
@@ -19,7 +19,7 @@ if ( defined( 'PNCP_VERSION' ) ) {
 	return;
 }
 
-define( 'PNCP_VERSION', '3.0.0' );
+define( 'PNCP_VERSION', '3.3.0' );
 define( 'PNCP_FILE', __FILE__ );
 define( 'PNCP_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PNCP_URL', plugin_dir_url( __FILE__ ) );
@@ -34,6 +34,8 @@ require_once PNCP_DIR . 'includes/class-pncp-graphql.php';
 require_once PNCP_DIR . 'includes/class-pncp-feed.php';
 require_once PNCP_DIR . 'includes/class-pncp-bots.php';
 require_once PNCP_DIR . 'includes/class-pncp-surge.php';
+require_once PNCP_DIR . 'includes/class-pncp-edge.php';
+require_once PNCP_DIR . 'includes/class-pncp-origin.php';
 require_once PNCP_DIR . 'includes/class-pncp-watermark.php';
 require_once PNCP_DIR . 'includes/class-pncp-private-urls.php';
 require_once PNCP_DIR . 'includes/class-pncp-rules.php';
@@ -44,6 +46,7 @@ require_once PNCP_DIR . 'includes/class-pncp-geo.php';
 require_once PNCP_DIR . 'includes/class-pncp-precheck.php';
 require_once PNCP_DIR . 'includes/class-pncp-totp.php';
 require_once PNCP_DIR . 'includes/class-pncp-lockdown.php';
+require_once PNCP_DIR . 'includes/class-pncp-seal.php';
 require_once PNCP_DIR . 'includes/class-pncp-integrity.php';
 require_once PNCP_DIR . 'includes/class-pncp-surface.php';
 require_once PNCP_DIR . 'includes/class-pncp-health.php';
@@ -61,6 +64,8 @@ PNCP_Rest::init();
 PNCP_Graphql::init();
 PNCP_Feed::init();
 PNCP_Bots::init();
+PNCP_Edge::init();
+PNCP_Origin::init();
 PNCP_Watermark::init();
 PNCP_Private_Urls::init();
 PNCP_Status::init();
@@ -68,6 +73,7 @@ PNCP_Human::init();
 PNCP_Geo::init();
 PNCP_Precheck::init();
 PNCP_Lockdown::init();
+PNCP_Seal::init();
 PNCP_Integrity::init();
 PNCP_Surface::init();
 PNCP_Health::init();
@@ -109,6 +115,10 @@ register_deactivation_hook( PNCP_FILE, 'pncp_deactivate' );
 function pncp_deactivate() {
 	wp_clear_scheduled_hook( PNCP_Ip::CRON );
 	wp_clear_scheduled_hook( PNCP_Log::CRON );
+	// The blocks ScrapeLock made at the CDN go away with it (the bans themselves end with the plugin).
+	PNCP_Edge::remove_all();
+	// The Lockdown guard keeps ScrapeLock active while locked: it goes when the plugin is deactivated.
+	PNCP_Seal::remove_guard();
 	remove_filter( 'rocket_cache_reject_ua', array( 'PNCP_Bots', 'rocket_reject_ua' ) );
 	// The early check goes away with the plugin. On multisite the file is shared: it stays, and does nothing
 	// on sites where ScrapeLock is not active.
@@ -190,6 +200,10 @@ function pncp_upgrade() {
 	}
 	if ( ! wp_next_scheduled( PNCP_Log::CRON ) ) {
 		wp_schedule_event( time() + 5 * MINUTE_IN_SECONDS, 'hourly', PNCP_Log::CRON );
+	}
+	// 3.3: Lockdown data stored before signatures existed is signed now (while pncp_version still says older).
+	if ( '' !== $from && version_compare( $from, '3.3.0', '<' ) ) {
+		PNCP_Lockdown::upgrade_seal();
 	}
 	update_option( 'pncp_version', PNCP_VERSION, true ); // Autoloaded: read on every request by pncp_maybe_upgrade().
 	PNCP_Options::flush();
