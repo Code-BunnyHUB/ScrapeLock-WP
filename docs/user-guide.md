@@ -80,13 +80,13 @@ Anything served from a page cache (Nginx FastCGI cache, WP Rocket etc.) or as a 
 
 ```php
 // BEGIN ScrapeLock pre-cache check (added and removed by the plugin's "Pre-cache check" setting)
-if ( is_file( '/…/wp-content/scrapelock-precheck/run.php' ) ) { include_once '/…/wp-content/scrapelock-precheck/run.php'; }
+if ( is_file( '/…/wp-content/plugins/scrapelock/includes/class-pncp-precheck-runtime.php' ) ) { include_once '/…/wp-content/plugins/scrapelock/includes/class-pncp-precheck-runtime.php'; PNCP_Precheck_Runtime::boot( '/…/wp-content/uploads/scrapelock/precheck-…' ); }
 // END ScrapeLock pre-cache check
 ```
 
 - It runs before the cache and WordPress, without the database. It stops only always-blocked IPs, temporary blocks and visitors over the "Pages per minute" limit.
 - Violations lead to a block as in the normal check. Blocks and their lifting apply on both sides. Events appear in the log.
-- Counters in APCu or in files in `wp-content/scrapelock-precheck`.
+- Settings, counters and events as plain data files (no PHP) in a protected folder with a random name in `uploads/scrapelock/` (counters in APCu, if available).
 - Not counted: logged-in users, forms, prefetch, wp-admin, wp-login, REST, cron, the server itself, always-allowed IPs, Google and Bing from their official addresses. Applebot and YandexBot are left to the normal check, and WP Rocket does not serve them cached pages.
 - It does not apply the stricter limits (human check, countries) or Emergency Mode: those apply to pages outside the cache.
 - If `wp-config.php` is not writable, the setting shows the lines to add by hand. Everything is removed when the setting is turned off or the plugin is deactivated. Not on multisite.
