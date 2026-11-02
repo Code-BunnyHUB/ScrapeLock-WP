@@ -24,6 +24,14 @@
 final class PNCP_Precheck_Runtime {
 
 	/**
+	 * Whether this request was logged here as "would block" ("Monitor only"): WordPress's own log then does
+	 * not log it a second time (PNCP_Log::add()).
+	 *
+	 * @var bool
+	 */
+	public static $monitored = false;
+
+	/**
 	 * Called by the line in wp-config.php: reads the configuration from the data folder and runs the check.
 	 *
 	 * @param string $dir The data folder.
@@ -64,7 +72,7 @@ final class PNCP_Precheck_Runtime {
 			}
 		}
 		$c = json_decode( (string) @file_get_contents( $file ), true );
-		if ( ! is_array( $c ) || ! isset( $c['format'] ) || 2 !== $c['format'] ) {
+		if ( ! is_array( $c ) || ! isset( $c['format'] ) || ! in_array( $c['format'], array( 2, 3 ), true ) ) {
 			return null;
 		}
 		$c['dir'] = $dir;
@@ -82,7 +90,7 @@ final class PNCP_Precheck_Runtime {
 	public static function run( $c ) {
 		// A run.php written before 3.3.1 passes its own configuration: it does nothing until wp-admin
 		// replaces its line in wp-config.php.
-		if ( ! is_array( $c ) || ! isset( $c['format'] ) || 2 !== $c['format'] ) {
+		if ( ! is_array( $c ) || ! isset( $c['format'] ) || ! in_array( $c['format'], array( 2, 3 ), true ) ) {
 			return;
 		}
 		try {
@@ -94,6 +102,13 @@ final class PNCP_Precheck_Runtime {
 			return;
 		}
 		list( $code, $reason, $ip ) = $verdict;
+		// "Monitor only": the verdict is logged as "would block" (code 0) and the request goes on, to the page
+		// cache or WordPress.
+		if ( self::monitoring( $c, time() ) ) {
+			self::event( $c, 0, $reason, $ip );
+			self::$monitored = true;
+			return;
+		}
 		self::event( $c, $code, $reason, $ip );
 		if ( ! headers_sent() ) {
 			http_response_code( $code );
@@ -121,6 +136,13 @@ final class PNCP_Precheck_Runtime {
 		if ( 'cli' === PHP_SAPI || ! self::applies( $c ) ) {
 			return null;
 		}
+		if ( self::emergency( $c, $now ) ) {
+			// 3.4: Emergency Mode's stricter page limit and bans (never looser than the stored ones).
+			$e                = (array) $c['emergency'];
+			$c['limit']       = isset( $e['limit'] ) ? (int) $e['limit'] : (int) $c['limit'];
+			$c['ban_strikes'] = isset( $e['ban_strikes'] ) ? (int) $e['ban_strikes'] : (int) $c['ban_strikes'];
+			$c['ban_minutes'] = isset( $e['ban_minutes'] ) ? (int) $e['ban_minutes'] : (int) $c['ban_minutes'];
+		}
 		$direct = self::not_via_cdn( $c );
 		if ( '' !== $direct ) {
 			return array( 403, 'not_via_cdn', $direct );
@@ -133,7 +155,11 @@ final class PNCP_Precheck_Runtime {
 			return null;
 		}
 		// A CDN address means "Real visitor IP" is not set: then one decision would hit many visitors at once.
-		if ( self::in_any( $ip, $c['cdn'] ) ) {
+		// 3.4: not without the CDN shared secret, when one is set: such a request came through someone else's
+		// account at the CDN, and is limited like any other address.
+		// 3.4.1: only the edge that connected (REMOTE_ADDR). A Cloudflare address from the real-IP header is a client of
+		// its own (a Cloudflare Worker, which a scraper can rent), as in PNCP_Ip::is_cdn_edge().
+		if ( self::is_cdn( $ip, $c ) && self::cdn_trust_ok( $c ) && self::normalize_ip( isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '' ) === $ip ) {
 			return null;
 		}
 		if ( self::in_any( $ip, $c['block'] ) ) {
@@ -143,9 +169,10 @@ final class PNCP_Precheck_Runtime {
 		// Search engines: Google and Bing are verified with their official lists. The others (Applebot,
 		// YandexBot) are verified with DNS by the normal check, so they are left to it.
 		$ua = isset( $_SERVER['HTTP_USER_AGENT'] ) ? strtolower( (string) $_SERVER['HTTP_USER_AGENT'] ) : '';
-		foreach ( $c['crawlers'] as $crawler ) {
+		foreach ( $c['crawlers'] as $i => $crawler ) {
 			if ( self::ua_in( $ua, $crawler['ua'] ) ) {
-				if ( null === $crawler['ips'] || self::in_any( $ip, $crawler['ips'] ) ) {
+				$ips = true === $crawler['ips'] ? self::crawler_set( $c, $i ) : $crawler['ips'];
+				if ( null === $ips || self::in_any( $ip, $ips ) ) {
 					return null;
 				}
 				break; // Claims to be Google / Bing from another address: counted like everyone else.
@@ -160,7 +187,7 @@ final class PNCP_Precheck_Runtime {
 		// Up to here (always-blocked IPs and temporary bans) every request is checked, even a POST: otherwise
 		// a cached page could be served to an IP that is already blocked or banned. The rate limit below
 		// counts the GET / HEAD views; the normal check counts the rest.
-		if ( ! self::countable() ) {
+		if ( ! self::countable() || self::shop_page( $c ) ) {
 			return null;
 		}
 		$limit = (int) $c['limit'];
@@ -182,12 +209,39 @@ final class PNCP_Precheck_Runtime {
 		if ( $count <= $limit ) {
 			return null;
 		}
-		// One "violation" per minute over the limit, as in the normal check; enough of them = a ban.
-		if ( $count === $limit + 1 && self::strike( $c, $bankey, $now ) ) {
+		// One "violation" per minute over the limit, as in the normal check; enough of them = a ban. Not in
+		// "Monitor only", which never bans.
+		if ( $count === $limit + 1 && ! self::monitoring( $c, $now ) && self::strike( $c, $bankey, $now ) ) {
 			self::ban( $dir, $bankey, $now + max( 1, (int) $c['ban_minutes'] ) * 60 );
 			self::event( $c, 403, 'ban', $ip ); // The event keeps the exact IP for the log.
 		}
 		return array( 429, 'rate_page', $ip );
+	}
+
+	/**
+	 * Is "Monitor only" in effect (as PNCP_Options::monitoring())? The first-week monitoring of a new install
+	 * ends at its time here too, even before WordPress rewrites the configuration.
+	 *
+	 * @param array<string, mixed> $c   Configuration.
+	 * @param int                  $now Time.
+	 * @return bool
+	 */
+	public static function monitoring( $c, $now ) {
+		if ( self::emergency( $c, $now ) ) {
+			return false; // 3.4: Emergency Mode really blocks, also while "Monitor only" is on (as in WordPress).
+		}
+		return ! empty( $c['monitor'] ) && ( empty( $c['monitor_until'] ) || $now < (int) $c['monitor_until'] );
+	}
+
+	/**
+	 * Is Emergency Mode on (3.4: its end time is in the configuration)?
+	 *
+	 * @param array<string, mixed> $c   Configuration.
+	 * @param int                  $now Time.
+	 * @return bool
+	 */
+	public static function emergency( $c, $now ) {
+		return ! empty( $c['emergency_until'] ) && $now < (int) $c['emergency_until'] && isset( $c['emergency'] ) && is_array( $c['emergency'] );
 	}
 
 	/**
@@ -200,8 +254,23 @@ final class PNCP_Precheck_Runtime {
 		if ( empty( $c['cdn_only'] ) || self::cdn_trust_ok( $c ) ) {
 			return '';
 		}
-		$remote = isset( $_SERVER['REMOTE_ADDR'] ) ? trim( (string) $_SERVER['REMOTE_ADDR'] ) : '';
-		return filter_var( $remote, FILTER_VALIDATE_IP ) && ! self::is_local( $remote ) ? $remote : '';
+		$remote = self::normalize_ip( isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '' );
+		if ( '' === $remote ) {
+			return '';
+		}
+		if ( ! self::is_local( $remote ) ) {
+			return $remote;
+		}
+		// The server itself only when no proxy passed the request on: behind a local reverse proxy (Nginx in
+		// front of Apache, Varnish) every request comes from 127.0.0.1, also the ones that went around the CDN.
+		// Those are judged by the visitor's address, as PNCP_Origin::exempt() does.
+		foreach ( array( 'HTTP_X_FORWARDED_FOR', 'HTTP_FORWARDED', 'HTTP_X_REAL_IP', 'HTTP_CF_CONNECTING_IP' ) as $header ) {
+			if ( ! empty( $_SERVER[ $header ] ) ) {
+				$ip = self::client_ip( $c, $reliable );
+				return '' !== $ip && ! self::is_local( $ip ) ? $ip : '';
+			}
+		}
+		return '';
 	}
 
 	/**
@@ -258,6 +327,40 @@ final class PNCP_Precheck_Runtime {
 	}
 
 	/**
+	 * 3.4.1: a WooCommerce cart, checkout or My account page (or an endpoint below it, such as the order received
+	 * page or My account > Orders)? These never count toward the page limit, as in the normal check: a shopper
+	 * reloads them many times. The paths and page IDs come from the configuration (PNCP_Precheck::config()).
+	 *
+	 * @param array<string, mixed> $c Configuration.
+	 * @return bool
+	 */
+	public static function shop_page( $c ) {
+		if ( empty( $c['shop'] ) || ! is_array( $c['shop'] ) ) {
+			return false;
+		}
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '/';
+		$ids  = isset( $c['shop']['ids'] ) ? array_map( 'intval', (array) $c['shop']['ids'] ) : array();
+		$args = array();
+		parse_str( (string) parse_url( $uri, PHP_URL_QUERY ), $args );
+		if ( isset( $args['page_id'] ) && is_scalar( $args['page_id'] ) && in_array( (int) $args['page_id'], $ids, true ) ) {
+			return true;
+		}
+		$path = '/' . ltrim( rawurldecode( (string) parse_url( $uri, PHP_URL_PATH ) ), '/' );
+		$home = (string) $c['home'];
+		if ( '' !== $home && ( 0 === strcasecmp( $path, $home ) || 0 === stripos( $path, $home . '/' ) ) ) {
+			$path = '/' . ltrim( substr( $path, strlen( $home ) ), '/' );
+		}
+		$path = strtolower( (string) preg_replace( '#^/index\.php(?=/)#i', '', $path ) );
+		foreach ( isset( $c['shop']['paths'] ) ? (array) $c['shop']['paths'] : array() as $shop ) {
+			$shop = (string) $shop;
+			if ( '' !== $shop && '/' !== $shop && ( rtrim( $path, '/' ) === $shop || 0 === strpos( $path, $shop . '/' ) ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Prefetch / prerender, as PNCP_Bots::is_prefetch() sees it.
 	 *
 	 * @return bool
@@ -283,8 +386,7 @@ final class PNCP_Precheck_Runtime {
 	 */
 	public static function client_ip( $c, &$reliable ) {
 		$reliable = true;
-		$remote   = isset( $_SERVER['REMOTE_ADDR'] ) ? trim( (string) $_SERVER['REMOTE_ADDR'] ) : '';
-		$remote   = filter_var( $remote, FILTER_VALIDATE_IP ) ? $remote : '';
+		$remote   = self::normalize_ip( isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '' );
 		$ip       = $remote;
 		$header   = (string) $c['header'];
 		if ( '' !== $header && ! empty( $_SERVER[ $header ] ) ) {
@@ -293,10 +395,11 @@ final class PNCP_Precheck_Runtime {
 			if ( $trusted || $legacy ) {
 				$chain = array_map( 'trim', explode( ',', (string) $_SERVER[ $header ] ) );
 				for ( $i = count( $chain ) - 1; $i >= 0; $i-- ) {
-					if ( ! filter_var( $chain[ $i ], FILTER_VALIDATE_IP ) ) {
+					$candidate = self::normalize_ip( $chain[ $i ] );
+					if ( '' === $candidate ) {
 						break;
 					}
-					$ip = $chain[ $i ];
+					$ip = $candidate;
 					if ( $legacy || 'HTTP_X_FORWARDED_FOR' !== $header || ! self::trusted( $ip, $c ) ) {
 						break;
 					}
@@ -305,8 +408,59 @@ final class PNCP_Precheck_Runtime {
 					$reliable = false;
 				}
 			}
+		} elseif ( '' === $header && ! empty( $c['cf_auto'] ) && ! empty( $_SERVER['HTTP_CF_CONNECTING_IP'] ) && self::cf_edge( $remote, $c ) ) {
+			// 3.4.1: "Real visitor IP" left at the default, but the request comes from a Cloudflare edge: Cloudflare
+			// always writes CF-Connecting-IP itself, so it is the visitor (as in PNCP_Ip::client_ip()). Otherwise
+			// every visitor, banned or not, would pass here as the shared edge address.
+			$candidate = self::normalize_ip( (string) $_SERVER['HTTP_CF_CONNECTING_IP'] );
+			if ( '' !== $candidate ) {
+				$ip = $candidate;
+			}
 		}
 		return $ip;
+	}
+
+	/**
+	 * May this address set CF-Connecting-IP (PNCP_Ip::is_trusted_proxy() for that header)? An explicit trusted proxy,
+	 * or a Cloudflare edge when the CDN secret, if one is set, is on the request.
+	 *
+	 * @param string               $ip IP.
+	 * @param array<string, mixed> $c  Configuration.
+	 * @return bool
+	 */
+	public static function cf_edge( $ip, $c ) {
+		if ( '' === $ip || 3 !== $c['format'] ) {
+			return false;
+		}
+		return self::in_any( $ip, $c['proxies'] ) || ( self::cdn_trust_ok( $c ) && self::in_any( $ip, $c['cdn_cf'] ) );
+	}
+
+	/**
+	 * The same spelling as PNCP_Ip::normalize() (no port or brackets, short IPv6, IPv4-mapped as IPv4), without
+	 * WordPress, which is not loaded yet here.
+	 *
+	 * @param string $ip IP as received.
+	 * @return string The IP, or ''.
+	 */
+	public static function normalize_ip( $ip ) {
+		$ip = trim( (string) $ip );
+		if ( '' === $ip ) {
+			return '';
+		}
+		if ( '[' === $ip[0] ) {
+			$end = strpos( $ip, ']' );
+			$ip  = false === $end ? '' : substr( $ip, 1, $end - 1 );
+		} elseif ( 1 === substr_count( $ip, ':' ) ) {
+			$ip = substr( $ip, 0, (int) strpos( $ip, ':' ) );
+		}
+		$bin = @inet_pton( $ip ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Invalid value = false.
+		if ( false === $bin ) {
+			return '';
+		}
+		if ( 16 === strlen( $bin ) && 0 === strpos( $bin, str_repeat( "\0", 10 ) . "\xff\xff" ) ) {
+			$bin = substr( $bin, 12 );
+		}
+		return (string) inet_ntop( $bin );
 	}
 
 	/**
@@ -325,8 +479,48 @@ final class PNCP_Precheck_Runtime {
 		}
 		// With a CDN secret set but not present on the request, only the explicit "Trusted proxies" are
 		// trusted, not the CDN edge lists (so a spoofed CDN edge IP cannot set the real-IP header).
+		if ( 3 === $c['format'] ) {
+			if ( self::in_any( $ip, $c['proxies'] ) ) {
+				return true;
+			}
+			if ( ! self::cdn_trust_ok( $c ) ) {
+				return false;
+			}
+			return ( ! empty( $c['proxies_cdn']['cf'] ) && self::in_any( $ip, $c['cdn_cf'] ) ) || ( ! empty( $c['proxies_cdn']['bunny'] ) && self::in_any( $ip, $c['cdn_bunny'] ) );
+		}
 		$set = self::cdn_trust_ok( $c ) ? $c['proxies'] : ( isset( $c['proxies_base'] ) ? $c['proxies_base'] : $c['proxies'] );
 		return self::in_any( $ip, $set );
+	}
+
+	/**
+	 * Is the address a CDN edge (Cloudflare, Bunny)?
+	 *
+	 * @param string               $ip IP.
+	 * @param array<string, mixed> $c  Configuration.
+	 * @return bool
+	 */
+	public static function is_cdn( $ip, $c ) {
+		if ( 3 === $c['format'] ) {
+			return self::in_any( $ip, $c['cdn_cf'] ) || self::in_any( $ip, $c['cdn_bunny'] );
+		}
+		return self::in_any( $ip, $c['cdn'] );
+	}
+
+	/**
+	 * The official list of a crawler family, from crawlers.json: read only when a request claims to be a
+	 * crawler (most requests do not), once per request.
+	 *
+	 * @param array<string, mixed> $c Configuration.
+	 * @param int                  $i The family's position.
+	 * @return array{0:array<string, bool>, 1:string[]}|null Null = no list: the normal check decides.
+	 */
+	public static function crawler_set( $c, $i ) {
+		static $sets = null;
+		if ( null === $sets ) {
+			$sets = json_decode( (string) @file_get_contents( $c['dir'] . '/crawlers.json' ), true );
+			$sets = is_array( $sets ) ? $sets : array();
+		}
+		return isset( $sets[ $i ] ) && is_array( $sets[ $i ] ) ? $sets[ $i ] : null;
 	}
 
 	/**
@@ -489,12 +683,20 @@ final class PNCP_Precheck_Runtime {
 	 *
 	 * @param string $base   The hits folder.
 	 * @param int    $minute Current minute.
+	 * @param int    $max    Most files removed in this call (0 = no limit).
 	 */
-	public static function cleanup( $base, $minute ) {
+	public static function cleanup( $base, $minute, $max = 300 ) {
+		// At most $max files per call inside a visitor's request: after an attack spread over thousands of IPs,
+		// the old minutes hold thousands of files, and one visitor must not wait for all of them. What is left
+		// is removed by the next minutes' first requests and by the hourly cleanup (PNCP_Precheck::cleanup_hits).
+		$left = (int) $max > 0 ? (int) $max : PHP_INT_MAX;
 		foreach ( (array) @scandir( $base ) as $name ) {
 			if ( ctype_digit( (string) $name ) && (int) $name < $minute - 1 ) {
 				foreach ( (array) @scandir( $base . '/' . $name ) as $file ) {
 					if ( '.' !== $file && '..' !== $file ) {
+						if ( $left-- <= 0 ) {
+							return;
+						}
 						@unlink( $base . '/' . $name . '/' . $file );
 					}
 				}

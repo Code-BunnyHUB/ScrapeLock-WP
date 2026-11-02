@@ -36,9 +36,16 @@ final class PNCP_Early {
 		}
 
 		$verdict = self::check();
+		$monitor = $verdict && PNCP_Options::monitoring();
 		// The normal check reads the settings and the IP again, after translations and the other plugins' filters.
 		PNCP_Options::flush();
 		PNCP_Ip::reset();
+		if ( $monitor ) {
+			// "Monitor only": logged as "would block" (once for the request, also when the normal check comes to
+			// the same verdict later) and the request goes on.
+			PNCP_Log::add( $verdict[1], PNCP_Log::MONITOR_CODE, $verdict[2] );
+			return;
+		}
 		if ( $verdict ) {
 			PNCP_Log::add( $verdict[1], $verdict[0], $verdict[2] );
 			PNCP_Bots::no_cache();
@@ -85,8 +92,12 @@ final class PNCP_Early {
 		}
 
 		// A Cloudflare address means "Real visitor IP" is not set: no IP-based decision then, or a single
-		// block would hit every visitor that comes through the same Cloudflare server.
-		$per_ip = ! PNCP_Ip::in_any( $ip, PNCP_Ip::list_of( 'cloudflare' ) );
+		// block would hit every visitor that comes through the same Cloudflare server. 3.4: not when a CDN
+		// shared secret is set and the request does not carry it: then it did not come through this site's
+		// own CDN account, and the address is limited like any other (see PNCP_Ip::is_cdn_edge()).
+		// 3.4.1: only the edge that connected (REMOTE_ADDR); a Cloudflare address from the real-IP header is a
+		// client of its own (a Cloudflare Worker, which a scraper can rent).
+		$per_ip = ! ( PNCP_Ip::remote_addr() === $ip && PNCP_Ip::in_any( $ip, PNCP_Ip::list_of( 'cloudflare' ) ) && PNCP_Ip::cdn_secret_ok( $s ) );
 
 		if ( $per_ip && PNCP_Ip::in_any( $ip, PNCP_Options::parse_list( $s['block_ips'] ) ) ) {
 			return array( 403, 'blocked_ip', $ip );
@@ -266,7 +277,11 @@ final class PNCP_Early {
 		if ( ! function_exists( 'get_filesystem_method' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 		}
-		if ( 'direct' !== get_filesystem_method( array(), PNCP_Paths::mu_plugins() ) || ! WP_Filesystem() ) {
+		// The check writes a test file in the folder it is given: for a mu-plugins folder that does not exist yet
+		// (most sites) it would always fail and the file would never be written. Then wp-content is asked.
+		$mu      = PNCP_Paths::mu_plugins();
+		$context = is_dir( $mu ) ? $mu : dirname( $mu );
+		if ( 'direct' !== get_filesystem_method( array(), $context ) || ! WP_Filesystem() ) {
 			return null;
 		}
 		global $wp_filesystem;
