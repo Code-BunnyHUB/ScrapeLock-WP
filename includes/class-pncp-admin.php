@@ -24,6 +24,21 @@ final class PNCP_Admin {
 	private static $form_section = '';
 
 	/**
+	 * 3.4.3: the action of the admin-post form opened last, so every action form gets its own button id
+	 * (submit_button() prints id="submit" on all of them).
+	 *
+	 * @var string
+	 */
+	private static $action_form = '';
+
+	/**
+	 * 3.4.3: submit button ids used so far, per action.
+	 *
+	 * @var int[]
+	 */
+	private static $submit_ids = array();
+
+	/**
 	 * Registers the hooks.
 	 */
 	public static function init() {
@@ -552,7 +567,32 @@ final class PNCP_Admin {
 	private static function action_form_open( $action, $nonce, $classes = '' ) {
 		printf( '<form method="post" action="%s" class="%s">', esc_url( admin_url( 'admin-post.php' ) ), esc_attr( $classes ) );
 		printf( '<input type="hidden" name="action" value="%s">', esc_attr( $action ) );
-		wp_nonce_field( $nonce );
+		self::$action_form = $action;
+		self::nonce_field( $nonce );
+	}
+
+	/**
+	 * 3.4.3: wp_nonce_field() without its id="_wpnonce", which repeated on every action form of a page. The
+	 * field name and the referer field stay the same, so the handlers check the nonce as before.
+	 *
+	 * @param string $nonce Nonce action.
+	 */
+	private static function nonce_field( $nonce ) {
+		echo preg_replace( '/ id="_wpnonce"/', '', wp_nonce_field( $nonce, '_wpnonce', true, false ), 1 ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Core markup.
+	}
+
+	/**
+	 * 3.4.3: a unique id for the submit button of the action form opened last: pncp-submit-<action>, then
+	 * pncp-submit-<action>-2 and so on. The button keeps the name "submit".
+	 *
+	 * @return array Attributes for submit_button().
+	 */
+	private static function submit_attrs() {
+		$key = '' !== self::$action_form ? self::$action_form : 'form';
+		$n   = isset( self::$submit_ids[ $key ] ) ? self::$submit_ids[ $key ] + 1 : 1;
+
+		self::$submit_ids[ $key ] = $n;
+		return array( 'id' => 'pncp-submit-' . str_replace( '_', '-', $key ) . ( $n > 1 ? '-' . $n : '' ) );
 	}
 
 	/* ---------- Page ---------- */
@@ -767,7 +807,7 @@ final class PNCP_Admin {
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" enctype="multipart/form-data">
 				<input type="hidden" name="action" value="pncp_settings">
 				<input type="hidden" name="op" value="import_preview">
-				<?php wp_nonce_field( 'pncp_settings' ); ?>
+				<?php self::nonce_field( 'pncp_settings' ); ?>
 				<p>
 					<label for="pncp-import-file"><?php esc_html_e( 'Import settings from a file:', 'scrapelock' ); ?></label>
 					<input type="file" id="pncp-import-file" name="pncp_import_file" accept=".json,application/json" required aria-describedby="pncp-import-help">
@@ -1180,7 +1220,7 @@ final class PNCP_Admin {
 		<?php self::row_close(); ?>
 		<?php self::row_open( 'human', __( 'Human check', 'scrapelock' ) ); ?>
 				<?php
-				self::checkbox( $s, 'human_check', __( 'Stricter page limit for visitors who have not shown they are people', 'scrapelock' ), __( 'A small script waits for the visitor\'s first real interaction (scroll, tap, key or mouse movement), solves a light challenge in the background and receives a cookie for 7 days. Nobody sees a captcha or a window. Visitors without the cookie (scripts, and people with JavaScript turned off) get the limit below instead of the normal page limit. Search engines and verified AI search bots are not affected. It works with page caches such as WP Rocket. A determined scraper can repeat the steps, but each of its IPs has to do the work.', 'scrapelock' ) );
+				self::checkbox( $s, 'human_check', __( 'Stricter page limit for visitors who have not shown they are people', 'scrapelock' ), __( 'A small script waits for the visitor\'s first real interaction (scroll, tap, key or mouse movement), solves a light challenge in the background and receives a cookie for 7 days. Nobody sees a captcha or a window. Visitors without the cookie (scripts, and people with JavaScript turned off) get the limit below instead of the normal page limit. Search engines and verified AI search bots are not affected. With a page cache plugin, turn on the pre-cache check so that cached pages get this limit too. A determined scraper can repeat the steps, but each of its IPs has to do the work.', 'scrapelock' ) );
 				self::number( $s, 'rate_limit_unverified', __( 'Pages per minute without the cookie (0 = off):', 'scrapelock' ), __( 'Starting value: 20. A person reads far fewer pages per minute, and gets the cookie with the first scroll or tap.', 'scrapelock' ) );
 				?>
 		<?php self::row_close(); ?>
@@ -1195,7 +1235,7 @@ final class PNCP_Admin {
 		<?php self::row_close(); ?>
 		<?php self::row_open( 'ban', __( 'Temporary block', 'scrapelock' ) ); ?>
 				<?php
-				self::number( $s, 'ban_strikes', __( 'Block after this many violations within 10 minutes (0 = never):', 'scrapelock' ), __( 'Violation: every minute in which the IP exceeded a limit, and every fake Googlebot. The trap blocks immediately.', 'scrapelock' ) );
+				self::number( $s, 'ban_strikes', __( 'Block after this many violations within 10 minutes (0 = never):', 'scrapelock' ), __( 'Violation: every minute in which the IP exceeded a limit, and every fake Googlebot. The trap blocks immediately: for 10 minutes the first time, for the full time if the same IP falls into it again within 24 hours.', 'scrapelock' ) );
 				self::number( $s, 'ban_minutes', __( 'Block duration (minutes):', 'scrapelock' ) );
 				?>
 				<p class="description"><?php esc_html_e( 'How long the log is kept is set on the Log tab.', 'scrapelock' ); ?></p>
@@ -1354,7 +1394,7 @@ final class PNCP_Admin {
 				</tr>
 			</table>
 			<?php if ( ! $locked ) : ?>
-				<p><?php submit_button( __( 'Save and test the connection', 'scrapelock' ), 'secondary', 'submit', false ); ?></p>
+				<p><?php submit_button( __( 'Save and test the connection', 'scrapelock' ), 'secondary', 'submit', false, self::submit_attrs() ); ?></p>
 			<?php endif; ?>
 		</form>
 		<?php
@@ -1366,7 +1406,7 @@ final class PNCP_Admin {
 			self::action_form_open( 'pncp_edge', 'pncp_edge', 'pncp-edge-test' );
 			echo '<input type="hidden" name="op" value="diagnose">';
 			echo '<p>';
-			submit_button( __( 'Test connection', 'scrapelock' ), 'secondary', 'submit', false );
+			submit_button( __( 'Test connection', 'scrapelock' ), 'secondary', 'submit', false, self::submit_attrs() );
 			echo '</p><p class="description">' . esc_html__( 'Checks step by step that the CDN can be reached, that the token is valid, active and has the permissions needed, that the zone exists and is active, and how much of the API rate limit is left. Then blocks the address 203.0.113.x (reserved for documentation, it belongs to nobody) at the CDN, checks that the CDN lists it and removes it again. No setting changes and no visitor is affected.', 'scrapelock' ) . '</p></form>';
 		}
 		self::render_diagnosis();
@@ -1411,7 +1451,7 @@ final class PNCP_Admin {
 				<p><strong><?php esc_html_e( 'The site is behind Cloudflare, but all visitors appear with a Cloudflare address.', 'scrapelock' ); ?></strong>
 				<?php esc_html_e( 'Then limits and blocks hit Cloudflare itself, i.e. many visitors at once. Use the CF-Connecting-IP header, trusted only when the request comes from Cloudflare.', 'scrapelock' ); ?></p>
 				<?php self::action_form_open( 'pncp_cf_ip', 'pncp_cf_ip' ); ?>
-					<p><?php submit_button( __( 'Use CF-Connecting-IP (recommended)', 'scrapelock' ), 'primary', 'submit', false ); ?></p>
+					<p><?php submit_button( __( 'Use CF-Connecting-IP (recommended)', 'scrapelock' ), 'primary', 'submit', false, self::submit_attrs() ); ?></p>
 				</form>
 			</div>
 			<?php
@@ -1480,7 +1520,7 @@ final class PNCP_Admin {
 			<p><strong><?php esc_html_e( 'The site is behind Bunny CDN, but all visitors appear with a Bunny address.', 'scrapelock' ); ?></strong>
 			<?php esc_html_e( 'Then limits and blocks hit Bunny itself, i.e. many visitors at once. Use the X-Real-IP header, trusted only when the request comes from a Bunny edge server (the official list is downloaded now).', 'scrapelock' ); ?></p>
 			<?php self::action_form_open( 'pncp_bunny_ip', 'pncp_bunny_ip' ); ?>
-				<p><?php submit_button( __( 'Use X-Real-IP from Bunny (recommended)', 'scrapelock' ), 'primary', 'submit', false ); ?></p>
+				<p><?php submit_button( __( 'Use X-Real-IP from Bunny (recommended)', 'scrapelock' ), 'primary', 'submit', false, self::submit_attrs() ); ?></p>
 			</form>
 		</div>
 		<?php
@@ -1544,14 +1584,14 @@ final class PNCP_Admin {
 		</ul>
 		<?php self::action_form_open( 'pncp_log', 'pncp_log' ); ?>
 			<input type="hidden" name="op" value="refresh_lists">
-			<?php submit_button( __( 'Refresh lists now', 'scrapelock' ), 'secondary', 'submit', false ); ?>
+			<?php submit_button( __( 'Refresh lists now', 'scrapelock' ), 'secondary', 'submit', false, self::submit_attrs() ); ?>
 		</form>
 		<?php if ( PNCP_Geo::needed() ) : ?>
 			<h3><?php esc_html_e( 'Country database', 'scrapelock' ); ?></h3>
 			<?php self::action_form_open( 'pncp_log', 'pncp_log' ); ?>
 				<input type="hidden" name="op" value="refresh_geo">
 				<p class="description"><?php esc_html_e( 'Downloads DB-IP Lite now (about 5 MB, it may take up to a minute). It is also refreshed automatically once a month.', 'scrapelock' ); ?></p>
-				<?php submit_button( __( 'Download now', 'scrapelock' ), 'secondary', 'submit', false ); ?>
+				<?php submit_button( __( 'Download now', 'scrapelock' ), 'secondary', 'submit', false, self::submit_attrs() ); ?>
 			</form>
 		<?php endif; ?>
 		<?php
@@ -1727,7 +1767,7 @@ final class PNCP_Admin {
 				</p>
 				<?php self::action_form_open( 'pncp_token', 'pncp_token' ); ?>
 					<input type="hidden" name="op" value="revoke_prev">
-					<?php submit_button( __( 'Revoke the previous one now', 'scrapelock' ), 'secondary', 'submit', false ); ?>
+					<?php submit_button( __( 'Revoke the previous one now', 'scrapelock' ), 'secondary', 'submit', false, self::submit_attrs() ); ?>
 				</form>
 			<?php endif; ?>
 			<?php self::action_form_open( 'pncp_token', 'pncp_token', 'pncp-token-form' ); ?>
@@ -1913,6 +1953,9 @@ final class PNCP_Admin {
 		$done = count( $ids ) < max( 1, $batch );
 		if ( $done ) {
 			delete_option( 'pncp_wm_cursor_' . $mode );
+			// 3.4.3: cached pages still linked the images as they were before the run (clean files after
+			// "Apply", watermarked ones after "Remove").
+			pncp_purge_page_cache();
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Tool progress.
 		$position = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'attachment' AND post_mime_type IN ('image/jpeg','image/png','image/webp') AND ID <= %d", $cursor ) );
@@ -2187,7 +2230,7 @@ final class PNCP_Admin {
 			</table>
 			<?php self::action_form_open( 'pncp_log', 'pncp_log' ); ?>
 				<input type="hidden" name="op" value="unban_all">
-				<?php submit_button( __( 'Unblock all', 'scrapelock' ), 'secondary', 'submit', true ); ?>
+				<?php submit_button( __( 'Unblock all', 'scrapelock' ), 'secondary', 'submit', true, self::submit_attrs() ); ?>
 			</form>
 		<?php endif; ?>
 
@@ -2290,7 +2333,7 @@ final class PNCP_Admin {
 		</p>
 		<?php self::action_form_open( 'pncp_log', 'pncp_log' ); ?>
 			<input type="hidden" name="op" value="clear_log">
-			<?php submit_button( __( 'Delete log', 'scrapelock' ), 'delete', 'submit', false ); ?>
+			<?php submit_button( __( 'Delete log', 'scrapelock' ), 'delete', 'submit', false, self::submit_attrs() ); ?>
 		</form>
 		<?php
 		self::render_log_settings( $s );

@@ -17,6 +17,22 @@ defined( 'ABSPATH' ) || exit;
 final class PNCP_Bots {
 
 	/**
+	 * 3.4.3: without an object cache or APCu, the site-wide surge counter is written on 1 page in this many,
+	 * adding this many each time (see surge()).
+	 *
+	 * @var int
+	 */
+	const SURGE_SAMPLE = 10;
+
+	/**
+	 * 3.4.3: without an object cache or APCu, how many new per-IP counter rows wp_options may get per minute,
+	 * site-wide (see db_incr_capped()).
+	 *
+	 * @var int
+	 */
+	const DB_NEW_KEYS_PER_MINUTE = 2000;
+
+	/**
 	 * Verifiable search engines: User-Agent patterns, reverse DNS domains and official IP list.
 	 *
 	 * @var array<string, array<string, mixed>>
@@ -153,8 +169,7 @@ final class PNCP_Bots {
 	public static function is_open_path( $path = null ) {
 		$raw = '';
 		if ( null === $path ) {
-			$uri  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
-			$raw  = '/' . ltrim( rawurldecode( (string) wp_parse_url( $uri, PHP_URL_PATH ) ), '/' );
+			$raw  = '/' . ltrim( self::request_path(), '/' );
 			$path = PNCP_Private_Urls::relative_path( $raw );
 		} else {
 			$raw = '/' . ltrim( (string) $path, '/' );
@@ -166,6 +181,19 @@ final class PNCP_Bots {
 		// blocked bot can always read robots.txt, llms.txt and the TDM opt-out even if the relative path
 		// resolves oddly. These files are only ever served from the domain root.
 		return (bool) preg_match( '#^/(?:robots\.txt|llms\.txt|llms-full\.txt|\.well-known/tdmrep\.json)$#i', $raw );
+	}
+
+	/**
+	 * 3.4.3: the path of this request, decoded (/%CF%84.xml: /τ.xml). Decoded first, then only checked for valid
+	 * UTF-8, with control characters taken out: sanitize_text_field() before rawurldecode() removed every %XX
+	 * octet, so a percent-encoded path (Greek letters, an encoded dot) was never the path it is compared to.
+	 *
+	 * @return string
+	 */
+	public static function request_path() {
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Decoded and cleaned below, only compared against paths.
+		$path = wp_check_invalid_utf8( rawurldecode( (string) wp_parse_url( $uri, PHP_URL_PATH ) ) );
+		return (string) preg_replace( '/[\x00-\x1F\x7F]/', '', $path );
 	}
 
 	/**
@@ -207,8 +235,7 @@ final class PNCP_Bots {
 		if ( isset( $_GET['sitemap'] ) ) {
 			return true;
 		}
-		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
-		$path = PNCP_Private_Urls::relative_path( rawurldecode( (string) wp_parse_url( $uri, PHP_URL_PATH ) ) );
+		$path = PNCP_Private_Urls::relative_path( self::request_path() );
 		return (bool) preg_match( '#^/(?:wp-sitemap[a-z0-9_-]*|sitemap(?:_index)?|[a-z0-9_-]+-sitemap[0-9]*)\.xml$#i', $path );
 	}
 
@@ -510,9 +537,10 @@ final class PNCP_Bots {
 		}
 
 		// Verification first: a real search engine gets through even if someone managed to
-		// get its IP blocked.
+		// get its IP blocked. Not for a shared CDN edge: its address is never the crawler's own, so a DNS lookup
+		// would only use up the budget, and the real Googlebot behind it must not be refused as a fake one.
 		$family = self::claimed_crawler( $ua );
-		if ( '' !== $family && self::is_verified_crawler( $family, $ip ) ) {
+		if ( '' !== $family && $per_ip && self::is_verified_crawler( $family, $ip ) ) {
 			return self::pass( 'search_engine' ); // Verified search engines: never blocked, never limited.
 		}
 		$ai = self::ai_verdict( $ua, $ip, $s );
@@ -538,11 +566,11 @@ final class PNCP_Bots {
 			return self::verdict( 403, 'fake_ai_bot', $ip );
 		}
 
-		if ( '' !== $family && ! empty( $s['block_fake_crawlers'] ) && ! self::$verify_inconclusive ) {
+		if ( '' !== $family && $per_ip && ! empty( $s['block_fake_crawlers'] ) && ! self::$verify_inconclusive ) {
 			self::strike_once_a_minute( $ip, 'fake_crawler' );
 			return self::verdict( 403, 'fake_crawler', $ip );
 		}
-		// When verification could not finish (DNS budget used up, or a temporary DNS failure) the request is
+		// When verification could not finish (DNS budget used up, a temporary DNS failure, or a shared CDN edge) the request is
 		// NOT blocked as a fake crawler: otherwise a flood of fake "Applebot" requests from many IPs could
 		// exhaust the shared DNS budget and make the real Applebot / YandexBot get a 403. It falls through to
 		// the normal per-minute limits instead, so a real crawler passes and a fake one is still rate-limited.
@@ -897,8 +925,27 @@ final class PNCP_Bots {
 			$path = substr( $path, strlen( $home ) );
 		}
 		$exempt = (bool) preg_match( '#\.(?:css|js|mjs|map|json|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|pdf|zip|gz|txt|xml)$#', $path )
-			|| (bool) preg_match( '#^/(?:favicon|apple-touch-icon|android-chrome|mstile|browserconfig|site\.webmanifest|manifest\.json|ads\.txt|app-ads\.txt|\.well-known/)#', $path );
+			|| (bool) preg_match( '#^/(?:favicon|apple-touch-icon|android-chrome|mstile|browserconfig|site\.webmanifest|manifest\.json|ads\.txt|app-ads\.txt|\.well-known/)#', $path )
+			// 3.4.3: a WooCommerce Store API address that a script of the shop built wrong. WooCommerce 11.2 asks
+			// /cart/undefinedwc/store/v1/cart after every change in the block cart (Mini-Cart in a block theme):
+			// in Emergency Mode (10 a minute, block after 2 violations) that banned real shoppers for hours.
+			|| false !== strpos( $path, 'wc/store/' )
+			|| self::same_origin_fetch();
 		return (bool) apply_filters( 'pncp_404_exempt', $exempt, $path );
+	}
+
+	/**
+	 * 3.4.3: a request made by a script of the site itself (fetch / XMLHttpRequest), as the browser marks it:
+	 * Sec-Fetch-Site same-origin and a Sec-Fetch-Dest other than a page. A 404 from it is a broken script of a
+	 * theme or plugin, not someone guessing addresses. Only the 404 limit skips it (the headers can be faked):
+	 * the request still counts towards the page limit.
+	 *
+	 * @return bool
+	 */
+	private static function same_origin_fetch() {
+		$site = isset( $_SERVER['HTTP_SEC_FETCH_SITE'] ) ? strtolower( sanitize_key( wp_unslash( $_SERVER['HTTP_SEC_FETCH_SITE'] ) ) ) : '';
+		$dest = isset( $_SERVER['HTTP_SEC_FETCH_DEST'] ) ? strtolower( sanitize_key( wp_unslash( $_SERVER['HTTP_SEC_FETCH_DEST'] ) ) ) : '';
+		return 'same-origin' === $site && '' !== $dest && ! in_array( $dest, array( 'document', 'iframe', 'frame', 'embed', 'object' ), true );
 	}
 
 	/**
@@ -948,9 +995,17 @@ final class PNCP_Bots {
 	 * @return bool
 	 */
 	public static function is_author_scan() {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only check of a public parameter.
-		$author = isset( $_GET['author'] ) ? sanitize_text_field( wp_unslash( $_GET['author'] ) ) : '';
-		return '' !== $author && ! is_admin() && preg_match( '/^-?\d/', $author ) && self::blocks_user_enum();
+		// 3.4.3: WordPress also takes the query var from POST (before GET), and turns any value with a digit in it
+		// ("+1", "x1") into an author archive that shows the username (body class, author feed link): only
+		// "?author=1" was caught, so "POST author=1" or "?author=%2B1" still listed the usernames.
+		// phpcs:disable WordPress.Security.NonceVerification -- Read-only check of a public parameter.
+		if ( isset( $_POST['author'] ) ) {
+			$author = sanitize_text_field( wp_unslash( $_POST['author'] ) );
+		} else {
+			$author = isset( $_GET['author'] ) ? sanitize_text_field( wp_unslash( $_GET['author'] ) ) : '';
+		}
+		// phpcs:enable
+		return '' !== $author && ! is_admin() && preg_match( '/\d/', $author ) && self::blocks_user_enum();
 	}
 
 	/**
@@ -1230,6 +1285,8 @@ final class PNCP_Bots {
 	 * and forward DNS, which must return the same IP. Positive result cached 24 hours, negative 1 hour,
 	 * failed reverse DNS 5 minutes. Without a verdict (DNS budget used up, reverse DNS failed) it returns
 	 * false and the request is refused, but not counted as a violation.
+	 * 3.4.3: for Google and Bing, once their list is loaded, an IP outside it with no PTR record is a verdict
+	 * ("no"), not a failed lookup.
 	 *
 	 * @param string $family google | bing | apple | yandex.
 	 * @param string $ip     IP.
@@ -1267,12 +1324,28 @@ final class PNCP_Bots {
 			PNCP_Log::cache_set( $budget, $used + 1, 2 * MINUTE_IN_SECONDS );
 		}
 
+		// 3.4.3: a family with an official IP list that is loaded (Google: its crawlers, special crawlers and
+		// user-triggered fetchers, all three in one list; Bing) has every real crawler IP on it. An IP outside the
+		// list whose reverse DNS answers "no such name" is then a fake, not a "perhaps": before, a fake Googlebot
+		// from a server without a PTR record was never blocked, never banned by the trap. Only a real DNS failure
+		// (timeout, server error) stays inconclusive; so does a family without a list, or a list not loaded yet.
+		$listed   = '' !== $def['list'] && array() !== PNCP_Ip::list_of( $def['list'] );
 		$verified = false;
-		$host     = (string) apply_filters( 'pncp_reverse_dns', null, $ip );
-		if ( '' === $host ) {
-			$host = (string) gethostbyaddr( $ip );
+		$pre      = apply_filters( 'pncp_reverse_dns', null, $ip ); // 3.4.3: false = "no PTR record" (a definite answer).
+		$host     = is_string( $pre ) ? $pre : '';
+		if ( false === $pre ) {
+			$host = null;
+		} elseif ( '' === $host ) {
+			$host = $listed ? self::reverse_dns( $ip ) : (string) gethostbyaddr( $ip );
 		}
-		if ( '' === $host || $host === $ip ) {
+		if ( null === $host && $listed ) {
+			// 3.4.3: no PTR record at all, and not on the official list: fake (cached like any "no", 1 hour).
+			if ( $store ) {
+				PNCP_Log::cache_set( $key, 'no', HOUR_IN_SECONDS );
+			}
+			return false;
+		}
+		if ( null === $host || '' === $host || $host === $ip ) {
 			// No PTR record or DNS failure: perhaps temporary, so it is retried in 5 minutes.
 			self::$verify_inconclusive = true;
 			if ( $store ) {
@@ -1302,6 +1375,37 @@ final class PNCP_Bots {
 			PNCP_Log::cache_set( $key, $verified ? 'yes' : 'no', $verified ? DAY_IN_SECONDS : HOUR_IN_SECONDS );
 		}
 		return $verified;
+	}
+
+	/**
+	 * 3.4.3: reverse DNS that tells "no PTR record" apart from a failed lookup (gethostbyaddr() returns the IP
+	 * for both). Used only for the families with an official IP list, where "no PTR" is a verdict.
+	 *
+	 * @param string $ip IP.
+	 * @return string|null The hostname; null when DNS answered that there is no PTR record; '' when the lookup
+	 *                     failed (timeout, server error), which is no verdict.
+	 */
+	private static function reverse_dns( $ip ) {
+		$packed = @inet_pton( $ip ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Invalid IP = no lookup.
+		if ( false === $packed ) {
+			return '';
+		}
+		if ( 4 === strlen( $packed ) ) {
+			$name = implode( '.', array_reverse( explode( '.', $ip ) ) ) . '.in-addr.arpa';
+		} else {
+			$name = implode( '.', array_reverse( str_split( bin2hex( $packed ) ) ) ) . '.ip6.arpa';
+		}
+		// dns_get_record() returns false on a failed lookup, and an empty array for NXDOMAIN / no data.
+		$records = @dns_get_record( $name, DNS_PTR ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- DNS failure = no verdict.
+		if ( false === $records ) {
+			return '';
+		}
+		foreach ( (array) $records as $record ) {
+			if ( ! empty( $record['target'] ) ) {
+				return (string) $record['target'];
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -1353,10 +1457,10 @@ final class PNCP_Bots {
 			return; // Explained, not acted on.
 		}
 		$key = 'pncp_sk_' . md5( $reason . '|' . PNCP_Ip::limit_key( $ip ) . '|' . (int) floor( time() / MINUTE_IN_SECONDS ) );
-		if ( false !== PNCP_Log::cache_get( $key ) ) {
+		// 3.4.3: an atomic add, so parallel requests of the same minute cannot both count.
+		if ( ! PNCP_Log::cache_add( $key, 1, 2 * MINUTE_IN_SECONDS ) ) {
 			return;
 		}
-		PNCP_Log::cache_set( $key, 1, 2 * MINUTE_IN_SECONDS );
 		PNCP_Log::strike( $ip, $reason );
 	}
 
@@ -1367,9 +1471,10 @@ final class PNCP_Bots {
 	 * @param string      $ip     IP.
 	 * @param string      $bucket Type (rate_page, rate_search, rate_rest).
 	 * @param string|null $net    Key to count under instead of the IP's own (e.g. its IPv6 /56).
+	 * @param int         $step   3.4.3: how much to add, in the database only (the sampled surge counter, see surge()).
 	 * @return int
 	 */
-	private static function hit( $ip, $bucket, $net = null ) {
+	private static function hit( $ip, $bucket, $net = null, $step = 1 ) {
 		$net    = null === $net ? PNCP_Ip::limit_key( $ip ) : $net;
 		$minute = (int) floor( time() / MINUTE_IN_SECONDS );
 		if ( null !== self::$dry ) {
@@ -1390,12 +1495,15 @@ final class PNCP_Bots {
 				return (int) $count;
 			}
 		}
-		$count = self::db_incr( $key, 2 * MINUTE_IN_SECONDS );
+		// 3.4.3: per-IP counters are capped in how many new rows they may add to wp_options each minute (see
+		// db_incr_capped()); the site-wide surge counter is one row, sampled instead.
+		$step  = max( 1, (int) $step );
+		$count = 'site' === $net ? self::db_incr( $key, 2 * MINUTE_IN_SECONDS, $step ) : self::db_incr_capped( $key, 2 * MINUTE_IN_SECONDS, $minute );
 		if ( null !== $count ) {
 			return $count;
 		}
 		// Database without ON DUPLICATE KEY (e.g. SQLite): plain transient, not atomic.
-		$count = (int) get_transient( $key ) + 1;
+		$count = (int) get_transient( $key ) + $step;
 		set_transient( $key, $count, 2 * MINUTE_IN_SECONDS );
 		return $count;
 	}
@@ -1438,9 +1546,21 @@ final class PNCP_Bots {
 	 */
 	private static function surge( $s ) {
 		$minute = (int) floor( time() / MINUTE_IN_SECONDS );
-		$count  = self::hit( '', 'surge', 'site' );
-		if ( 1 === $count ) {
-			PNCP_Surge::observe( $count, $minute, self::peek( 'surge', 'site', $minute - 1 ), $s );
+		$step   = 1;
+		if ( ! wp_using_ext_object_cache() && ! PNCP_Log::apcu_ok() ) {
+			// 3.4.3: in the database, every page of the site wrote the same row, so under attack all PHP workers
+			// queued on its row lock. Now 1 page in SURGE_SAMPLE adds SURGE_SAMPLE: the same count on average
+			// (the thresholds keep working), a tenth of the writes. A quiet minute may then read as 0.
+			$step = (int) apply_filters( 'pncp_surge_sample', self::SURGE_SAMPLE );
+			if ( $step > 1 && 1 !== wp_rand( 1, $step ) ) {
+				return;
+			}
+			$step = max( 1, $step );
+		}
+		$count = self::hit( '', 'surge', 'site', $step );
+		if ( $step === $count ) {
+			// The first count of this minute (3.4.3: the first sample): it closes the previous minute.
+			PNCP_Surge::observe( 1, $minute, self::peek( 'surge', 'site', $minute - 1 ), $s );
 		}
 	}
 
@@ -1450,12 +1570,14 @@ final class PNCP_Bots {
 	 * happens inside MySQL and the new value is read with LAST_INSERT_ID() on the same connection.
 	 * It is stored as a regular transient (with timeout), so WordPress cleans it up like all transients.
 	 *
-	 * @param string $key Transient key.
-	 * @param int    $ttl Seconds.
+	 * @param string $key  Transient key.
+	 * @param int    $ttl  Seconds.
+	 * @param int    $step 3.4.3: how much to add (1, or the sample size of the surge counter).
 	 * @return int|null Null if the database does not support it.
 	 */
-	private static function db_incr( $key, $ttl ) {
+	private static function db_incr( $key, $ttl, $step = 1 ) {
 		global $wpdb;
+		$step = max( 1, (int) $step );
 		if ( ! ( $wpdb instanceof wpdb ) || ! ( $wpdb->dbh instanceof mysqli ) ) {
 			return null;
 		}
@@ -1463,9 +1585,11 @@ final class PNCP_Bots {
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- Atomic counter: not possible with the options API.
 		$rows = $wpdb->query(
 			$wpdb->prepare(
-				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, '1', 'off')
-				ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(option_value + 1)",
-				'_transient_' . $key
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'off')
+				ON DUPLICATE KEY UPDATE option_value = LAST_INSERT_ID(option_value + %d)",
+				'_transient_' . $key,
+				(string) $step,
+				$step
 			)
 		);
 		if ( false === $rows ) {
@@ -1482,11 +1606,11 @@ final class PNCP_Bots {
 					(string) ( time() + (int) $ttl )
 				)
 			);
-			$count = 1;
+			$count = $step;
 		} else {
 			// No separate SELECT LAST_INSERT_ID(): with HyperDB / read-write split it would go to a replica.
 			$count = $insert_id;
-			if ( $count < 2 ) {
+			if ( $count < $step + 1 ) {
 				$wpdb->suppress_errors( $suppress );
 				return null; // Unexpected: fall back to the transient.
 			}
@@ -1494,6 +1618,61 @@ final class PNCP_Bots {
 		// phpcs:enable
 		$wpdb->suppress_errors( $suppress );
 		return $count;
+	}
+
+	/**
+	 * 3.4.3: a per-IP counter in the database, with a cap on new rows. Without an object cache or APCu, every
+	 * IP seen in a minute added two rows to wp_options (the counter and its timeout), per type: a crawl from
+	 * thousands of addresses wrote thousands of rows a minute. An IP already counted this minute is counted as
+	 * before (one UPDATE, as the INSERT it replaces). A new one takes a row from a site-wide budget of
+	 * DB_NEW_KEYS_PER_MINUTE; once that is used up, IPs not seen yet this minute are not stored, and count as
+	 * their first request of the minute (no per-IP limit for them until the next minute; the site-wide surge
+	 * counter, bans and every other check still apply).
+	 *
+	 * @param string $key    Transient key.
+	 * @param int    $ttl    Seconds.
+	 * @param int    $minute Minute (Unix time / 60).
+	 * @return int|null Null if the database does not support it.
+	 */
+	private static function db_incr_capped( $key, $ttl, $minute ) {
+		global $wpdb;
+		if ( ! ( $wpdb instanceof wpdb ) || ! ( $wpdb->dbh instanceof mysqli ) ) {
+			return null;
+		}
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- Atomic counter: not possible with the options API.
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = LAST_INSERT_ID(option_value + 1) WHERE option_name = %s",
+				'_transient_' . $key
+			)
+		);
+		if ( false === $rows ) {
+			$wpdb->suppress_errors( $suppress );
+			return null;
+		}
+		if ( 1 === (int) $rows ) {
+			// wpdb reads insert_id only after an INSERT: LAST_INSERT_ID(expr) of the same (write) connection.
+			$count = (int) mysqli_insert_id( $wpdb->dbh ); // phpcs:ignore WordPress.DB.RestrictedFunctions -- LAST_INSERT_ID() of the UPDATE just run; wpdb has no accessor for it.
+			$wpdb->suppress_errors( $suppress );
+			return $count >= 2 ? $count : null; // Unexpected: fall back to the transient, as db_incr() does.
+		}
+		// A new row: within this minute's budget? Read first, so that past the budget nothing is written at all.
+		$limit  = (int) apply_filters( 'pncp_db_new_counters_per_minute', self::DB_NEW_KEYS_PER_MINUTE );
+		$budget = self::counter_key( 'db_new_keys', 'site', $minute );
+		if ( $limit > 0 ) {
+			$used = (int) $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", '_transient_' . $budget ) );
+			if ( $used >= $limit ) {
+				$wpdb->suppress_errors( $suppress );
+				return 1; // Not stored: counted as this IP's first request of the minute.
+			}
+		}
+		// phpcs:enable
+		$wpdb->suppress_errors( $suppress );
+		if ( $limit > 0 ) {
+			self::db_incr( $budget, $ttl );
+		}
+		return self::db_incr( $key, $ttl );
 	}
 
 	/**
@@ -1591,7 +1770,8 @@ final class PNCP_Bots {
 	}
 
 	/**
-	 * Whoever opens the trap gets blocked.
+	 * Whoever opens the trap gets blocked (3.4.3: 10 minutes the first time, the full ban the second time
+	 * within 24 hours, see trap_ban_minutes()).
 	 *
 	 * A third-party site cannot get your visitors blocked (e.g. with <img src="…trap">):
 	 * browsers send Sec-Fetch-Site/Sec-Fetch-Dest, and blocking happens only for navigation
@@ -1602,8 +1782,7 @@ final class PNCP_Bots {
 		if ( empty( $s['enabled'] ) || empty( $s['trap_enabled'] ) ) {
 			return;
 		}
-		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
-		$path = PNCP_Private_Urls::relative_path( rawurldecode( (string) wp_parse_url( $uri, PHP_URL_PATH ) ) );
+		$path = PNCP_Private_Urls::relative_path( self::request_path() );
 		if ( 0 !== stripos( trailingslashit( $path ), self::trap_path() ) ) {
 			return;
 		}
@@ -1623,7 +1802,7 @@ final class PNCP_Bots {
 			PNCP_Log::add( 'trap', 403, $ip );
 			// "Block after 0 violations" = never block: log only.
 			if ( (int) $s['ban_strikes'] > 0 ) {
-				PNCP_Log::ban( $ip, (int) $s['ban_minutes'], 'trap' );
+				PNCP_Log::ban( $ip, self::trap_ban_minutes( $ip, (int) $s['ban_minutes'] ), 'trap' );
 			}
 		}
 
@@ -1631,6 +1810,27 @@ final class PNCP_Bots {
 		header( 'Content-Type: text/plain; charset=utf-8' );
 		echo 'Forbidden';
 		exit;
+	}
+
+	/**
+	 * 3.4.3: how long the trap bans. One trap hit banned the IP (IPv6: the /64) for the full time, which locked
+	 * out a whole office, school or mobile carrier NAT because of one bad client behind it. Now the first hit
+	 * is a short ban (10 minutes) and a strike kept for 24 hours; a second hit from the same IP key within those
+	 * 24 hours gets the full ban, as before. A scraper that comes back after the short ban is banned in full.
+	 *
+	 * @param string $ip      IP.
+	 * @param int    $minutes The configured ban, in minutes.
+	 * @return int Minutes.
+	 */
+	private static function trap_ban_minutes( $ip, $minutes ) {
+		$minutes = max( 1, (int) $minutes );
+		$key     = 'pncp_tk_' . md5( PNCP_Ip::limit_key( $ip ) );
+		if ( false !== PNCP_Log::cache_get( $key ) ) {
+			return $minutes; // Second hit within 24 hours: the full ban.
+		}
+		PNCP_Log::cache_set( $key, 1, DAY_IN_SECONDS );
+		$first = (int) apply_filters( 'pncp_trap_first_ban_minutes', 10 );
+		return $first > 0 ? min( $first, $minutes ) : $minutes;
 	}
 
 	/**

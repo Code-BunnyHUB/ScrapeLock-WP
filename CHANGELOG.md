@@ -1,5 +1,23 @@
 # Αλλαγές
 
+## 3.4.3 — 2026-11-06
+
+Μεγάλη έκδοση διορθώσεων, ελεγμένη σε εργαστήριο με 22 WordPress sites (PHP built-in server, nginx + PHP-FPM με APCu, Redis object cache, WooCommerce 11.2 με πραγματικό browser, WP Super Cache, W3 Total Cache, Cache Enabler, LiteSpeed Cache, nginx FastCGI cache) και αναβάθμιση από 3.4.2 με Lockdown. Η πλήρης λίστα είναι στο `readme.txt`. Οι αλλαγές των 3.3.2–3.4.2 είναι στο `changelog.txt`.
+
+- **Page cache:** ο έλεγχος πριν από το cache εφαρμόζει πλέον τη λίστα bots και το «χωρίς User-Agent» και στις σελίδες του cache. Με WP Super Cache, W3 Total Cache ή Cache Enabler, το GPTBot και τα άλλα bots διάβαζαν τις σελίδες του cache. Τα Applebot/YandexBot που δεν επαληθεύονται, και τα cookies σύνδεσης, παίρνουν τετραπλάσιο όριο αντί για κανένα. Το αυστηρό όριο του ελέγχου ανθρώπου ισχύει και στις σελίδες του cache. Καθαρίζεται και το cache του Cache Enabler, και κάθε cache όταν αλλάζει το watermark. Το Site Health προειδοποιεί όταν ένα page cache απαντά πριν από το ScrapeLock.
+- **Object cache (Redis):** το Lockdown και ο έλεγχος αρχείων διαβάζουν τα υπογεγραμμένα δεδομένα τους από τη βάση, όχι από το cache.
+- **PHP-FPM / APCu:**
+  - διπλές εγγραφές στο log υπό φόρτο·
+  - το ξεμπλοκάρισμα υπό φόρτο·
+  - τα `wp scrapelock block` / `unblock` και οι λίστες data center από το WP-CLI ισχύουν αμέσως.
+- **WooCommerce:**
+  - το Store API δεν δίνει πια τη μεγάλη περιγραφή στις απαντήσεις order/checkout·
+  - το Lockdown μπλοκάρει τη δημιουργία πελατών·
+  - στο Emergency Mode δεν μπλοκάρεται αγοραστής εξαιτίας των λανθασμένων αιτημάτων 404 του Mini-Cart.
+- **Lockdown:** δεν αφήνει εγκατάσταση, αναβάθμιση ή διαγραφή plugins/themes όσο είναι κλειδωμένο. Στέλνει email «Updates are waiting» με επανάληψη.
+- **Κανόνες nginx:** εισαγωγικά σε διαδρομές με κενό ή `;`, και τα «πάντα επιτρεπόμενα IP» δεν περιορίζονται από το `limit_req`.
+- **readme:** πιο σωστή διατύπωση για τους headless browsers και για το τι σταματά το Lockdown. Τα changelog των 3.4.1 και 3.4.2 μεταφέρθηκαν στο `changelog.txt`.
+
 ## 3.3.1 — 2026-10-26
 
 Διορθώσεις από τον έλεγχο του WordPress.org.

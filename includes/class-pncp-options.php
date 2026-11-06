@@ -777,6 +777,9 @@ final class PNCP_Options {
 		if ( '' !== self::ban_refusal( $ip ) ) {
 			return 'refused';
 		}
+		// Saved as it is checked: "203.0.113.7:443", "[2001:db8::1]" or "::ffff:203.0.113.7" become the plain
+		// address, which the list matches (and keeps on the next save of the Bots tab).
+		$ip     = PNCP_Ip::normalize( $ip );
 		$stored = self::stored();
 		$list   = self::parse_list( $stored['block_ips'] );
 		if ( in_array( $ip, $list, true ) ) {
@@ -1071,7 +1074,9 @@ final class PNCP_Options {
 			'human_check'             => 1,
 			'rate_limit_unverified'   => $min( $s['rate_limit_unverified'], 10 ),
 			'block_user_enum'         => 1,
-			'ban_strikes'             => 2,
+			// 3.4.3: never looser than the stored setting: 1 violation stays 1, and 0 (never block) stays the
+			// owner's choice. Before, it was always 2.
+			'ban_strikes'             => (int) $s['ban_strikes'] > 0 ? min( (int) $s['ban_strikes'], 2 ) : 0,
 			'ban_minutes'             => max( (int) $s['ban_minutes'], 360 ),
 			'list_excerpts'           => 1,
 			'ipv6_wide'               => 1,
@@ -1238,6 +1243,9 @@ final class PNCP_Options {
 			'list_excerpts',
 			'feed_mode',
 			'feed_source_link',
+			// 3.4.3: which image sizes the pages link (watermarked stand-ins or the clean files).
+			'watermark_enabled',
+			'watermark_products',
 			'watermark_full',
 			'rest_hide_content',
 			'graphql_hide_content',
@@ -1397,6 +1405,13 @@ final class PNCP_Options {
 		$input    = is_array( $input ) ? $input : array();
 		$defaults = self::defaults();
 		$clean    = array();
+		// 3.4.3: every setting is a single value. A list or an object (a crafted form post, or another plugin's
+		// update_option()) counts as not sent, instead of "Array to string conversion" warnings and "Array" saved.
+		foreach ( $input as $key => $value ) {
+			if ( '_sections' !== $key && ! is_scalar( $value ) ) {
+				unset( $input[ $key ] );
+			}
+		}
 
 		foreach ( self::bool_keys() as $key ) {
 			$clean[ $key ] = empty( $input[ $key ] ) ? 0 : 1;
@@ -1408,8 +1423,18 @@ final class PNCP_Options {
 		}
 
 		foreach ( self::int_ranges() as $key => $range ) {
-			$value         = isset( $input[ $key ] ) && '' !== $input[ $key ] ? (int) $input[ $key ] : $defaults[ $key ];
-			$clean[ $key ] = max( $range[0], min( $range[1], $value ) );
+			$value = isset( $input[ $key ] ) && '' !== $input[ $key ] ? $input[ $key ] : $defaults[ $key ];
+			// 3.4.3: a number written as text ("1e999", "1e30") is read as a number first, so it gets the same
+			// limits: (int) "1e999" is 0, which is "no limit" for the page limits, not the maximum.
+			if ( is_string( $value ) && is_numeric( trim( $value ) ) ) {
+				$value = 0 + trim( $value );
+			}
+			// A number too large for an integer (from an import: JSON numbers can be floats) is limited before it is
+			// made an integer, which would wrap it around, e.g. to a negative number and so to 0 (no limit).
+			if ( is_float( $value ) ) {
+				$value = $value >= $range[1] ? $range[1] : ( $value <= $range[0] ? $range[0] : (int) $value );
+			}
+			$clean[ $key ] = max( $range[0], min( $range[1], (int) $value ) );
 		}
 
 		$ids                   = isset( $input['excluded_ids'] ) ? (string) $input['excluded_ids'] : '';
@@ -1709,7 +1734,8 @@ final class PNCP_Options {
 		$lines = preg_split( '/\r\n|\r|\n/', (string) $raw );
 		$out   = array();
 		foreach ( $lines as $line ) {
-			$line = trim( sanitize_text_field( $line ) );
+			// 3.4.3: sanitize_text_field() keeps control characters other than tabs and line breaks (\x01, \x7f).
+			$line = trim( (string) preg_replace( '/[\x00-\x1F\x7F]+/', '', sanitize_text_field( $line ) ) );
 			if ( '' !== $line ) {
 				$out[ strtolower( $line ) ] = mb_substr( $line, 0, 100 );
 			}

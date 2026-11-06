@@ -64,19 +64,45 @@
 			return;
 		}
 		var text = 'value' in target ? target.value : target.textContent;
-		var original = button.textContent;
+		// The label before the first click: a second click within 2 seconds would otherwise keep "Copied" for good.
+		if ( ! button.hasAttribute( 'data-pncp-label' ) ) {
+			button.setAttribute( 'data-pncp-label', button.textContent );
+		}
+		var original = button.getAttribute( 'data-pncp-label' );
 		var done = function () {
 			button.textContent = cfg.i18n.copied;
-			setTimeout( function () {
+			clearTimeout( button.pncpTimer );
+			button.pncpTimer = setTimeout( function () {
 				button.textContent = original;
 			}, 2000 );
 		};
+		// Without the Clipboard API (a site on plain HTTP) or when it refuses: the text is selected and copied
+		// the old way. A <code> (the new token, shown only once) has no select(), so a range selects it; if
+		// copying fails, the text stays selected for Ctrl+C.
+		var fallback = function () {
+			var ok = false;
+			try {
+				if ( target.select ) {
+					target.select();
+				} else if ( window.getSelection && document.createRange ) {
+					var range = document.createRange();
+					range.selectNodeContents( target );
+					var selection = window.getSelection();
+					selection.removeAllRanges();
+					selection.addRange( range );
+				}
+				ok = document.execCommand( 'copy' );
+			} catch ( err ) {
+				ok = false;
+			}
+			if ( ok ) {
+				done();
+			}
+		};
 		if ( navigator.clipboard && window.isSecureContext ) {
-			navigator.clipboard.writeText( text ).then( done );
-		} else if ( target.select ) {
-			target.select();
-			document.execCommand( 'copy' );
-			done();
+			navigator.clipboard.writeText( text ).then( done, fallback );
+		} else {
+			fallback();
 		}
 	} );
 

@@ -271,6 +271,12 @@ final class PNCP_Health {
 	public static function test_precheck() {
 		$s = PNCP_Options::stored();
 		if ( empty( $s['enabled'] ) || empty( $s['precheck'] ) ) {
+			// 3.4.3: a page cache plugin that serves stored pages from advanced-cache.php (WP Super Cache, W3 Total
+			// Cache, Cache Enabler, WP Rocket...) answers before ScrapeLock's normal and early checks: without the
+			// pre-cache check, bots, limits and bans do not apply to those pages.
+			if ( ! empty( $s['enabled'] ) && defined( 'WP_CACHE' ) && WP_CACHE && file_exists( WP_CONTENT_DIR . '/advanced-cache.php' ) && ! is_multisite() ) {
+				return self::result( 'precheck', 'recommended', __( 'A page cache answers before ScrapeLock', 'scrapelock' ), __( 'A page cache plugin serves stored pages before WordPress loads, so the bot list, the page limits and the blocks do not apply to them. Turn on the pre-cache check in the Bots tab.', 'scrapelock' ), 'bots' );
+			}
 			return self::result( 'precheck', 'good', __( 'The ScrapeLock pre-cache check is off', 'scrapelock' ), __( 'Pages served from the page cache are not checked first; the normal check works as usual.', 'scrapelock' ) );
 		}
 		if ( PNCP_Precheck::active() ) {
@@ -345,12 +351,15 @@ final class PNCP_Health {
 	 */
 	public static function test_integrity() {
 		$report = PNCP_Integrity::report();
-		if ( ! empty( $report['tampered'] ) || ( PNCP_Lockdown::is_locked() && PNCP_Integrity::baseline()['tampered'] ) ) {
+		// 3.4.3: read once: each read unpacks the whole fingerprint (tens of thousands of files on a large site).
+		$base   = PNCP_Integrity::baseline();
+		$locked = PNCP_Lockdown::is_locked();
+		if ( ! empty( $report['tampered'] ) || ( $locked && $base['tampered'] ) ) {
 			return self::result( 'integrity', 'critical', __( 'The ScrapeLock file fingerprint was changed outside WordPress', 'scrapelock' ), __( 'The fingerprint of the code files was changed or removed in the database while the site was locked, so new or changed files might have been hidden. Check the files with a security scanner; a new fingerprint is taken the next time you lock the site.', 'scrapelock' ), 'lockdown' );
 		}
 		// The hourly check runs on WordPress's cron: if it stopped (DISABLE_WP_CRON without a real cron job, or
 		// the event was removed), a quiet report must not look like a clean site.
-		if ( PNCP_Lockdown::is_locked() && PNCP_Integrity::baseline()['time'] && (int) $report['time'] < time() - 3 * HOUR_IN_SECONDS ) {
+		if ( $locked && $base['time'] && (int) $report['time'] < time() - 3 * HOUR_IN_SECONDS ) {
 			return self::result( 'integrity', 'recommended', __( 'The ScrapeLock file check has not run for more than 3 hours', 'scrapelock' ), __( 'The file check runs every hour through WordPress\'s scheduled tasks (cron). If DISABLE_WP_CRON is set in wp-config.php, add a real cron job that calls wp-cron.php, or run "wp cron event run --due-now" regularly.', 'scrapelock' ), 'lockdown' );
 		}
 		$found = PNCP_Integrity::findings( $report );
@@ -364,7 +373,7 @@ final class PNCP_Health {
 				'lockdown'
 			);
 		}
-		if ( ! PNCP_Integrity::baseline()['time'] ) {
+		if ( ! $base['time'] ) {
 			return self::result( 'integrity', 'good', __( 'ScrapeLock file integrity is not active', 'scrapelock' ), __( 'The fingerprint of the code files is taken when the site is locked with Lockdown, and checked every hour while it stays locked.', 'scrapelock' ) );
 		}
 		return self::result( 'integrity', 'good', __( 'No changed code files', 'scrapelock' ), __( 'No code file was added or changed since the site was locked, and WordPress and its plugins from WordPress.org match their official copies.', 'scrapelock' ) );
@@ -415,6 +424,7 @@ final class PNCP_Health {
 			return (int) $s[ $key ] > 0 ? sprintf( __( '%d/min', 'scrapelock' ), (int) $s[ $key ] ) : __( 'Off', 'scrapelock' );
 		};
 		$until   = PNCP_Options::emergency_until();
+		$fp_time = PNCP_Integrity::baseline()['time']; // 3.4.3: read once (see test_integrity()).
 		$lists   = array();
 		foreach ( PNCP_Ip::lists_updated() as $name => $time ) {
 			$lists[] = $name . ': ' . ( $time ? wp_date( 'Y-m-d H:i', $time ) : '-' );
@@ -473,7 +483,7 @@ final class PNCP_Health {
 			'auto_emergency' => array( __( 'Automatic Emergency Mode', 'scrapelock' ), empty( $s['auto_emergency'] ) ? $no : ( 'start' === $s['auto_emergency_mode'] ? __( 'Starts on its own', 'scrapelock' ) : __( 'Alerts only', 'scrapelock' ) ) ),
 			'edge'           => array( __( 'Blocking at the CDN', 'scrapelock' ), $edge ),
 			'cdn_only'       => array( __( 'Only through the CDN', 'scrapelock' ), PNCP_Origin::active( $s ) ? $yes : $no ),
-			'integrity'      => array( __( 'File integrity fingerprint', 'scrapelock' ), PNCP_Integrity::baseline()['time'] ? wp_date( 'Y-m-d H:i', PNCP_Integrity::baseline()['time'] ) : '-' ),
+			'integrity'      => array( __( 'File integrity fingerprint', 'scrapelock' ), $fp_time ? wp_date( 'Y-m-d H:i', $fp_time ) : '-' ),
 			'lockdown'       => array( __( 'Lockdown', 'scrapelock' ), $lock ),
 			'lockdown_roles' => array( __( 'Roles frozen while locked', 'scrapelock' ), implode( ', ', PNCP_Lockdown::frozen_roles() ) ),
 			'lockdown_work'  => array( __( 'Roles that keep their work while locked', 'scrapelock' ), implode( ', ', PNCP_Lockdown::limited_roles() ) ),

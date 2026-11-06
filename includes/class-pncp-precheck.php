@@ -27,6 +27,11 @@ final class PNCP_Precheck {
 	const KEY    = 'pncp_precheck_key';
 
 	/**
+	 * 3.4.3: option with the key of the human check cookie for cached pages (see human()).
+	 */
+	const HUMAN_KEY = 'pncp_precheck_hv_key';
+
+	/**
 	 * Version of the configuration file; the runtime ignores any other.
 	 */
 	const FORMAT = 3;
@@ -324,6 +329,13 @@ final class PNCP_Precheck {
 			// 3.4.1: WooCommerce cart, checkout and My account (with their endpoints below them): never counted,
 			// as in the normal check (PNCP_Bots::is_shop_transaction_page()). Bans and the block list still apply.
 			'shop'            => self::shop_pages( $home ),
+			// 3.4.3: the bot list on cached pages too. WP Super Cache, W3 Total Cache, Cache Enabler and the like
+			// served GPTBot & co. their stored pages: only WP Rocket was told to skip them (rocket_cache_reject_ua).
+			'bots'            => self::bot_needles( $s ),
+			'empty_ua'        => ! empty( $s['block_bots'] ) && ! empty( $s['block_empty_ua'] ),
+			'allow_ua'        => self::allow_entries( $s ),
+			// 3.4.3: the stricter limit of visitors who have not passed the human check (see human()).
+			'human'           => self::human( $s ),
 		);
 		/**
 		 * Filters the configuration of the pre-cache check before it is written to config.json.
@@ -331,6 +343,83 @@ final class PNCP_Precheck {
 		 * @param array<string, mixed> $config Configuration.
 		 */
 		return (array) apply_filters( 'pncp_precheck_config', $config );
+	}
+
+	/**
+	 * 3.4.3: the blocked User-Agents (PNCP_Options::blocked_agents()), lowercase, as the normal check matches
+	 * them ("=name" = the whole User-Agent). Without the allowed AI search bots, as for WP Rocket: those are
+	 * counted like any visitor here, and verified by the normal check.
+	 *
+	 * @param array<string, mixed> $s Stored settings.
+	 * @return string[]
+	 */
+	private static function bot_needles( $s ) {
+		if ( empty( $s['block_bots'] ) ) {
+			return array();
+		}
+		$search = array_map( 'strtolower', PNCP_Options::allowed_ai_search() );
+		$out    = array();
+		foreach ( PNCP_Options::blocked_agents( $s ) as $needle ) {
+			$needle = strtolower( (string) $needle );
+			if ( '' !== $needle && '=' !== $needle && ! in_array( $needle, $search, true ) ) {
+				$out[] = $needle;
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * 3.4.3: the "always allowed" User-Agents (PNCP_Bots::allow_list_match()) and the allowed AI search bots:
+	 * [ lowercase User-Agent, null or the set of IPs an entry is pinned to ].
+	 *
+	 * @param array<string, mixed> $s Stored settings.
+	 * @return array<int, array{0:string, 1:mixed}>
+	 */
+	private static function allow_entries( $s ) {
+		$out = array();
+		foreach ( PNCP_Options::parse_list( $s['allow_list'] ) as $entry ) {
+			$entry = PNCP_Options::split_allow_entry( $entry );
+			if ( '' !== $entry['ua'] ) {
+				$out[] = array( strtolower( $entry['ua'] ), $entry['pinned'] ? self::set( $entry['ips'] ) : null );
+			}
+		}
+		foreach ( PNCP_Options::allowed_ai_search() as $ua ) {
+			if ( '' !== (string) $ua ) {
+				$out[] = array( strtolower( (string) $ua ), null );
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * 3.4.3: the human check on cached pages. The check cannot verify the human check's own cookie (signed with
+	 * the WordPress salts, which wp-config.php defines after the check has run), so the human check also sets a
+	 * second cookie (PNCP_Human::PC_COOKIE), signed with a key of this folder's configuration. A leaked key
+	 * would only let a script pass as verified: it would still get the normal page limit.
+	 *
+	 * @param array<string, mixed> $s Stored settings.
+	 * @return array{limit:int, key:string, cookie:string}
+	 */
+	private static function human( $s ) {
+		return array(
+			'limit'  => ! empty( $s['human_check'] ) ? (int) $s['rate_limit_unverified'] : 0,
+			'key'    => self::human_key(),
+			'cookie' => PNCP_Human::PC_COOKIE,
+		);
+	}
+
+	/**
+	 * 3.4.3: the key of the human check cookie for cached pages (created once).
+	 *
+	 * @return string
+	 */
+	public static function human_key() {
+		$key = (string) get_option( self::HUMAN_KEY, '' );
+		if ( strlen( $key ) < 32 ) {
+			$key = wp_generate_password( 40, false, false );
+			update_option( self::HUMAN_KEY, $key, false );
+		}
+		return $key;
 	}
 
 	/**
@@ -371,7 +460,7 @@ final class PNCP_Precheck {
 	 * The limits of Emergency Mode that the pre-cache check applies (see PNCP_Options::emergency_overlay()).
 	 *
 	 * @param array<string, mixed> $s Stored settings.
-	 * @return array{limit:int, ban_strikes:int, ban_minutes:int}
+	 * @return array{limit:int, ban_strikes:int, ban_minutes:int, v6_wide:bool, human:int}
 	 */
 	private static function emergency_limits( $s ) {
 		$overlay = PNCP_Options::emergency_overlay( $s );
@@ -379,6 +468,9 @@ final class PNCP_Precheck {
 			'limit'       => (int) $overlay['rate_limit'],
 			'ban_strikes' => (int) $overlay['ban_strikes'],
 			'ban_minutes' => (int) $overlay['ban_minutes'],
+			// 3.4.3: also the /56 limit and the human check's stricter limit, which Emergency Mode turns on.
+			'v6_wide'     => ! empty( $overlay['ipv6_wide'] ),
+			'human'       => ! empty( $overlay['human_check'] ) ? (int) $overlay['rate_limit_unverified'] : 0,
 		);
 	}
 
@@ -445,6 +537,7 @@ final class PNCP_Precheck {
 		}
 		$tmp = $file . '.' . wp_generate_password( 8, false ) . '.tmp';
 		if ( ! $filesystem->put_contents( $tmp, $contents, FS_CHMOD_FILE ) ) {
+			$filesystem->delete( $tmp ); // A write cut short (disk full, quota) may have left part of it.
 			return false;
 		}
 		if ( ! @rename( $tmp, $file ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.rename_rename -- Atomic replace in the same folder.
