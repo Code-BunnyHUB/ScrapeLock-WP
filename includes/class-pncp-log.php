@@ -254,6 +254,7 @@ final class PNCP_Log {
 			'blocked_ip'      => __( 'IP in the always-blocked list', 'scrapelock' ),
 			'blocked_ref'     => __( 'Referrer in the always-blocked list', 'scrapelock' ),
 			'trap'            => __( 'Bot trap', 'scrapelock' ),
+			'probe'           => __( 'Scanner probe (.env, .git, backups…)', 'scrapelock' ), // 3.5: "Ban scanners on their first probe".
 			'ban'             => __( 'New temporary block', 'scrapelock' ),
 			'manual'          => __( 'Blocked by hand', 'scrapelock' ),
 			'banned'          => __( 'Request from a blocked IP', 'scrapelock' ),
@@ -1105,6 +1106,11 @@ final class PNCP_Log {
 		}
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table; the cache is above.
 		$until = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT until_ts FROM %i WHERE ip = %s', self::bans_table(), $bankey ) );
+		if ( class_exists( 'PNCP_Bots', false ) && PNCP_Bots::explaining() ) {
+			// 3.5: a check (PNCP_Bots::explain()) writes no cache entry; the answer is kept for this request only.
+			self::$banned[ $bankey ] = $until > time();
+			return self::$banned[ $bankey ];
+		}
 		if ( wp_using_ext_object_cache() ) {
 			wp_cache_set( $key, $until, 'pncp', $until > time() ? $until - time() : 5 * MINUTE_IN_SECONDS );
 		} elseif ( self::apcu_ok() ) {
@@ -1142,6 +1148,20 @@ final class PNCP_Log {
 	 */
 	private static function apcu_ban_key( $bankey ) {
 		return self::apcu_key( 'pncp_ban_' . md5( $bankey ) . '_' . (string) get_option( self::BANS_STAMP_OPTION, '' ) );
+	}
+
+	/**
+	 * 3.5: the cache key of the probe ban's 24-hour memory of an IP key (PNCP_Bots::probe_ban_minutes()). Without
+	 * an object cache the stamp of the last ban change made from WP-CLI is part of it, as for the ban answers
+	 * (apcu_ban_key()): "wp scrapelock unblock" cannot reach the web server's APCu, and the new stamp gives a
+	 * lifted IP a clean memory there.
+	 *
+	 * @param string $ip IP or ban key.
+	 * @return string
+	 */
+	public static function probe_memory_key( $ip ) {
+		$key = 'pncp_pk_' . md5( PNCP_Ip::limit_key( (string) $ip ) );
+		return wp_using_ext_object_cache() ? $key : $key . '_' . (string) get_option( self::BANS_STAMP_OPTION, '' );
 	}
 
 	/**
@@ -1292,6 +1312,7 @@ final class PNCP_Log {
 		$wpdb->delete( self::bans_table(), array( 'ip' => $ip ), array( '%s' ) );
 		PNCP_Precheck::forget_ban( $ip );
 		self::cache_delete( 'pncp_st_' . md5( PNCP_Ip::limit_key( $ip ) ) );
+		self::cache_delete( self::probe_memory_key( $ip ) ); // 3.5: the probe ban's 24-hour memory: a lifted IP starts clean.
 		if ( wp_using_ext_object_cache() ) {
 			wp_cache_delete( 'pncp_ban_' . md5( $ip ), 'pncp' );
 		} elseif ( self::apcu_ok() ) {
@@ -1315,6 +1336,7 @@ final class PNCP_Log {
 		PNCP_Precheck::forget_all_bans();
 		foreach ( $ips as $ip ) {
 			self::cache_delete( 'pncp_st_' . md5( PNCP_Ip::limit_key( (string) $ip ) ) );
+			self::cache_delete( self::probe_memory_key( (string) $ip ) ); // 3.5: the probe ban's memory.
 			if ( wp_using_ext_object_cache() ) {
 				wp_cache_delete( 'pncp_ban_' . md5( (string) $ip ), 'pncp' );
 			} elseif ( self::apcu_ok() ) {

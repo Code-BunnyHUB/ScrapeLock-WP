@@ -497,11 +497,42 @@ final class PNCP_Rules {
 			$lines[] = 'location ^~ ' . self::nginx_arg( $uploads . '/' . $backup . '/' ) . ' { deny all; return 404; }';
 			$lines[] = '';
 		}
+		// 3.5: the pre-cache check's data (counters, bans, visitor IPs) and the country database: Nginx ignores the
+		// .htaccess files in them. Fixed names only, as Site Health prints them (PNCP_Health::folders_fix()), and
+		// only for a folder that exists, so the rules of a site that never used them stay as they were.
+		$data = array();
+		if ( '' !== (string) get_option( PNCP_Precheck::KEY, '' ) ) {
+			$data[] = 'location ^~ ' . self::nginx_arg( $uploads . '/' . PNCP_Precheck::DIR . '/' ) . ' { deny all; return 404; }';
+		}
+		if ( is_dir( PNCP_Geo::dir() ) ) {
+			$data[] = 'location ^~ ' . self::nginx_arg( $uploads . '/' . PNCP_Geo::DIR . '/' ) . ' { deny all; return 404; }';
+		}
+		if ( $data ) {
+			$lines[] = '# ScrapeLock\'s data folders (pre-cache check, country database): never public.';
+			$lines   = array_merge( $lines, $data );
+			$lines[] = '';
+		}
 		if ( $s['hide_versions'] ) {
 			$lines[] = '# Hide versions: readme / changelog files that give the version of WordPress, plugins and themes away (404).';
 			foreach ( self::version_regexes() as $regex ) {
 				$lines[] = 'location ~* ' . self::nginx_arg( $regex ) . ' { return 404; }';
 			}
+			$lines[] = '';
+		}
+		// 3.5: "Ban scanners on their first probe": the probe paths go to WordPress, which bans (only when on).
+		$probe   = self::probe_regex();
+		$missing = self::probe_regex( 'server_missing' );
+		if ( '' !== $probe ) {
+			$lines[] = '# Scanner probes (.env, .git, wp-config.php backups, SSH keys): sent to WordPress, which bans the IP';
+			$lines[] = '# ("Ban scanners on their first probe"). These files are never served, even if they exist. Put it ABOVE any';
+			$lines[] = '# location that denies hidden files (location ~ /\\.): Nginx uses the first regex location that matches.';
+			$lines[] = 'location ~* ' . self::nginx_arg( $probe ) . ' { rewrite ^ ' . self::url_path( home_url() ) . '/index.php last; }';
+			$lines[] = '';
+		}
+		// 3.5: dumps and archives at the top of the site only when no such file exists (a real download is served).
+		if ( '' !== $missing ) {
+			$lines[] = '# Scanner probes for database dumps and backup archives: sent to WordPress only when the file does not exist.';
+			$lines[] = 'location ~* ' . self::nginx_arg( $missing ) . ' { try_files $uri ' . self::url_path( home_url() ) . '/index.php?$args; }';
 			$lines[] = '';
 		}
 		if ( $s['block_upload_php'] ) {
@@ -594,6 +625,22 @@ final class PNCP_Rules {
 	}
 
 	/**
+	 * 3.5: the scanner probe paths for the server rules (PNCP_Probe::SERVER_KEYS), as a regex of the full request
+	 * path, or '' when "Ban scanners on their first probe" is off.
+	 *
+	 * @param string $where 'server' (always sent to WordPress) or 'server_missing' (only when no such file exists).
+	 * @return string
+	 */
+	private static function probe_regex( $where = 'server' ) {
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || empty( $s['probe_ban'] ) ) {
+			return '';
+		}
+		$body = PNCP_Probe::body( $where );
+		return '' === $body ? '' : '^' . preg_quote( self::url_path( home_url() ) . '/', '#' ) . $body . '$';
+	}
+
+	/**
 	 * Apache rules (.htaccess, above the WordPress rules).
 	 *
 	 * @return string
@@ -649,6 +696,19 @@ final class PNCP_Rules {
 			foreach ( self::version_regexes() as $regex ) {
 				$lines[] = 'RewriteRule ' . self::apache_regex( $regex ) . ' - [R=404,NC,L]';
 			}
+		}
+		// 3.5: "Ban scanners on their first probe" (only when on).
+		$probe   = self::probe_regex();
+		$missing = self::probe_regex( 'server_missing' );
+		if ( '' !== $probe ) {
+			$lines[] = '# Scanner probes (.env, .git, wp-config.php backups, SSH keys): sent to WordPress, which bans the IP.';
+			$lines[] = 'RewriteRule ' . self::apache_regex( $probe ) . ' ' . self::url_path( home_url() ) . '/index.php [NC,L]';
+		}
+		// 3.5: dumps and archives at the top of the site only when no such file exists (a real download is served).
+		if ( '' !== $missing ) {
+			$lines[] = '# Scanner probes for database dumps and backup archives: sent to WordPress only when the file does not exist.';
+			$lines[] = 'RewriteCond %{REQUEST_FILENAME} !-f';
+			$lines[] = 'RewriteRule ' . self::apache_regex( $missing ) . ' ' . self::url_path( home_url() ) . '/index.php [NC,L]';
 		}
 		if ( $s['block_upload_php'] ) {
 			$lines[] = '# No PHP in the uploads folder (ScrapeLock also writes this into the .htaccess of the uploads folder).';

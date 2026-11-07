@@ -337,6 +337,19 @@ final class PNCP_Precheck {
 			// 3.4.3: the stricter limit of visitors who have not passed the human check (see human()).
 			'human'           => self::human( $s ),
 		);
+		// 3.5: "Ban scanners on their first probe": only the entries that can never be a WordPress page (see
+		// PNCP_Probe::RUNTIME_KEYS). Absent when the setting is off, so config.json stays exactly as in 3.4.3.
+		if ( ! empty( $s['enabled'] ) && ! empty( $s['probe_ban'] ) ) {
+			$body = PNCP_Probe::body( 'runtime' );
+			if ( '' !== $body ) {
+				$config['probe'] = array(
+					're'      => '^/' . $body . '$',
+					/** This filter is documented in includes/class-pncp-bots.php */
+					'first'   => (int) apply_filters( 'pncp_probe_first_ban_minutes', 10 ),
+					'skip_ua' => array_values( array_filter( array_map( 'strtolower', PNCP_Bots::trap_exempt_agents() ) ) ),
+				);
+			}
+		}
 		/**
 		 * Filters the configuration of the pre-cache check before it is written to config.json.
 		 *
@@ -726,10 +739,41 @@ final class PNCP_Precheck {
 		if ( ! self::has_dir() ) {
 			return;
 		}
-		$file = self::dir() . '/bans/' . md5( $ip );
-		if ( file_exists( $file ) ) {
-			wp_delete_file( $file );
+		// 3.5: the probe ban's 24-hour memory too: a lifted IP starts clean.
+		foreach ( array( 'bans', 'probes' ) as $folder ) {
+			$file = self::dir() . '/' . $folder . '/' . md5( $ip );
+			if ( file_exists( $file ) ) {
+				wp_delete_file( $file );
+			}
 		}
+	}
+
+	/**
+	 * 3.5: the 24-hour probe memory of the check (PNCP_Precheck_Runtime::probe_seen(), same file and format), for
+	 * a probe WordPress bans: true when the check (or WordPress) remembers a probe of this IP key within 24
+	 * hours; otherwise the time of this probe is written. False without a data folder. Only called on a ban.
+	 *
+	 * @param string $key The IP's key (PNCP_Ip::limit_key()).
+	 * @return bool
+	 */
+	public static function probe_seen( $key ) {
+		if ( ! self::has_dir() ) {
+			return false;
+		}
+		$folder = self::dir() . '/probes';
+		if ( ! is_dir( $folder ) && ! wp_mkdir_p( $folder ) ) {
+			return false;
+		}
+		$file = $folder . '/' . md5( (string) $key );
+		$now  = time();
+		$time = is_file( $file ) ? (int) @file_get_contents( $file ) : 0; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- A local file of the plugin's folder; removed in between = not seen.
+		if ( $time > $now - DAY_IN_SECONDS ) {
+			// 3.5: the time of the first probe is kept, and a probe within the burst of it is the same first probe
+			// (parallel requests, as PNCP_Precheck_Runtime::probe_seen()).
+			return $time <= $now - PNCP_Bots::FIRST_BAN_BURST;
+		}
+		@file_put_contents( $file, (string) $now, LOCK_EX ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Same file the check writes.
+		return false;
 	}
 
 	/**
@@ -738,6 +782,7 @@ final class PNCP_Precheck {
 	public static function forget_all_bans() {
 		if ( self::has_dir() ) {
 			self::delete_folder( self::dir() . '/bans', self::dir() );
+			self::delete_folder( self::dir() . '/probes', self::dir() ); // 3.5: the probe ban's memory.
 		}
 	}
 
@@ -779,8 +824,9 @@ final class PNCP_Precheck {
 	 * @return int Number of lines.
 	 */
 	private static function import_lines( $lines ) {
-		$rows = array();
-		$bans = array();
+		$rows   = array();
+		$bans   = array();
+		$probes = array();
 		foreach ( $lines as $line ) {
 			$parts = explode( "\t", (string) $line );
 			if ( count( $parts ) < 6 || ! ctype_digit( $parts[0] ) || ! filter_var( $parts[3], FILTER_VALIDATE_IP ) ) {
@@ -792,6 +838,9 @@ final class PNCP_Precheck {
 			}
 			if ( 'ban' === $reason ) {
 				$bans[ $ip ] = (int) $time;
+			}
+			if ( 'probe' === $reason && 403 === (int) $code ) {
+				$probes[ $ip ] = (int) $time; // 3.5: a probe ban the runtime decided (code 0 = "Monitor only": none).
 			}
 			// The code is part of the key, as in PNCP_Log::add(): "would block" (0) and real blocks stay apart.
 			$key = $ip . '|' . $reason . '|' . (int) $code . '|' . (int) floor( (int) $time / MINUTE_IN_SECONDS );
@@ -818,7 +867,17 @@ final class PNCP_Precheck {
 		}
 		$minutes = max( 1, (int) PNCP_Options::stored()['ban_minutes'] );
 		foreach ( $bans as $ip => $since ) {
-			PNCP_Log::import_ban( $ip, $since + $minutes * MINUTE_IN_SECONDS, 'rate_page', $since );
+			// 3.5: an escalated probe ban (the second probe within 24 hours) is labelled as a probe.
+			PNCP_Log::import_ban( $ip, $since + $minutes * MINUTE_IN_SECONDS, isset( $probes[ $ip ] ) ? 'probe' : 'rate_page', $since );
+		}
+		// 3.5: the short first probe bans (only those without a full ban here: store_ban() mirrors the given expiry
+		// to the runtime's file, so a short one imported after a full one would shorten it).
+		if ( (int) PNCP_Options::stored()['ban_strikes'] > 0 ) {
+			foreach ( $probes as $ip => $since ) {
+				if ( ! isset( $bans[ $ip ] ) ) {
+					PNCP_Log::import_ban( $ip, $since + PNCP_Bots::probe_first_minutes( $minutes ) * MINUTE_IN_SECONDS, 'probe', $since );
+				}
+			}
 		}
 		return count( $lines );
 	}

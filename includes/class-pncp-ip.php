@@ -157,7 +157,8 @@ final class PNCP_Ip {
 		$group = PNCP_Log::apcu_ok() ? apcu_fetch( $apcu ) : false;
 		if ( ! is_array( $group ) ) {
 			$group = get_option( $name, array() );
-			if ( PNCP_Log::apcu_ok() && is_array( $group ) ) {
+			// 3.5: not while a request is only explained ("Check a request" writes no cache entry).
+			if ( PNCP_Log::apcu_ok() && is_array( $group ) && ! ( class_exists( 'PNCP_Bots', false ) && PNCP_Bots::explaining() ) ) {
 				apcu_store( $apcu, $group, HOUR_IN_SECONDS );
 			}
 		}

@@ -24,6 +24,12 @@
 final class PNCP_Precheck_Runtime {
 
 	/**
+	 * 3.5: seconds after a first probe in which another probe of the same IP key is part of the same first
+	 * burst (probe_seen()); PNCP_Bots::FIRST_BAN_BURST is the same for WordPress.
+	 */
+	const BURST = 10;
+
+	/**
 	 * Whether this request was logged here as "would block" ("Monitor only"): WordPress's own log then does
 	 * not log it a second time (PNCP_Log::add()).
 	 *
@@ -217,6 +223,22 @@ final class PNCP_Precheck_Runtime {
 				return array( 403, 'bot_ua', $ip );
 			}
 		}
+		// 3.5: a scanner probe (.env, .git, wp-config.php backups, dumps, backup archives at the top of the site):
+		// the configured paths can never be a WordPress page, so no 404 is needed to know. Only when the file does
+		// not exist, and never for what the normal check exempts and this one cannot verify (a login cookie, a
+		// crawler without a list, an allowed User-Agent, an IP that may be forged): those are left to WordPress.
+		if ( isset( $c['probe'] ) && is_array( $c['probe'] ) && self::probe( $c, $ua, $ip, $bankey, $reliable, $allowed, $unverified ) ) {
+			if ( ! self::monitoring( $c, $now ) && (int) $c['ban_strikes'] > 0 ) {
+				$full    = self::probe_seen( $dir, $bankey, $now );
+				$minutes = max( 1, (int) $c['ban_minutes'] );
+				$first   = isset( $c['probe']['first'] ) ? (int) $c['probe']['first'] : 10;
+				self::ban( $dir, $bankey, $now + ( $full || $first <= 0 ? $minutes : min( $first, $minutes ) ) * 60 );
+				if ( $full ) {
+					self::event( $c, 403, 'ban', $ip ); // The full ban, as for the page limit; the first one is the 'probe' event.
+				}
+			}
+			return array( 403, 'probe', $ip );
+		}
 		// Up to here (always-blocked IPs and temporary bans) every request is checked, even a POST: otherwise
 		// a cached page could be served to an IP that is already blocked or banned. The rate limit below
 		// counts the GET / HEAD views; the normal check counts the rest.
@@ -274,6 +296,112 @@ final class PNCP_Precheck_Runtime {
 			self::event( $c, 403, 'ban', $ip ); // The event keeps the exact IP for the log.
 		}
 		return array( 429, 'rate_page', $ip );
+	}
+
+	/**
+	 * 3.5: is this request a scanner probe to refuse and ban here ("Ban scanners on their first probe")? Only the
+	 * paths of the configuration (PNCP_Probe::RUNTIME_KEYS, never a WordPress page), only for a file that does
+	 * not exist, and only when the exemptions of the normal check (PNCP_Bots::should_ban_on_sight()) can be
+	 * decided here; anything in doubt goes on to WordPress, which decides with the full check.
+	 *
+	 * @param array<string, mixed> $c          Configuration.
+	 * @param string               $ua         User-Agent (lowercase).
+	 * @param string               $ip         IP.
+	 * @param string               $bankey     The IP's key (IPv6: the /64).
+	 * @param bool                 $reliable   Whether the IP can be trusted.
+	 * @param bool                 $allowed    Whether the User-Agent is always allowed.
+	 * @param bool                 $unverified Whether it claims to be a crawler this check cannot verify.
+	 * @return bool
+	 */
+	public static function probe( $c, $ua, $ip, $bankey, $reliable, $allowed, $unverified ) {
+		if ( ! $reliable || $allowed || $unverified || '' === $bankey || self::login_cookie() || self::is_prefetch() ) {
+			return false;
+		}
+		$re = isset( $c['probe']['re'] ) ? (string) $c['probe']['re'] : '';
+		if ( '' === $re ) {
+			return false;
+		}
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '/';
+		$full = '/' . ltrim( rawurldecode( (string) parse_url( $uri, PHP_URL_PATH ) ), '/' );
+		if ( false !== strpos( $full, "\0" ) || preg_match( '#(?:^|[/\\\\])\.\.(?:[/\\\\]|$)#', $full ) ) {
+			return false; // Never a file look-up outside the site: WordPress decides.
+		}
+		$full = (string) preg_replace( '/[\x00-\x1F\x7F]/', '', $full );
+		$path = $full;
+		$home = (string) $c['home'];
+		if ( '' !== $home && ( 0 === strcasecmp( $path, $home ) || 0 === stripos( $path, $home . '/' ) ) ) {
+			$path = '/' . ltrim( substr( $path, strlen( $home ) ), '/' );
+		}
+		$path = (string) preg_replace( '#^/index\.php(?=/)#i', '', $path );
+		if ( 1 !== @preg_match( '#' . $re . '#i', $path ) ) {
+			return false;
+		}
+		// Sec-Fetch, as the normal check: another site's <img>, a sub-resource or a human click never bans.
+		$site = isset( $_SERVER['HTTP_SEC_FETCH_SITE'] ) ? strtolower( trim( (string) $_SERVER['HTTP_SEC_FETCH_SITE'] ) ) : '';
+		$dest = isset( $_SERVER['HTTP_SEC_FETCH_DEST'] ) ? strtolower( trim( (string) $_SERVER['HTTP_SEC_FETCH_DEST'] ) ) : '';
+		$user = isset( $_SERVER['HTTP_SEC_FETCH_USER'] ) ? trim( (string) $_SERVER['HTTP_SEC_FETCH_USER'] ) : '';
+		if ( ( '' !== $site && ! in_array( $site, array( 'same-origin', 'none' ), true ) ) || ( '' !== $dest && 'document' !== $dest ) || '?1' === $user ) {
+			return false;
+		}
+		if ( '' === $site && 0 === strpos( $ua, 'mozilla/' ) ) {
+			return false; // A browser without Sec-Fetch: the normal check counts its probes (3rd within 10 minutes).
+		}
+		if ( isset( $c['probe']['skip_ua'] ) && '' !== $ua && self::ua_in( $ua, array_filter( array_map( 'strval', (array) $c['probe']['skip_ua'] ) ) ) ) {
+			return false; // Search engines without verification (pncp_trap_exempt_agents).
+		}
+		foreach ( (array) $c['crawlers'] as $i => $crawler ) {
+			if ( is_array( $crawler ) && isset( $crawler['ips'] ) && true === $crawler['ips'] ) {
+				$set = self::crawler_set( $c, $i );
+				if ( is_array( $set ) && isset( $set[1] ) && self::in_any( $ip, $set ) ) {
+					return false; // An official crawler address (Google, Bing), whatever its User-Agent.
+				}
+			}
+		}
+		// Only a file that does not exist; without any place to look, WordPress decides.
+		$candidates = array();
+		$root       = isset( $_SERVER['DOCUMENT_ROOT'] ) ? (string) $_SERVER['DOCUMENT_ROOT'] : '';
+		if ( '' !== $root ) {
+			$candidates[] = rtrim( $root, '/\\' ) . $full;
+		}
+		$script = isset( $_SERVER['SCRIPT_FILENAME'] ) ? (string) $_SERVER['SCRIPT_FILENAME'] : '';
+		if ( '' !== $script && 'index.php' === basename( $script ) ) {
+			$candidates[] = dirname( $script ) . $path;
+		}
+		if ( ! $candidates ) {
+			return false;
+		}
+		foreach ( $candidates as $file ) {
+			if ( @file_exists( $file ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * 3.5: the 24-hour memory of the probe ban: true when this IP key already probed within 24 hours (then the
+	 * full ban); otherwise the time of this probe is written and false is returned (the short first ban). Any
+	 * failure is false, never an error.
+	 *
+	 * @param string $dir Data folder.
+	 * @param string $key The IP's key (IPv6: the /64).
+	 * @param int    $now Time.
+	 * @return bool
+	 */
+	public static function probe_seen( $dir, $key, $now ) {
+		$folder = $dir . '/probes';
+		if ( ! is_dir( $folder ) ) {
+			@mkdir( $folder, 0755, true );
+		}
+		$file = $folder . '/' . md5( $key );
+		$time = is_file( $file ) ? (int) @file_get_contents( $file ) : 0;
+		if ( $time > $now - 86400 ) {
+			// 3.5: a probe within BURST seconds of the first one is part of the same first burst (parallel requests
+			// that passed the ban check before the first ban was stored): the short ban too.
+			return $time <= $now - self::BURST;
+		}
+		@file_put_contents( $file, (string) (int) $now, LOCK_EX );
+		return false;
 	}
 
 	/**
@@ -861,6 +989,13 @@ final class PNCP_Precheck_Runtime {
 			foreach ( (array) @scandir( $data . '/strikes' ) as $file ) {
 				$path = $data . '/strikes/' . $file;
 				if ( '.' !== $file && '..' !== $file && is_file( $path ) && (int) @filemtime( $path ) < $now - 600 ) {
+					@unlink( $path );
+				}
+			}
+			// 3.5: the probe ban's 24-hour memory.
+			foreach ( (array) @scandir( $data . '/probes' ) as $file ) {
+				$path = $data . '/probes/' . $file;
+				if ( '.' !== $file && '..' !== $file && is_file( $path ) && (int) @filemtime( $path ) < $now - 86400 ) {
 					@unlink( $path );
 				}
 			}

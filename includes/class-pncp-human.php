@@ -281,7 +281,9 @@ final class PNCP_Human {
 		$bucket = 'pncp_hv_' . md5( PNCP_Ip::limit_key( $ip ) ) . '_' . (int) floor( time() / MINUTE_IN_SECONDS );
 		$tries  = PNCP_Log::cache_incr( $bucket, MINUTE_IN_SECONDS ); // 3.4.3: atomic where it can be.
 		if ( $tries > self::max_per_minute() ) {
-			wp_send_json_error( null, 429 );
+			$retry = PNCP_Bots::retry_after(); // 3.5: the bucket is per minute, like the limits.
+			header( 'Retry-After: ' . $retry );
+			wp_send_json_error( array( 'retry_after' => $retry ), 429 );
 		}
 		$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_key( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : 'GET';
 		if ( 'POST' !== $method ) {

@@ -91,11 +91,38 @@ final class PNCP_Bots {
 	private static $dry = null;
 
 	/**
+	 * 3.5: seconds after a first trap hit or probe in which another one of the same IP key is part of the same
+	 * first burst (first_ban_claim(); PNCP_Precheck_Runtime::BURST for the pre-cache check).
+	 */
+	const FIRST_BAN_BURST = 10;
+
+	/**
+	 * 3.5: is a request only being explained (explain())? Other classes then leave their caches alone: a check
+	 * counts, logs, bans and caches nothing.
+	 *
+	 * @return bool
+	 */
+	public static function explaining() {
+		return null !== self::$dry;
+	}
+
+	/**
+	 * 3.5: whether a REST dispatch was already checked in this PHP request. WordPress dispatches each _embed
+	 * link (and some plugins their own reads, e.g. WooCommerce Admin while the index is built) inside the
+	 * visitor's request; only the first dispatch is the visitor's.
+	 *
+	 * @var bool
+	 */
+	private static $rest_seen = false;
+
+	/**
 	 * Registers the hooks.
 	 */
 	public static function init() {
 		add_action( 'init', array( __CLASS__, 'trap_guard' ), 0 );
 		add_action( 'init', array( __CLASS__, 'sitemap_guard' ), 1 );
+		add_action( 'template_redirect', array( __CLASS__, 'probe_guard' ), 11 ); // 3.5: after WordPress's redirects (priority 10).
+		add_filter( 'redirect_canonical', array( __CLASS__, 'probe_no_canonical' ), 99 ); // 3.5: see there.
 		add_action( 'template_redirect', array( __CLASS__, 'page_guard' ), 0 );
 		// Before WooCommerce handles the classic cart forms (wp_loaded, 20) and wc-ajax (template_redirect).
 		add_action( 'wp_loaded', array( __CLASS__, 'cart_guard' ), 0 );
@@ -251,6 +278,8 @@ final class PNCP_Bots {
 		if ( null !== $result || ! $request instanceof WP_REST_Request ) {
 			return $result;
 		}
+		$first           = ! self::$rest_seen; // 3.5: see $rest_seen.
+		self::$rest_seen = true;
 		if ( self::blocks_user_enum() && preg_match( '#^/wp/v2/users(?:/|$)#i', (string) $request->get_route() ) ) {
 			return self::rest_error( new WP_Error( 'rest_user_cannot_view', __( 'Sorry, you are not allowed to list users.', 'scrapelock' ), array( 'status' => rest_authorization_required_code() ) ) );
 		}
@@ -273,8 +302,15 @@ final class PNCP_Bots {
 			// exempt from the limit. The product catalogue (/wc/store/.../products) is scrapable data and counts
 			// toward the REST limit like any other read.
 			$count = ! preg_match( '#^/wc/store(?:/v\d+)?/(?:cart|checkout|batch)(?:/|$)#i', $route );
+			// 3.5: only the first dispatch of a request counts (and is weighted): the reads WordPress makes for
+			// _embed, or another plugin inside the same request, are still checked for blocks and bans but count
+			// nothing. Batch requests hold only writes, so this opens no way around the limit.
+			if ( ! $first ) {
+				$count = false;
+			}
 		}
-		$verdict = self::check( 'rest', $count, $cart );
+		$cost    = $count ? self::rest_cost( $request ) : 1; // 3.5: weighted by list size (see rest_cost()).
+		$verdict = self::check( 'rest', $count, $cart, $cost );
 		if ( ! $verdict ) {
 			return $result;
 		}
@@ -282,24 +318,112 @@ final class PNCP_Bots {
 		self::no_cache();
 		do_action( 'litespeed_control_set_nocache', 'scrapelock' ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- LiteSpeed Cache hook.
 		$cart_limit = in_array( $verdict['reason'], array( 'rate_cart', 'rate_coupon' ), true );
-		$retry      = $cart_limit ? (string) self::retry_after() : '60';
+		// 3.5: every 429 says when the per-minute counters start again, in the header and in the body (retry_after).
+		$retry = self::retry_after();
 		if ( 429 === $verdict['code'] ) {
-			$server->send_header( 'Retry-After', $retry );
+			$server->send_header( 'Retry-After', (string) $retry );
 		}
 		if ( $cart_limit ) {
-			$error = new WP_Error( 'pncp_rate_limited', self::cart_message( $verdict['reason'] ), array( 'status' => 429 ) );
-		} else {
 			$error = new WP_Error(
-				429 === $verdict['code'] ? 'pncp_rate_limited' : 'pncp_forbidden',
-				429 === $verdict['code'] ? __( 'Too many requests. Please try again in a minute.', 'scrapelock' ) : __( 'Access denied.', 'scrapelock' ),
-				array( 'status' => $verdict['code'] )
+				'pncp_rate_limited',
+				self::cart_message( $verdict['reason'] ),
+				array(
+					'status'      => 429,
+					'retry_after' => $retry,
+				)
 			);
+		} elseif ( 429 === $verdict['code'] ) {
+			$error = new WP_Error(
+				'pncp_rate_limited',
+				__( 'Too many requests. Please try again in a minute.', 'scrapelock' ),
+				array(
+					'status'      => 429,
+					'retry_after' => $retry,
+				)
+			);
+		} else {
+			$error = new WP_Error( 'pncp_forbidden', __( 'Access denied.', 'scrapelock' ), array( 'status' => $verdict['code'] ) );
 		}
 		$response = self::rest_error( $error );
 		if ( 429 === $verdict['code'] ) {
-			$response->header( 'Retry-After', $retry );
+			$response->header( 'Retry-After', (string) $retry );
 		}
 		return $response;
+	}
+
+	/**
+	 * 3.5: how many units an anonymous REST read counts toward "REST API requests per minute". One
+	 * ?per_page=100 answer holds ten times what a default one does, so a list of up to 20 items counts 1, 21-50
+	 * counts 2, and more than 50 (or per_page <= 0, "all" in some APIs) counts 3. Single items, other routes and
+	 * logged-in users count 1, as before. The route's default per_page is not applied yet at rest_pre_dispatch,
+	 * so no per_page is "none" (1); core validates the value only later, so garbage (an array, "abc") counts 1.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return int 1..10
+	 */
+	public static function rest_cost( $request ) {
+		if ( is_user_logged_in() ) {
+			return 1; // Authenticated: never weighted, and the filter does not run.
+		}
+		$per_page = null;
+		$cost     = 1;
+		$raw = $request->get_param( 'per_page' );
+		// 3.5: per_page first, so the registered routes are looked up (is_rest_collection()) only when it is given.
+		if ( is_scalar( $raw ) && is_numeric( trim( (string) $raw ) ) && self::is_rest_collection( (string) $request->get_route() ) ) {
+			$per_page = (int) ( 0 + trim( (string) $raw ) ); // "1e3" -> 1000; (int) of INF / NAN is 0, so 3.
+			$cost     = ( $per_page <= 0 || $per_page > 50 ) ? 3 : ( $per_page > 20 ? 2 : 1 );
+		}
+		/**
+		 * Filter: the units an anonymous REST read counts toward the REST limit (clamped to 1-10, and to the
+		 * limit itself, so the first request of a minute always passes).
+		 *
+		 * @since 3.5.0
+		 * @param int             $cost     Units (1 = one request).
+		 * @param WP_REST_Request $request  The request.
+		 * @param int|null        $per_page The per_page asked for on a collection route (null = none, or not a collection).
+		 */
+		$cost = (int) apply_filters( 'pncp_rest_cost', $cost, $request, $per_page );
+		return max( 1, min( 10, $cost ) );
+	}
+
+	/**
+	 * 3.5: whether a REST route is a list whose size per_page sets: every top-level wp/v2 collection (posts,
+	 * pages, media, comments, terms, search, any post type's rest_base; not users), the WooCommerce Store API
+	 * product lists and their term lists (not collection-data, single products, cart, checkout or batch), and
+	 * the WooCommerce REST product lists.
+	 *
+	 * @param string $route Route (e.g. /wp/v2/posts).
+	 * @return bool
+	 */
+	private static function is_rest_collection( $route ) {
+		// 3.5: a wp/v2 route only when its GET handler takes per_page (not types, taxonomies, statuses, settings...).
+		return ( (bool) preg_match( '#^/wp/v2/(?!users(?:/|$))[a-z0-9_-]+/?$#i', $route ) && self::rest_route_has_per_page( $route ) )
+			|| (bool) preg_match( '#^/wc/store(?:/v\d+)?/products(?:/(?:categories|tags|brands|reviews|attributes(?:/\d+/terms)?))?/?$#i', $route )
+			|| (bool) preg_match( '#^/wc/v\d+/products(?:/(?:categories|tags|reviews|attributes))?/?$#i', $route );
+	}
+
+	/**
+	 * 3.5: whether the registered GET handler of a route declares a per_page argument. Only looked up for an
+	 * anonymous read of a top-level wp/v2 route that asks for per_page.
+	 *
+	 * @param string $route Route (e.g. /wp/v2/posts).
+	 * @return bool
+	 */
+	private static function rest_route_has_per_page( $route ) {
+		$routes = rest_get_server()->get_routes();
+		$route  = untrailingslashit( $route );
+		foreach ( array( $route, strtolower( $route ) ) as $key ) {
+			if ( ! isset( $routes[ $key ] ) || ! is_array( $routes[ $key ] ) ) {
+				continue;
+			}
+			foreach ( $routes[ $key ] as $handler ) {
+				if ( is_array( $handler ) && ! empty( $handler['methods']['GET'] ) && isset( $handler['args']['per_page'] ) ) {
+					return true;
+				}
+			}
+			return false;
+		}
+		return false;
 	}
 
 	/**
@@ -413,29 +537,32 @@ final class PNCP_Bots {
 			// wc-ajax (and admin-ajax.php) answers JSON: the shop's scripts show the message instead of a broken page.
 			self::no_cache();
 			$limited = in_array( $verdict['reason'], array( 'rate_cart', 'rate_coupon' ), true );
+			$retry   = self::retry_after(); // 3.5: the same value in the header and in the JSON.
 			if ( 429 === $verdict['code'] && ! headers_sent() ) {
-				header( 'Retry-After: ' . ( $limited ? self::retry_after() : 60 ) );
+				header( 'Retry-After: ' . $retry );
 			}
 			$message = $limited ? self::cart_message( $verdict['reason'] ) : ( 429 === $verdict['code'] ? __( 'Too many requests. Please try again in a minute.', 'scrapelock' ) : __( 'Access denied.', 'scrapelock' ) );
-			wp_send_json(
-				array(
-					'error'    => true,
-					'code'     => 429 === $verdict['code'] ? 'pncp_rate_limited' : 'pncp_forbidden',
-					'message'  => $message,
-					'messages' => '<ul class="woocommerce-error" role="alert"><li>' . esc_html( $message ) . '</li></ul>',
-				),
-				(int) $verdict['code']
+			$body    = array(
+				'error'    => true,
+				'code'     => 429 === $verdict['code'] ? 'pncp_rate_limited' : 'pncp_forbidden',
+				'message'  => $message,
+				'messages' => '<ul class="woocommerce-error" role="alert"><li>' . esc_html( $message ) . '</li></ul>',
 			);
+			if ( 429 === $verdict['code'] ) {
+				$body['retry_after'] = $retry; // 3.5: only on a 429; the 403 JSON is unchanged.
+			}
+			wp_send_json( $body, (int) $verdict['code'] );
 		}
 		self::die_html( $verdict['code'] );
 	}
 
 	/**
 	 * Seconds until the per-minute counters start again (for Retry-After).
+	 * 3.5: public, for the retry_after field of the GraphQL and human-check 429s.
 	 *
 	 * @return int
 	 */
-	private static function retry_after() {
+	public static function retry_after() {
 		return max( 1, MINUTE_IN_SECONDS - ( time() % MINUTE_IN_SECONDS ) );
 	}
 
@@ -461,9 +588,10 @@ final class PNCP_Bots {
 	 * @param string $context page | search | rest | graphql | sitemap.
 	 * @param bool   $count   Whether to count toward the limit.
 	 * @param string $cart    WooCommerce cart write: 'cart' or 'coupon' counts toward the cart limits ('' = not one).
+	 * @param int    $cost    3.5: units this request counts toward the REST / GraphQL limit (1 = one request).
 	 * @return array{code:int, reason:string}|null Null if the request passes (always in "Monitor only", see verdict()).
 	 */
-	public static function check( $context, $count = true, $cart = '' ) {
+	public static function check( $context, $count = true, $cart = '', $cost = 1 ) {
 		$s = PNCP_Options::get();
 		// No exemption for wp_doing_ajax(): WooCommerce defines DOING_AJAX on wc-ajax, so every bot would
 		// get through (confirmed with real WooCommerce). On admin-ajax.php only WooCommerce's cart actions get
@@ -719,10 +847,13 @@ final class PNCP_Bots {
 		if ( $count && isset( $limits[ $context ] ) ) {
 			$limit = (int) $s[ $limits[ $context ][0] ];
 			if ( $limit > 0 ) {
-				$count = self::hit( $ip, $limits[ $context ][1] );
+				// 3.5: a REST list counts by size (rest_cost()); never more than the limit, so the first request of a minute always passes.
+				$units = 'rest' === $context ? max( 1, min( (int) $cost, $limit ) ) : 1;
+				$count = self::hit( $ip, $limits[ $context ][1], null, $units );
 				if ( $count > $limit ) {
-					// One "violation" per minute in which the limit was exceeded, not one per request.
-					if ( $count === $limit + 1 ) {
+					// One "violation" per minute in which the limit was exceeded, not one per request (3.5: on the
+					// request that crossed it; with weighted units the count may jump past limit + 1).
+					if ( $count - $units <= $limit ) {
 						self::strike( $ip, $limits[ $context ][1] );
 					}
 					return self::verdict( 429, $limits[ $context ][1], $ip );
@@ -762,7 +893,7 @@ final class PNCP_Bots {
 	 * What check() would answer to a request with this IP, User-Agent and address, without acting on it: nothing
 	 * is counted (the per-minute counters are only read, and this request is added to what they hold), nothing
 	 * is logged, no violation or temporary block is added, and no DNS verdict or DNS budget is stored. For
-	 * "wp scrapelock check".
+	 * "wp scrapelock check" and, 3.5, the "Check a request" card (PNCP_Tester).
 	 *
 	 * Taken into account: the settings in effect now (also Emergency Mode), the headers given (e.g.
 	 * Accept-Language, Sec-Fetch-Mode, Sec-CH-UA, Referer), the kind of address (page, search, REST API,
@@ -774,7 +905,7 @@ final class PNCP_Bots {
 	 * @param string                $ua      User-Agent ('' = none).
 	 * @param string                $url     Address on this site ('' = the home page).
 	 * @param array<string, string> $headers More request headers, name => value (e.g. "Accept-Language" => "en").
-	 * @return array{context:string, feed:bool, code:int, reason:string, pass:string, monitor:bool}
+	 * @return array{context:string, feed:bool, code:int, reason:string, pass:string, monitor:bool, inconclusive:bool}
 	 */
 	public static function explain( $ip, $ua, $url = '', $headers = array() ) {
 		$url    = '' === trim( (string) $url ) ? home_url( '/' ) : (string) $url;
@@ -800,6 +931,10 @@ final class PNCP_Bots {
 			'HTTP_PURPOSE'         => null,
 			'HTTP_X_MOZ'           => null,
 			'HTTP_X_PURPOSE'       => null,
+			// 3.5: the admin's own country from the CDN edge (admin-ajax behind Cloudflare / Bunny) must not be
+			// taken as the country of the IP checked: without them the country database decides.
+			'HTTP_CF_IPCOUNTRY'           => null,
+			'HTTP_CDN_REQUESTCOUNTRYCODE' => null,
 		);
 		foreach ( (array) $headers as $name => $value ) {
 			$key = 'HTTP_' . strtoupper( str_replace( '-', '_', trim( (string) $name ) ) );
@@ -834,16 +969,23 @@ final class PNCP_Bots {
 			$context = 'page';
 		}
 
-		self::$dry = array(
+		// 3.5: a stale flag of an earlier verification in this PHP request must not leak into this one.
+		self::$verify_inconclusive = false;
+		self::$dry                 = array(
 			'ip'   => (string) $ip,
 			'ua'   => (string) $ua,
 			'feed' => $feed,
 		);
+		// 3.5: a REST list counts by size, as rest_guard() counts it (rest_cost(); the caller is logged out).
+		$cost = 'rest' === $context ? self::explain_rest_cost( $relative, $args ) : 1;
+		PNCP_Geo::reset(); // 3.5: no country cached earlier in this PHP request (e.g. the admin's own IP).
 		try {
-			$verdict = self::check( $context );
-			$dry     = self::$dry;
+			$verdict      = self::check( $context, true, '', $cost );
+			$dry          = self::$dry;
+			$inconclusive = self::$verify_inconclusive;
 		} finally {
 			self::$dry = null;
+			PNCP_Geo::reset();
 			foreach ( $saved as $key => $value ) {
 				if ( null === $value ) {
 					unset( $_SERVER[ $key ] );
@@ -853,14 +995,37 @@ final class PNCP_Bots {
 			}
 		}
 		return array(
-			'context' => $context,
-			'feed'    => $feed,
-			'code'    => $verdict ? (int) $verdict['code'] : 0,
-			'reason'  => $verdict ? (string) $verdict['reason'] : '',
-			'pass'    => $verdict ? '' : ( isset( $dry['pass'] ) ? (string) $dry['pass'] : 'passed' ),
+			'context'      => $context,
+			'feed'         => $feed,
+			'code'         => $verdict ? (int) $verdict['code'] : 0,
+			'reason'       => $verdict ? (string) $verdict['reason'] : '',
+			'pass'         => $verdict ? '' : ( isset( $dry['pass'] ) ? (string) $dry['pass'] : 'passed' ),
 			// In "Monitor only" a real request with this verdict is let through and logged as "Would block".
-			'monitor' => $verdict && PNCP_Options::monitoring(),
+			'monitor'      => $verdict && PNCP_Options::monitoring(),
+			// 3.5: for the "Check a request" card: a claimed search engine whose DNS check could not finish.
+			'inconclusive' => $inconclusive,
 		);
+	}
+
+	/**
+	 * 3.5: the units a REST read of explain() counts (rest_cost()), from the address: the route of ?rest_route=
+	 * or the path after the REST prefix, and the query arguments.
+	 *
+	 * @param string               $relative Path relative to home, decoded and lowercase.
+	 * @param array<string, mixed> $args     Query arguments.
+	 * @return int
+	 */
+	private static function explain_rest_cost( $relative, $args ) {
+		if ( isset( $args['rest_route'] ) && is_string( $args['rest_route'] ) ) {
+			$route = $args['rest_route'];
+		} else {
+			$route = (string) substr( $relative, strlen( '/' . rest_get_url_prefix() ) );
+		}
+		$route = '/' . ltrim( $route, '/' );
+		unset( $args['rest_route'] );
+		$request = new WP_REST_Request( 'GET', $route );
+		$request->set_query_params( $args );
+		return self::rest_cost( $request );
 	}
 
 	/**
@@ -1471,34 +1636,34 @@ final class PNCP_Bots {
 	 * @param string      $ip     IP.
 	 * @param string      $bucket Type (rate_page, rate_search, rate_rest).
 	 * @param string|null $net    Key to count under instead of the IP's own (e.g. its IPv6 /56).
-	 * @param int         $step   3.4.3: how much to add, in the database only (the sampled surge counter, see surge()).
+	 * @param int         $step   3.5: how much to add, in every backend (REST cost; the sampled surge counter, see surge()).
 	 * @return int
 	 */
 	private static function hit( $ip, $bucket, $net = null, $step = 1 ) {
 		$net    = null === $net ? PNCP_Ip::limit_key( $ip ) : $net;
 		$minute = (int) floor( time() / MINUTE_IN_SECONDS );
+		$step   = max( 1, (int) $step );
 		if ( null !== self::$dry ) {
 			// Explained, not counted: what the counter holds, plus this request.
-			return self::peek( $bucket, $net, $minute ) + 1;
+			return self::peek( $bucket, $net, $minute ) + $step;
 		}
 		$key = self::counter_key( $bucket, $net, $minute );
 		if ( wp_using_ext_object_cache() ) {
 			wp_cache_add( $key, 0, 'pncp', 2 * MINUTE_IN_SECONDS );
-			return (int) wp_cache_incr( $key, 1, 'pncp' );
+			return (int) wp_cache_incr( $key, $step, 'pncp' );
 		}
 		if ( PNCP_Log::apcu_ok() ) {
 			// Shared memory of PHP: atomic, and no database write on every page.
 			$name = PNCP_Log::apcu_key( $key );
 			apcu_add( $name, 0, 2 * MINUTE_IN_SECONDS );
-			$count = apcu_inc( $name );
+			$count = apcu_inc( $name, $step );
 			if ( false !== $count ) {
 				return (int) $count;
 			}
 		}
 		// 3.4.3: per-IP counters are capped in how many new rows they may add to wp_options each minute (see
 		// db_incr_capped()); the site-wide surge counter is one row, sampled instead.
-		$step  = max( 1, (int) $step );
-		$count = 'site' === $net ? self::db_incr( $key, 2 * MINUTE_IN_SECONDS, $step ) : self::db_incr_capped( $key, 2 * MINUTE_IN_SECONDS, $minute );
+		$count = 'site' === $net ? self::db_incr( $key, 2 * MINUTE_IN_SECONDS, $step ) : self::db_incr_capped( $key, 2 * MINUTE_IN_SECONDS, $minute, $step );
 		if ( null !== $count ) {
 			return $count;
 		}
@@ -1632,18 +1797,21 @@ final class PNCP_Bots {
 	 * @param string $key    Transient key.
 	 * @param int    $ttl    Seconds.
 	 * @param int    $minute Minute (Unix time / 60).
+	 * @param int    $step   3.5: how much to add (the REST cost).
 	 * @return int|null Null if the database does not support it.
 	 */
-	private static function db_incr_capped( $key, $ttl, $minute ) {
+	private static function db_incr_capped( $key, $ttl, $minute, $step = 1 ) {
 		global $wpdb;
 		if ( ! ( $wpdb instanceof wpdb ) || ! ( $wpdb->dbh instanceof mysqli ) ) {
 			return null;
 		}
+		$step     = max( 1, (int) $step );
 		$suppress = $wpdb->suppress_errors( true );
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- Atomic counter: not possible with the options API.
 		$rows = $wpdb->query(
 			$wpdb->prepare(
-				"UPDATE {$wpdb->options} SET option_value = LAST_INSERT_ID(option_value + 1) WHERE option_name = %s",
+				"UPDATE {$wpdb->options} SET option_value = LAST_INSERT_ID(option_value + %d) WHERE option_name = %s",
+				$step,
 				'_transient_' . $key
 			)
 		);
@@ -1655,7 +1823,7 @@ final class PNCP_Bots {
 			// wpdb reads insert_id only after an INSERT: LAST_INSERT_ID(expr) of the same (write) connection.
 			$count = (int) mysqli_insert_id( $wpdb->dbh ); // phpcs:ignore WordPress.DB.RestrictedFunctions -- LAST_INSERT_ID() of the UPDATE just run; wpdb has no accessor for it.
 			$wpdb->suppress_errors( $suppress );
-			return $count >= 2 ? $count : null; // Unexpected: fall back to the transient, as db_incr() does.
+			return $count >= $step + 1 ? $count : null; // Unexpected: fall back to the transient, as db_incr() does.
 		}
 		// A new row: within this minute's budget? Read first, so that past the budget nothing is written at all.
 		$limit  = (int) apply_filters( 'pncp_db_new_counters_per_minute', self::DB_NEW_KEYS_PER_MINUTE );
@@ -1664,7 +1832,7 @@ final class PNCP_Bots {
 			$used = (int) $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", '_transient_' . $budget ) );
 			if ( $used >= $limit ) {
 				$wpdb->suppress_errors( $suppress );
-				return 1; // Not stored: counted as this IP's first request of the minute.
+				return $step; // Not stored: counted as this IP's first request of the minute (3.5: of $step units).
 			}
 		}
 		// phpcs:enable
@@ -1672,7 +1840,7 @@ final class PNCP_Bots {
 		if ( $limit > 0 ) {
 			self::db_incr( $budget, $ttl );
 		}
-		return self::db_incr( $key, $ttl );
+		return self::db_incr( $key, $ttl, $step );
 	}
 
 	/**
@@ -1825,11 +1993,166 @@ final class PNCP_Bots {
 	private static function trap_ban_minutes( $ip, $minutes ) {
 		$minutes = max( 1, (int) $minutes );
 		$key     = 'pncp_tk_' . md5( PNCP_Ip::limit_key( $ip ) );
-		if ( false !== PNCP_Log::cache_get( $key ) ) {
+		if ( ! self::first_ban_claim( $key ) ) {
 			return $minutes; // Second hit within 24 hours: the full ban.
 		}
-		PNCP_Log::cache_set( $key, 1, DAY_IN_SECONDS );
 		$first = (int) apply_filters( 'pncp_trap_first_ban_minutes', 10 );
+		return $first > 0 ? min( $first, $minutes ) : $minutes;
+	}
+
+	/**
+	 * 3.5: "Ban scanners on their first probe" (opt-in). A request for a path only attack scanners ask for
+	 * (PNCP_Probe: .env, .git, wp-config.php backups, dumps and archives at the top of the site, SSH keys,
+	 * phpMyAdmin, Adminer, PHP in uploads) that WordPress answers with a 404 and that is not a real file gets a
+	 * 403 and a short ban (like the bot trap: probe_ban_minutes()). Same exemptions as the trap
+	 * (should_ban_on_sight()), plus the always-allowed User-Agents on any network (as the pre-cache check).
+	 * 3.5: runs on template_redirect after WordPress's own redirects (old slugs, redirect_canonical(), priority
+	 * 10), so a 404 that WordPress turns into a 301 is never acted on (3.5: except redirect_canonical()'s for a
+	 * path on the list: probe_no_canonical()). With plain permalinks WordPress answers an unknown path with the
+	 * home page, not a 404: then the list match and the file check decide alone.
+	 * Every match is refused with the same 403, also a real file and an exempt visitor (only logged and banned
+	 * when not exempt): a 404 for a real file and a 403 for a missing one would tell a scanner which secrets
+	 * are on disk. In "Monitor only" every match gets WordPress's normal 404 page instead.
+	 * Nothing before the list match touches the database, a transient or the file system.
+	 */
+	public static function probe_guard() {
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || empty( $s['probe_ban'] ) || ! ( is_404() || '' === (string) get_option( 'permalink_structure' ) ) ) {
+			return;
+		}
+		$path = PNCP_Probe::request_path();
+		if ( ! PNCP_Probe::matches( $path ) ) {
+			return;
+		}
+		if ( '' !== trim( (string) $s['private_paths'] ) && '' !== PNCP_Private_Urls::matching_pattern( $path, PNCP_Options::parse_list( $s['private_paths'] ) ) ) {
+			return; // A Private URL has its own answer.
+		}
+		// 3.5: before any exemption (as trap_guard()): a cached 404 for /.env would keep every later scanner from
+		// reaching PHP at all.
+		self::no_cache();
+		header( 'X-Robots-Tag: noindex, nofollow' );
+		$monitor = PNCP_Options::monitoring( $s );
+		$ban     = false;
+		// A real file is never logged or banned.
+		if ( ! PNCP_Probe::file_exists( $path ) ) {
+			$ip  = PNCP_Ip::client_ip();
+			$ua  = self::user_agent();
+			$ban = '' !== $ip && ! PNCP_Ip::is_cdn_edge( $ip ) && ! PNCP_Log::is_banned( $ip )
+				// 3.5: an always-allowed User-Agent (site managers, uptime monitors) on any network, as the pre-cache
+				// check: they run from data centers and may look for an exposed .env as a security check.
+				&& ! ( '' !== $ua && self::allow_list_match( $ua, $ip, $s ) )
+				&& self::should_ban_on_sight( $ip, 'pncp_pr_' );
+			/**
+			 * 3.5: last word before a scanner probe is logged and banned by WordPress (not applied by the pre-cache
+			 * check). The request is refused either way.
+			 *
+			 * @param bool   $ban  Whether to log and ban.
+			 * @param string $path The path asked for, relative to the home path (decoded).
+			 * @param string $ip   Visitor IP.
+			 */
+			$ban = $ban && apply_filters( 'pncp_probe_ban', true, $path, $ip );
+		}
+		// "Monitor only": logged as "would block", no ban and no memory, and the request goes on to the 404 page.
+		if ( $monitor ) {
+			if ( $ban ) {
+				PNCP_Log::add( 'probe', PNCP_Log::MONITOR_CODE, $ip );
+			}
+			return;
+		}
+		if ( $ban ) {
+			PNCP_Log::add( 'probe', 403, $ip );
+			// "Block after 0 violations" = never block: log only (as the trap).
+			if ( (int) $s['ban_strikes'] > 0 ) {
+				PNCP_Log::ban( $ip, self::probe_ban_minutes( $ip, (int) $s['ban_minutes'] ), 'probe' );
+			}
+		}
+		status_header( 403 );
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		echo 'Forbidden';
+		exit;
+	}
+
+	/**
+	 * 3.5: redirect_canonical() answers a 404 for /phpmyadmin/index.php or /index.php/.env with a 301 to the same
+	 * address without index.php, before probe_guard() runs, and most scanners do not follow it. A 404 whose path
+	 * is on the probe list is not redirected, so probe_guard() refuses it. Runs only when WordPress has a
+	 * redirect to make; other redirects (old slugs, real pages) are left alone.
+	 *
+	 * @param string|false $redirect_url The address WordPress redirects to.
+	 * @return string|false
+	 */
+	public static function probe_no_canonical( $redirect_url ) {
+		if ( ! is_string( $redirect_url ) || '' === $redirect_url || ! is_404() ) {
+			return $redirect_url;
+		}
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || empty( $s['probe_ban'] ) ) {
+			return $redirect_url;
+		}
+		$path = PNCP_Probe::request_path();
+		if ( ! PNCP_Probe::matches( $path ) ) {
+			return $redirect_url;
+		}
+		if ( '' !== trim( (string) $s['private_paths'] ) && '' !== PNCP_Private_Urls::matching_pattern( $path, PNCP_Options::parse_list( $s['private_paths'] ) ) ) {
+			return $redirect_url; // A Private URL has its own answer (as probe_guard()).
+		}
+		return false;
+	}
+
+	/**
+	 * 3.5: how long a probe bans: like the trap (trap_ban_minutes()), the first probe a short ban and a memory kept
+	 * for 24 hours; a second probe from the same IP key within those 24 hours gets the full ban.
+	 *
+	 * @param string $ip      IP.
+	 * @param int    $minutes The configured ban, in minutes.
+	 * @return int Minutes.
+	 */
+	private static function probe_ban_minutes( $ip, $minutes ) {
+		$minutes = max( 1, (int) $minutes );
+		$key     = PNCP_Log::probe_memory_key( $ip ); // 3.5: with the WP-CLI stamp (see there).
+		// 3.5: the pre-cache check's memory too (and this probe written to it), so a probe answered there and one
+		// answered here count as two, in either order.
+		$runtime = PNCP_Precheck::probe_seen( PNCP_Ip::limit_key( $ip ) );
+		if ( ! self::first_ban_claim( $key ) || $runtime ) {
+			return $minutes; // Second probe within 24 hours: the full ban.
+		}
+		return self::probe_first_minutes( $minutes );
+	}
+
+	/**
+	 * 3.5: the 24-hour memory of a first ban (trap, probe), claimed in one atomic step (with an object cache or
+	 * APCu): true for the first hit, false for a later one (then the full ban). A scanner sends its first
+	 * requests in parallel, and several of them pass the ban check before the first ban is stored; reading and
+	 * then writing the memory gave the later ones the full ban, which wins (store_ban() keeps the longest). The
+	 * memory holds the time of the first hit, and a hit within FIRST_BAN_BURST seconds of it counts as the same
+	 * first hit. (A memory written by an older version holds 1: a later hit, as before.)
+	 *
+	 * @param string $key Cache key.
+	 * @return bool
+	 */
+	private static function first_ban_claim( $key ) {
+		$now = time();
+		if ( PNCP_Log::cache_add( $key, $now, DAY_IN_SECONDS ) ) {
+			return true;
+		}
+		return (int) PNCP_Log::cache_get( $key ) > $now - self::FIRST_BAN_BURST;
+	}
+
+	/**
+	 * 3.5: the first probe ban: filter pncp_probe_first_ban_minutes (10), never longer than the full ban.
+	 *
+	 * @param int $minutes The configured ban, in minutes.
+	 * @return int Minutes.
+	 */
+	public static function probe_first_minutes( $minutes ) {
+		$minutes = max( 1, (int) $minutes );
+		/**
+		 * 3.5: minutes of the first scanner probe ban (0 or less: the full ban at once). Never longer than
+		 * "Block for N minutes". Read by the pre-cache check when its configuration is written.
+		 *
+		 * @param int $minutes Minutes (10).
+		 */
+		$first = (int) apply_filters( 'pncp_probe_first_ban_minutes', 10 );
 		return $first > 0 ? min( $first, $minutes ) : $minutes;
 	}
 
@@ -1855,6 +2178,19 @@ final class PNCP_Bots {
 	 * @return bool
 	 */
 	private static function trap_should_ban( $ip ) {
+		return self::should_ban_on_sight( $ip, 'pncp_tr_' );
+	}
+
+	/**
+	 * 3.5: the exemptions of the bot trap (trap_should_ban()), shared with the scanner probe ban (probe_guard()).
+	 * Unchanged code; only the cache-key prefix of the counter for browsers without Sec-Fetch is a parameter, so
+	 * the trap and the probe ban count separately.
+	 *
+	 * @param string $ip   IP.
+	 * @param string $seen Cache-key prefix of the "old browser" counter ('pncp_tr_' for the trap).
+	 * @return bool
+	 */
+	private static function should_ban_on_sight( $ip, $seen ) {
 		$s = PNCP_Options::get();
 		if ( '' === $ip || PNCP_Options::user_is_exempt( $s ) || PNCP_Ip::is_local( $ip ) || ! PNCP_Ip::reliable() || self::is_official_crawler_ip( $ip ) ) {
 			return false;
@@ -1903,7 +2239,7 @@ final class PNCP_Bots {
 			// Browser without Sec-Fetch: perhaps an old browser that loaded another site's <img>. Only after
 			// repeated hits (3rd within 10 minutes) is it treated as a bot, so a one-off cross-site <img> on
 			// someone else's page does not get an old-browser visitor banned.
-			$key  = 'pncp_tr_' . md5( PNCP_Ip::limit_key( $ip ) );
+			$key  = $seen . md5( PNCP_Ip::limit_key( $ip ) );
 			$seen = (int) PNCP_Log::cache_get( $key );
 			PNCP_Log::cache_set( $key, $seen + 1, 10 * MINUTE_IN_SECONDS );
 			return $seen >= 2;
