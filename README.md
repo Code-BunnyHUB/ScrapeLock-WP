@@ -28,6 +28,7 @@ Most content protection plugins disable right click in the browser. Scrapers and
 - **Private XML feeds** (price comparison sites, Google Merchant, ERP) protected with a token in a header or the URL. Only the token hash is stored; rotation with a grace period.
 - Optional: hide the REST API index from visitors, turn off pingbacks, and see which REST routes anyone can call.
 - **Hide versions** of WordPress, PHP and the plugins (generator tags, `?ver=`, X-Powered-By, and readme / changelog files through the server rules), so scanners cannot match them against lists of known vulnerabilities.
+- **Hide that the site runs on WordPress, as far as possible** (3.6): no REST API, oEmbed, RSD and shortlink links, emoji script, X-Pingback or X-Redirect-By for visitors, for tools such as BuiltWith and for scanners. The `/wp-content/` paths still show it; no plugin can hide those.
 - Optional: excerpts instead of the full text on lists of articles (home, categories, search), and blocking of web archives (Wayback Machine).
 - Usernames hidden from `?author=N`, the users endpoint, the sitemap and oEmbed.
 
@@ -35,6 +36,12 @@ Most content protection plugins disable right click in the browser. Scrapers and
 - Copy, right click, drag and print protection (or copy with a source link), blur on screenshot shortcuts, no framing by other sites.
 - Machine-readable AI opt-out (TDM): header, meta tag and `/.well-known/tdmrep.json`.
 - Watermarks, never applied twice, with the clean original kept.
+
+### Members, courses and paid content (3.6)
+No web page can stop a screenshot, a screen recording or a photo of the screen. These options make copies traceable instead:
+- **Who is reading, on every screenshot:** a faint line repeated over protected pages with the member's user name and the date and time. It never takes clicks or selections, comes back when removed or hidden, and the page is sent as private. Optionally the IP and time for visitors who are not signed in (fetched by the page, so cached pages still work).
+- **An invisible trace in the text:** zero-width characters with the account, the day and an HMAC made with the site's keys in each paragraph; paste copied text under Log → "Find whose copy this is".
+- **Per-account page limit** and **shared account alert**: an email when one account is used from several addresses within 10 minutes, optionally signing it out everywhere else.
 
 ### Server and CDN
 - Ready-made **Nginx, Apache and Cloudflare rules** generated for your own site and settings.
@@ -55,6 +62,7 @@ Freeze the whole site with one click and a code from your authenticator app (Goo
 - **Sealed against database tampering (3.3):** the lock and the file fingerprint are signed (HMAC-SHA256, key derived from `AUTH_KEY`/`AUTH_SALT` in `wp-config.php`), and a must-use plugin (`scrapelock-lockdown-guard.php`) keeps a signed copy of the lock outside the database. SQL injection in another plugin cannot unlock the site: protected options changed in the database are put back, and accounts made administrator behind WordPress's back cannot sign in. A temporary unlock gives the rights back only to the administrator who unlocked.
 - **File integrity:** a fingerprint of every PHP, `.htaccess` and `.user.ini` file is taken when you lock and checked every hour; WordPress and the plugins from WordPress.org are also compared with their official checksums. A new or changed file (usually a backdoor uploaded through a vulnerable plugin) is emailed to you; optional quarantine deactivates the plugin and renames new PHP files in the uploads folder.
 - **No PHP in the uploads folder:** `.htaccess` for Apache and a rule for Nginx.
+- **Wider coverage (3.6):** widgets, the theme's settings and WooCommerce's own payment methods are kept and put back; capabilities given to one user outside their role do not work while locked; the Site Editor's templates cannot be changed by code; code that plugins keep in the database (Code Snippets, WPCode) and the templates are checked every hour; files changed during a temporary unlock are emailed when it locks again.
 
 Lockdown complements a firewall such as Wordfence: the firewall and two-factor login guard the door, Lockdown guards what happens after someone is inside, for example with a stolen session cookie.
 
