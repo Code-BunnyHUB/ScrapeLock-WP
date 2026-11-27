@@ -1,0 +1,407 @@
+<?php
+/**
+ * ScrapeLock — έλεγχος πριν από το cache (2.6), σε πραγματικό WordPress.
+ *
+ *   WP_DIR=/path/to/wordpress BASE=http://127.0.0.1:8099 php t_precheck.php
+ *
+ * Προσομοιώνει cache σελίδων όπως του WP Rocket: WP_CACHE στο wp-config.php και ένα advanced-cache.php που
+ * σερβίρει τη /cached-page/ χωρίς να φορτώσει plugins. Το wp-config.php και το advanced-cache.php
+ * επανέρχονται στο τέλος (και σε σφάλμα). Μόνο σε WordPress δοκιμών.
+ */
+
+$wp_dir = getenv( 'WP_DIR' );
+$base   = rtrim( (string) getenv( 'BASE' ), '/' );
+if ( ! $wp_dir || ! $base ) {
+	fwrite( STDERR, "WP_DIR και BASE απαιτούνται\n" );
+	exit( 2 );
+}
+define( 'WP_USE_THEMES', false );
+require $wp_dir . '/wp-load.php';
+
+$fails = 0;
+function t( $label, $ok, $extra = '' ) {
+	global $fails;
+	if ( ! $ok ) {
+		++$fails;
+	}
+	echo ( $ok ? 'PASS ' : 'FAIL ' ) . $label . ( $extra && ! $ok ? "  [$extra]" : '' ) . "\n";
+}
+
+/** Αίτημα με curl: [code, headers, body]. */
+function req( $path, $headers = array(), $method = 'GET', $cookie = '' ) {
+	global $base;
+	$ch = curl_init( $base . $path );
+	$h  = array();
+	foreach ( $headers as $k => $v ) {
+		$h[] = $k . ': ' . $v;
+	}
+	$opts = array(
+		CURLOPT_RETURNTRANSFER => true,
+		CURLOPT_HEADER         => true,
+		CURLOPT_HTTPHEADER     => $h,
+		CURLOPT_CUSTOMREQUEST  => $method,
+		CURLOPT_TIMEOUT        => 30,
+	);
+	if ( 'HEAD' === $method ) {
+		$opts[ CURLOPT_NOBODY ] = true;
+	}
+	if ( '' !== $cookie ) {
+		$opts[ CURLOPT_COOKIE ] = $cookie;
+	}
+	curl_setopt_array( $ch, $opts );
+	$out  = (string) curl_exec( $ch );
+	$code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+	$hs   = (int) curl_getinfo( $ch, CURLINFO_HEADER_SIZE );
+	curl_close( $ch );
+	return array( $code, strtolower( substr( $out, 0, $hs ) ), substr( $out, $hs ) );
+}
+
+/** Επισκέπτης με browser: η IP στο X-Real-IP (ο server των tests είναι το 127.0.0.1, δηλαδή «Nginx μπροστά»). */
+function visitor( $ip, $extra = array() ) {
+	return array_merge(
+		array(
+			'X-Real-IP'       => $ip,
+			'X-Test-IP'       => $ip,
+			'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/141.0 Safari/537.36',
+			'Accept-Language' => 'el-GR,el;q=0.9',
+		),
+		$extra
+	);
+}
+
+function settings( $changes ) {
+	update_option( PNCP_OPTION, array_merge( PNCP_Options::stored(), $changes ) );
+	PNCP_Options::flush();
+	PNCP_Ip::reset();
+	// Το run.php ξαναγράφεται από το CLI: το OPcache του server το ξαναδιαβάζει μετά από revalidate_freq (2 s).
+	// (Από τη σελίδα ρυθμίσεων το plugin καλεί opcache_invalidate στον ίδιο server.)
+	sleep( 3 );
+}
+
+/** Περιμένει το επόμενο λεπτό αν μένουν λιγότερα από 20 δευτερόλεπτα (οι μετρητές είναι ανά λεπτό). */
+function same_minute() {
+	$left = 60 - time() % 60;
+	if ( $left < 20 ) {
+		sleep( $left + 1 );
+	}
+}
+
+/** Πόσα αιτήματα από τα $n πέρασαν (κωδικοί). */
+function codes( $path, $headers, $n, $method = 'GET', $cookie = '' ) {
+	$out = array();
+	for ( $i = 0; $i < $n; $i++ ) {
+		list( $code ) = req( $path, $headers, $method, $cookie );
+		$out[]        = $code;
+	}
+	return $out;
+}
+
+$config_file = PNCP_Precheck::config_path();
+$cache_file  = WP_CONTENT_DIR . '/advanced-cache.php';
+$original    = (string) file_get_contents( $config_file );
+$had_cache   = file_exists( $cache_file ) ? (string) file_get_contents( $cache_file ) : null;
+$keep        = PNCP_Options::stored();
+register_shutdown_function(
+	static function () use ( $config_file, $original, $cache_file, $had_cache, $keep ) {
+		file_put_contents( $config_file, $original );
+		if ( null === $had_cache ) {
+			@unlink( $cache_file );
+		} else {
+			file_put_contents( $cache_file, $had_cache );
+		}
+		update_option( PNCP_OPTION, $keep );
+		PNCP_Precheck::sync();
+	}
+);
+t( 'wp-config.php βρέθηκε', '' !== $config_file && 0 === strpos( $original, "<?php\n" ) );
+
+// «WP Rocket»: WP_CACHE και advanced-cache.php που σερβίρει τη /cached-page/ πριν από τα plugins.
+file_put_contents( $config_file, "<?php\ndefine( 'WP_CACHE', true ); // test cache\n" . substr( $original, 6 ) );
+file_put_contents( $cache_file, "<?php\nif ( isset( \$_SERVER['REQUEST_URI'] ) && 0 === strpos( \$_SERVER['REQUEST_URI'], '/cached-page/' ) ) {\n\theader( 'X-Test-Cache: HIT' );\n\techo 'CACHED PAGE';\n\texit;\n}\n" );
+// OPcache ξαναδιαβάζει τα αλλαγμένα αρχεία μετά από opcache.revalidate_freq δευτερόλεπτα (προεπιλογή 2).
+sleep( 3 );
+
+global $wpdb;
+PNCP_Log::unban_all();
+PNCP_Log::clear();
+// 3.4: ο έλεγχος ακολουθεί και το «Monitor only» (νέα εγκατάσταση: 7 ημέρες) και το Emergency Mode.
+// Οι δοκιμές ξεκινούν όπως ένα υπάρχον site: μπλοκάρει, χωρίς Emergency Mode.
+update_option( PNCP_Options::EMERGENCY_OPTION, 0 );
+settings(
+	array(
+		'monitor_mode'            => 0,
+		'monitor_until'           => 0,
+		'enabled'                 => 1,
+		'precheck'                => 0,
+		'rate_limit'              => 5,
+		'ban_strikes'             => 0,
+		'ban_minutes'             => 5,
+		'ip_header'               => 'x_real_ip',
+		'block_bots'              => 1,
+		'require_browser_headers' => 0,
+		'human_check'             => 0,
+		'allow_ips'               => '',
+		'block_ips'               => '',
+	)
+);
+
+/* ---------- Χωρίς τον έλεγχο: η σελίδα από το cache δεν έχει όριο ---------- */
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.10' ), 8 );
+t( 'χωρίς τον έλεγχο: 8 σελίδες από το cache, όλες 200 (το κενό που κλείνει)', array_fill( 0, 8, 200 ) === $c, implode( ',', $c ) );
+t( 'χωρίς τον έλεγχο: καμία γραμμή στο wp-config.php', ! PNCP_Precheck::in_config() );
+
+/* ---------- Ενεργοποίηση ---------- */
+// Εκτός wp-admin / WP-CLI / cron (π.χ. αναβάθμιση από αίτημα επισκέπτη) το wp-config.php δεν αλλάζει (2.6.4).
+settings( array( 'precheck' => 1 ) );
+t( 'εκτός wp-admin: κατάσταση deferred, το wp-config.php δεν άλλαξε', 'deferred' === get_option( PNCP_Precheck::STATUS ) && ! PNCP_Precheck::in_config(), (string) get_option( PNCP_Precheck::STATUS ) );
+// Από εδώ και πέρα όπως στη σελίδα ρυθμίσεων: στο wp-admin. Το admin_init ολοκληρώνει ό,τι περίμενε.
+require_once ABSPATH . 'wp-admin/includes/class-wp-screen.php';
+WP_Screen::get( 'settings_page_scrapelock' )->set_current_screen();
+PNCP_Precheck::maybe_sync();
+sleep( 3 ); // OPcache: το νέο wp-config.php.
+t( 'ενεργοποίηση: κατάσταση ok', 'ok' === get_option( PNCP_Precheck::STATUS ), (string) get_option( PNCP_Precheck::STATUS ) );
+t( 'ενεργοποίηση: η γραμμή μπαίνει αμέσως μετά το <?php', 0 === strpos( (string) file_get_contents( $config_file ), "<?php\n" . PNCP_Precheck::block() . "define( 'WP_CACHE'" ) );
+t( 'ενεργοποίηση: τρέχει (loader + wp-config)', PNCP_Precheck::active() );
+t( 'ενεργοποίηση: το υπόλοιπο wp-config.php δεν άλλαξε', PNCP_Precheck::without_block( (string) file_get_contents( $config_file ) ) === "<?php\ndefine( 'WP_CACHE', true ); // test cache\n" . substr( $original, 6 ) );
+settings( array( 'precheck' => 1 ) );
+t( 'δεύτερη αποθήκευση: η γραμμή μία φορά', 1 === substr_count( (string) file_get_contents( $config_file ), 'BEGIN ScrapeLock pre-cache check' ) );
+$pncp_uploads = trailingslashit( wp_upload_dir( null, false )['basedir'] );
+t( 'φάκελος δεδομένων στο uploads/scrapelock με τυχαίο όνομα (3.3.1)', (bool) preg_match( '#^' . preg_quote( $pncp_uploads, '#' ) . 'scrapelock/precheck-[a-z0-9]{20}$#', PNCP_Precheck::dir() ), PNCP_Precheck::dir() );
+t( 'φάκελος δεδομένων προστατευμένος (index.html, .htaccess)', file_exists( PNCP_Precheck::dir() . '/index.html' ) && false !== strpos( (string) file_get_contents( PNCP_Precheck::dir() . '/.htaccess' ), 'Require all denied' ) && file_exists( dirname( PNCP_Precheck::dir() ) . '/index.html' ) );
+t( 'η γραμμή του wp-config.php φορτώνει το αρχείο του plugin, όχι αρχείο που γράφτηκε', false !== strpos( PNCP_Precheck::block(), "include_once '" . PNCP_DIR . "includes/class-pncp-precheck-runtime.php'" ) && false !== strpos( PNCP_Precheck::block(), 'PNCP_Precheck_Runtime::boot(' ) );
+
+/* ---------- Όριο σε σελίδες από το cache ---------- */
+same_minute();
+list( $code, $h, $body ) = req( '/cached-page/', visitor( '203.0.113.11' ) );
+t( 'cache: η σελίδα σερβίρεται ακόμη από το cache', 200 === $code && 'CACHED PAGE' === $body, "$code $body" );
+$c = codes( '/cached-page/', visitor( '203.0.113.11' ), 5 );
+t( 'cache: πάνω από 5/λεπτό → 429', array( 200, 200, 200, 200, 429 ) === $c, implode( ',', $c ) );
+list( $code, $h, $body ) = req( '/cached-page/', visitor( '203.0.113.11' ) );
+t( 'cache: 429 χωρίς WordPress, με Retry-After και no-store', 429 === $code && 'Too many requests.' === $body && false !== strpos( $h, 'retry-after: 60' ) && false !== strpos( $h, 'no-store' ), "$code $body" );
+list( $code ) = req( '/cached-page/', visitor( '203.0.113.12' ) );
+t( 'cache: άλλη IP δεν επηρεάζεται', 200 === $code );
+list( $code, $h ) = req( '/cached-page/', visitor( '203.0.113.11' ), 'HEAD' );
+t( 'cache: HEAD μετράει και αυτό, χωρίς σώμα', 429 === $code );
+
+/* ---------- 3.4: «Monitor only» και Emergency Mode και πριν από το cache ---------- */
+settings( array( 'monitor_mode' => 1, 'monitor_until' => 0 ) );
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.13' ), 7 );
+t( 'Monitor only (3.4): πάνω από το όριο, όλα 200 (τίποτα δεν μπλοκάρεται)', array_fill( 0, 7, 200 ) === $c, implode( ',', $c ) );
+t( 'Monitor only (3.4): καταγράφεται ως «would block» (κωδικός 0)', false !== strpos( (string) @file_get_contents( PNCP_Precheck::dir() . '/events.log' ), "\t0\trate_page\t203.0.113.13\t" ) );
+PNCP_Options::set_emergency( 1, false );
+sleep( 3 ); // OPcache / νέο config.json.
+$c = codes( '/cached-page/', visitor( '203.0.113.14' ), 6 );
+t( 'Emergency Mode με Monitor only (3.4): μπλοκάρει κανονικά, 429 πάνω από το όριο', array( 200, 200, 200, 200, 200, 429 ) === $c, implode( ',', $c ) );
+PNCP_Options::set_emergency( 0, false );
+settings( array( 'monitor_mode' => 0, 'monitor_until' => 0 ) );
+PNCP_Log::unban_all();
+
+/* ---------- Τι δεν μετράει ---------- */
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.20' ), 8, 'GET', 'wordpress_logged_in_abc=x' );
+t( 'συνδεδεμένοι (cookie wordpress_logged_in_): δεν μετρούν εδώ', ! in_array( 429, $c, true ), implode( ',', $c ) );
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.21', array( 'Sec-Purpose' => 'prefetch', 'Sec-Fetch-Dest' => 'document' ) ), 17 );
+t( 'prefetch με Sec-Fetch-Dest: δικό του όριο 3 × σελίδες (15), μετά 429 (2.8.3· τα headers τα στέλνει και ένα script)', 15 === count( array_keys( $c, 200, true ) ) && 429 === $c[15] && 429 === $c[16], implode( ',', $c ) );
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.29', array( 'Sec-Purpose' => 'prefetch' ) ), 8 );
+t( '«prefetch» χωρίς Sec-Fetch-Dest (script): μετράει', in_array( 429, $c, true ), implode( ',', $c ) );
+$c = codes( '/wp-json/', visitor( '203.0.113.22' ), 7 );
+t( 'REST (/wp-json/): αφήνεται στον κανονικό έλεγχο (δικό του όριο)', ! in_array( 429, $c, true ), implode( ',', $c ) );
+$c = codes( '/wp-login.php', visitor( '203.0.113.23' ), 7 );
+t( 'wp-login.php: δεν μετράει', ! in_array( 429, $c, true ), implode( ',', $c ) );
+$c = codes( '/cached-page/', visitor( '203.0.113.24' ), 7, 'POST' );
+t( 'POST: δεν μετράει εδώ (δεν σερβίρεται από την cache· το μετρά ο κανονικός έλεγχος)', ! in_array( 429, $c, true ), implode( ',', $c ) );
+$c = codes( '/cached-page/', array( 'User-Agent' => 'curl/8' ), 8 );
+t( 'ο ίδιος ο server (127.0.0.1, χωρίς X-Real-IP): δεν μετράει', ! in_array( 429, $c, true ), implode( ',', $c ) );
+
+/* ---------- Μηχανές αναζήτησης ---------- */
+PNCP_Ip::store_list( 'google', array( '66.249.64.0/19' ) );
+PNCP_Precheck::refresh();
+sleep( 3 );
+same_minute();
+$c = codes( '/cached-page/', visitor( '66.249.66.1', array( 'User-Agent' => 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' ) ), 8 );
+t( 'Googlebot από IP της επίσημης λίστας: δεν μετράει', ! in_array( 429, $c, true ), implode( ',', $c ) );
+// 3.13.0: με «Μπλοκάρισμα ψεύτικων μηχανών αναζήτησης» (η προεπιλογή) και φρέσκια επίσημη λίστα, ο έλεγχος πριν
+// την cache το απορρίπτει αμέσως (403), όπως ο κανονικός έλεγχος· χωρίς τη ρύθμιση μετράει όπως όλοι. Ρητά και τα
+// δύο: πριν, η δοκιμή περνούσε μόνο όταν μια προηγούμενη δοκιμή είχε αφήσει τη ρύθμιση κλειστή.
+$keep_bfc = PNCP_Options::stored()['block_fake_crawlers'];
+settings( array( 'block_fake_crawlers' => 1 ) );
+PNCP_Precheck::refresh();
+sleep( 3 );
+$c = codes( '/cached-page/', visitor( '198.51.100.32', array( 'User-Agent' => 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' ) ), 3 );
+t( 'ψεύτικο Googlebot (άλλη IP), «ψεύτικες μηχανές» ανοιχτό: 403 από την πρώτη σελίδα (3.13.0)', array( 403, 403, 403 ) === $c, implode( ',', $c ) );
+settings( array( 'block_fake_crawlers' => 0 ) );
+PNCP_Precheck::refresh();
+sleep( 3 );
+same_minute();
+$c = codes( '/cached-page/', visitor( '198.51.100.30', array( 'User-Agent' => 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' ) ), 6 );
+t( 'ψεύτικο Googlebot (άλλη IP), «ψεύτικες μηχανές» κλειστό: μετράει όπως όλοι', in_array( 429, $c, true ) && ! in_array( 403, $c, true ), implode( ',', $c ) );
+settings( array( 'block_fake_crawlers' => $keep_bfc ) );
+PNCP_Precheck::refresh();
+sleep( 3 );
+$c = codes( '/cached-page/', visitor( '198.51.100.31', array( 'User-Agent' => 'Mozilla/5.0 (Macintosh) Applebot/0.1' ) ), 8 );
+t( 'Applebot (χωρίς επίσημη λίστα): αφήνεται στον κανονικό έλεγχο (DNS)', ! in_array( 429, $c, true ), implode( ',', $c ) );
+t( 'WP Rocket: το Applebot δεν παίρνει σελίδες από το cache όσο ο έλεγχος είναι ενεργός', in_array( 'applebot', (array) apply_filters( 'rocket_cache_reject_ua', array() ), true ) );
+delete_option( PNCP_Ip::LISTS_OPTION . '_google' );
+
+/* ---------- Λίστες IP του διαχειριστή ---------- */
+settings( array( 'allow_ips' => '198.51.100.40', 'block_ips' => "198.51.100.41\n198.51.100.128/25" ) );
+same_minute();
+$c = codes( '/cached-page/', visitor( '198.51.100.40' ), 8 );
+t( 'πάντα επιτρεπτή IP: χωρίς όριο', ! in_array( 429, $c, true ), implode( ',', $c ) );
+list( $code, , $body ) = req( '/cached-page/', visitor( '198.51.100.41' ) );
+t( 'πάντα αποκλεισμένη IP: 403 πριν από το cache', 403 === $code && 'Access denied.' === $body, "$code $body" );
+list( $code ) = req( '/cached-page/', visitor( '198.51.100.200' ) );
+t( 'πάντα αποκλεισμένο CIDR: 403', 403 === $code );
+list( $code, , $body ) = req( '/robots.txt', visitor( '198.51.100.41' ) );
+t( 'πάντα αποκλεισμένη IP: διαβάζει το robots.txt (200)', 200 === $code && false !== stripos( $body, 'User-agent' ), (string) $code );
+list( $code ) = req( '/.well-known/tdmrep.json', visitor( '198.51.100.41' ) );
+t( 'πάντα αποκλεισμένη IP: διαβάζει το tdmrep.json (200)', 200 === $code, (string) $code );
+settings( array( 'allow_ips' => '', 'block_ips' => '' ) );
+
+/* ---------- Αποκλεισμοί: από τον κανονικό έλεγχο και από τον ίδιο ---------- */
+PNCP_Log::ban( '198.51.100.50', 5, 'trap' );
+list( $code, , $body ) = req( '/cached-page/', visitor( '198.51.100.50' ) );
+t( 'αποκλεισμός του κανονικού ελέγχου: ισχύει και στο cache', 403 === $code && 'Access denied.' === $body, "$code $body" );
+PNCP_Log::unban( '198.51.100.50' );
+list( $code ) = req( '/cached-page/', visitor( '198.51.100.50' ) );
+t( 'άρση αποκλεισμού: ξανά 200', 200 === $code );
+
+settings( array( 'ban_strikes' => 1, 'ban_minutes' => 5 ) );
+PNCP_Log::clear();
+same_minute();
+$c = codes( '/cached-page/', visitor( '198.51.100.60' ), 7 );
+t( 'όριο + 1 παράβαση = αποκλεισμός: 429 και μετά 403', array( 200, 200, 200, 200, 200, 429, 403 ) === $c, implode( ',', $c ) );
+list( $code ) = req( '/robots.txt', visitor( '198.51.100.60' ) );
+t( 'αποκλεισμένη IP (ban): διαβάζει ακόμη το robots.txt (200)', 200 === $code, (string) $code );
+$pncp_events = (string) file_get_contents( PNCP_Precheck::dir() . '/events.log' );
+t( 'αρχείο συμβάντων: απλό κείμενο, χωρίς κώδικα PHP', '' !== $pncp_events && false === strpos( $pncp_events, '<?' ) && 0 === strpos( $pncp_events, (string) (int) substr( $pncp_events, 0, 10 ) ), substr( $pncp_events, 0, 60 ) );
+$imported = PNCP_Precheck::import_events();
+t( 'εισαγωγή συμβάντων στο αρχείο καταγραφής', $imported >= 3, (string) $imported );
+$rows = $wpdb->get_results( $wpdb->prepare( "SELECT reason, code, hits, path FROM {$wpdb->prefix}pncp_log WHERE ip = %s ORDER BY id", '198.51.100.60' ), ARRAY_A );
+$by   = array();
+foreach ( $rows as $row ) {
+	$by[ $row['reason'] ] = $row;
+}
+t( 'καταγραφή: όριο, αποκλεισμός, αποκλεισμένη IP, με τη διαδρομή', isset( $by['rate_page'], $by['ban'], $by['banned'] ) && '/cached-page/' === $by['rate_page']['path'], wp_json_encode( $rows ) );
+PNCP_Log::reset_cache();
+t( 'ο αποκλεισμός του ελέγχου φαίνεται στα «Αποκλεισμένα» (βάση)', PNCP_Log::is_banned( '198.51.100.60' ) && isset( PNCP_Log::active_bans()['198.51.100.60'] ) );
+t( 'δεύτερη εισαγωγή: τίποτα διπλό', 0 === PNCP_Precheck::import_events() );
+PNCP_Log::unban( '198.51.100.60' );
+list( $code ) = req( '/cached-page/', visitor( '198.51.100.60' ) );
+t( 'άρση από τη σελίδα: ισχύει και πριν από το cache (μένει μόνο το όριο του λεπτού)', 403 !== $code && ! file_exists( PNCP_Precheck::dir() . '/bans/' . md5( '198.51.100.60' ) ), (string) $code );
+settings( array( 'ban_strikes' => 0 ) );
+
+/* ---------- Ασφάλεια ---------- */
+$pncp_php = array();
+foreach ( new RecursiveIteratorIterator( new RecursiveDirectoryIterator( dirname( PNCP_Precheck::dir() ), FilesystemIterator::SKIP_DOTS ) ) as $pncp_f ) {
+	if ( preg_match( '/\.php[0-9]?$/i', $pncp_f->getFilename() ) || false !== strpos( (string) file_get_contents( $pncp_f->getPathname() ), '<?php' ) ) {
+		$pncp_php[] = $pncp_f->getPathname();
+	}
+}
+t( 'κανένα αρχείο PHP ή κώδικας στον φάκελο δεδομένων (3.3.1)', ! $pncp_php, implode( ', ', $pncp_php ) );
+t( 'ρυθμίσεις: config.json, χωρίς τις λίστες IP του διαχειριστή να λείπουν', is_array( json_decode( (string) file_get_contents( PNCP_Precheck::config_file() ), true ) ) );
+list( $code, , $body ) = req( '/wp-content/plugins/scrapelock/includes/class-pncp-precheck-runtime.php', visitor( '198.51.100.71' ) );
+t( 'class-pncp-precheck-runtime.php από το web: μόνο ορισμός κλάσης', '' === trim( $body ), "$code " . substr( $body, 0, 80 ) );
+same_minute();
+$c = codes( '/cached-page/', visitor( '198.51.100.72', array( 'X-Forwarded-For' => '10.9.9.9' ) ), 6 );
+t( 'ψεύτικο X-Forwarded-For δεν αλλάζει την IP (μετράει η X-Real-IP)', in_array( 429, $c, true ), implode( ',', $c ) );
+settings( array( 'ip_header' => 'remote_addr' ) );
+$c = codes( '/cached-page/', visitor( '198.51.100.73' ), 8 );
+t( 'REMOTE_ADDR: η X-Real-IP αγνοείται, όλα από 127.0.0.1 (ο server) = χωρίς όριο', ! in_array( 429, $c, true ), implode( ',', $c ) );
+settings( array( 'ip_header' => 'x_real_ip' ) );
+
+/* ---------- Σπασμένα αρχεία δεν ρίχνουν το site ---------- */
+// Με APCu (π.χ. στο GitHub Actions) ο φάκελος hits δεν φτιάχνεται ποτέ.
+if ( ! is_dir( PNCP_Precheck::dir() . '/hits' ) ) {
+	mkdir( PNCP_Precheck::dir() . '/hits', 0755, true );
+}
+file_put_contents( PNCP_Precheck::dir() . '/hits/x', 'not a folder' );
+@chmod( PNCP_Precheck::dir() . '/hits', 0555 );
+list( $code ) = req( '/cached-page/', visitor( '198.51.100.80' ) );
+@chmod( PNCP_Precheck::dir() . '/hits', 0755 );
+t( 'φάκελος μετρητών που δεν γράφεται: το αίτημα περνά', 200 === $code, (string) $code );
+
+/* ---------- wp-config.php που δεν γράφεται ---------- */
+settings( array( 'precheck' => 0 ) );
+chmod( $config_file, 0444 );
+clearstatcache();
+if ( ! is_writable( $config_file ) ) {
+	settings( array( 'precheck' => 1 ) );
+	t( 'wp-config.php μόνο για ανάγνωση: κατάσταση not_writable, το αρχείο δεν άλλαξε', 'not_writable' === get_option( PNCP_Precheck::STATUS ) && ! PNCP_Precheck::in_config(), (string) get_option( PNCP_Precheck::STATUS ) );
+} else {
+	echo "SKIP wp-config.php μόνο για ανάγνωση (ως root γράφεται πάντα)\n";
+}
+chmod( $config_file, 0644 );
+clearstatcache();
+
+/* ---------- 3.12.9: οι γραμμές μιας παλαιότερης έκδοσης που δεν αντικαταστάθηκαν ---------- */
+settings( array( 'precheck' => 1 ) );
+PNCP_Precheck::sync(); // wp-config.php is writable again (the read-only case above left the line out).
+$pncp_now = (string) file_get_contents( $config_file );
+file_put_contents( $config_file, str_replace( PNCP_Precheck::block(), str_replace( "\t);\n", "\t); // older\n", PNCP_Precheck::block() ), $pncp_now ) );
+$pncp_rs = new ReflectionMethod( 'PNCP_Admin', 'render_precheck_status' );
+$pncp_rs->setAccessible( true );
+ob_start();
+$pncp_rs->invoke( null, PNCP_Options::stored() );
+$pncp_html = (string) ob_get_clean();
+t( 'παλιές γραμμές (wp-config.php δεν άλλαξε): line_outdated(), «Replace the ScrapeLock lines» με τις νέες (όχι «Add»)', PNCP_Precheck::line_outdated() && ! PNCP_Precheck::in_config() && false !== strpos( $pncp_html, 'Replace the ScrapeLock lines' ) && false !== strpos( $pncp_html, esc_textarea( PNCP_Precheck::block() ) ) && false === strpos( $pncp_html, 'Add these lines' ), wp_strip_all_tags( $pncp_html ) );
+file_put_contents( $config_file, $pncp_now );
+t( 'τρέχουσες γραμμές: όχι line_outdated()', ! PNCP_Precheck::line_outdated() && PNCP_Precheck::in_config() );
+
+/* ---------- Απενεργοποίηση ---------- */
+settings( array( 'precheck' => 1 ) );
+settings( array( 'precheck' => 0 ) );
+t( 'απενεργοποίηση: η γραμμή φεύγει, το wp-config.php όπως ήταν', "<?php\ndefine( 'WP_CACHE', true ); // test cache\n" . substr( $original, 6 ) === (string) file_get_contents( $config_file ) );
+t( 'απενεργοποίηση: ο φάκελος δεδομένων σβήνεται', ! file_exists( PNCP_Precheck::dir() ) );
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.90' ), 7 );
+t( 'απενεργοποίηση: ξανά χωρίς όριο στο cache', ! in_array( 429, $c, true ), implode( ',', $c ) );
+settings( array( 'precheck' => 1 ) );
+settings( array( 'enabled' => 0 ) );
+t( 'προστασία κλειστή: ο έλεγχος αφαιρείται', ! PNCP_Precheck::in_config() );
+settings( array( 'enabled' => 1, 'precheck' => 1 ) );
+pncp_deactivate();
+t( 'απενεργοποίηση plugin: γραμμή και αρχεία φεύγουν', ! PNCP_Precheck::in_config() && ! file_exists( PNCP_Precheck::dir() ) );
+$level = error_reporting( E_ALL & ~E_DEPRECATED ); // Το db.php του SQLite βγάζει Deprecated στο CREATE TABLE.
+pncp_upgrade();
+error_reporting( $level );
+t( 'ενεργοποίηση plugin (upgrade): ο έλεγχος επανέρχεται με τη ρύθμιση', PNCP_Precheck::active() );
+
+/* ---------- Ελέγχει τις γραμμές του wp-config.php ---------- */
+$tmp = tempnam( sys_get_temp_dir(), 'pncp' );
+file_put_contents( $tmp, "<?php\n" . PNCP_Precheck::block() );
+exec( escapeshellarg( PHP_BINARY ) . ' -l ' . escapeshellarg( $tmp ) . ' 2>&1', $lint, $rc );
+unlink( $tmp );
+t( 'οι γραμμές του wp-config.php είναι έγκυρη PHP', 0 === $rc, implode( ' ', $lint ) );
+
+/* ---------- Μυστικό του CDN: μόνο το hash στο αρχείο ---------- */
+settings( array( 'cdn_secret' => 'my-cdn-secret-1234' ) );
+$pncp_json = (string) file_get_contents( PNCP_Precheck::config_file() );
+t( 'μυστικό CDN: στο config.json μόνο το hash του', false === strpos( $pncp_json, 'my-cdn-secret-1234' ) && false !== strpos( $pncp_json, hash( 'sha256', 'my-cdn-secret-1234' ) ) );
+settings( array( 'cdn_secret' => '' ) );
+
+/* ---------- Αναβάθμιση από την 3.3.0 (φάκελος wp-content/scrapelock-precheck) ---------- */
+settings( array( 'precheck' => 0 ) );
+$pncp_legacy = WP_CONTENT_DIR . '/scrapelock-precheck';
+@mkdir( $pncp_legacy . '/bans', 0755, true );
+file_put_contents( $pncp_legacy . '/run.php', "<?php\n// ScrapeLock pre-cache check: written by the plugin, do not edit. Removed when the setting is turned off.\nif ( ! class_exists( 'PNCP_Precheck_Runtime', false ) && is_file( '" . PNCP_DIR . "includes/class-pncp-precheck-runtime.php' ) ) {\n\trequire_once '" . PNCP_DIR . "includes/class-pncp-precheck-runtime.php';\n\tPNCP_Precheck_Runtime::run( array( 'v' => '3.3.0', 'dir' => '" . $pncp_legacy . "', 'limit' => 1 ) );\n}\n" );
+file_put_contents( $pncp_legacy . '/events.php', "<?php exit; ?>\n" . time() . "\t429\trate_page\t198.51.100.99\t/old/\tOld UA\n" );
+file_put_contents( $pncp_legacy . '/bans/' . md5( '198.51.100.98' ), (string) ( time() + 600 ) );
+$pncp_cfg = (string) file_get_contents( $config_file );
+file_put_contents( $config_file, "<?php\n" . PNCP_Precheck::BEGIN . " (added and removed by the plugin's \"Pre-cache check\" setting)\nif ( is_file( '" . $pncp_legacy . "/run.php' ) ) { include_once '" . $pncp_legacy . "/run.php'; }\n" . PNCP_Precheck::END . "\n" . substr( $pncp_cfg, 6 ) );
+sleep( 3 );
+same_minute();
+$c = codes( '/cached-page/', visitor( '203.0.113.95' ), 4 );
+t( 'παλιό run.php (3.3.0) με το νέο plugin: δεν κάνει τίποτα μέχρι να αλλάξει η γραμμή', ! in_array( 429, $c, true ), implode( ',', $c ) );
+PNCP_Log::clear();
+settings( array( 'precheck' => 1 ) );
+t( 'αναβάθμιση: ο παλιός φάκελος στο wp-content σβήνεται', ! file_exists( $pncp_legacy ) );
+t( 'αναβάθμιση: η παλιά γραμμή αντικαθίσταται από τη νέα', ! PNCP_Precheck::in_config() || ( false === strpos( (string) file_get_contents( $config_file ), 'scrapelock-precheck' ) && 1 === substr_count( (string) file_get_contents( $config_file ), PNCP_Precheck::BEGIN ) ) );
+t( 'αναβάθμιση: τα συμβάντα του παλιού φακέλου περνούν στο Αρχείο', (bool) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->prefix}pncp_log WHERE ip = %s AND path = %s", '198.51.100.99', '/old/' ) ) );
+
+echo $fails ? "$fails FAIL\n" : "OK\n";
+exit( $fails ? 1 : 0 );

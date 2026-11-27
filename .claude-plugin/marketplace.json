@@ -1,0 +1,23 @@
+{
+  "name": "codebunny",
+  "owner": {
+    "name": "CodeBunny",
+    "url": "https://github.com/Code-BunnyHUB"
+  },
+  "metadata": {
+    "description": "Agent skills by CodeBunny for WordPress site owners and developers."
+  },
+  "plugins": [
+    {
+      "name": "scrapelock",
+      "source": "./agent-skill",
+      "description": "Install, set up, check and troubleshoot ScrapeLock (AI bot, scraper and fake Googlebot protection for WordPress) with WP-CLI.",
+      "version": "1.0.0",
+      "author": { "name": "CodeBunny" },
+      "homepage": "https://wordpress.org/plugins/scrapelock/",
+      "repository": "https://github.com/Code-BunnyHUB/ScrapeLock-WP",
+      "license": "GPL-2.0-or-later",
+      "keywords": ["wordpress", "ai-crawlers", "anti-scraping", "bot-protection", "wp-cli"]
+    }
+  ]
+}

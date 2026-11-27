@@ -1,0 +1,164 @@
+<p align="center">
+  <img src="wporg-assets/banner-1544x500.png" alt="ScrapeLock – stops scrapers and AI bots on the server, not just in the browser" width="100%">
+</p>
+
+# ScrapeLock – Content & AI Bot Protection
+
+Server-side anti-scraping and site lockdown for WordPress and WooCommerce, by **CodeBunny**. Formerly **Content Protect**.
+
+Most content protection plugins disable right click in the browser. Scrapers and AI crawlers never use a browser, so they are not affected. ScrapeLock works on the server, where automated copying actually happens, and keeps real visitors, customers and search engines unaffected. **Lockdown** adds what no firewall does: once you are logged in, nothing can be changed until you unlock the site with a code from your phone.
+
+- **Free, GPL-2.0-or-later.** No premium version, no license checks, no tracking.
+- **WordPress 6.2+** (tested up to 7.2), **PHP 7.4+**, WooCommerce-aware.
+
+## Features
+
+### Bots and limits
+- **Real search engines vs. fakes.** Googlebot, Bingbot, Applebot and Yandex are verified against their official IP lists and with reverse + forward DNS. Real crawlers are never limited; impostors get a 403.
+- **AI training vs. AI search.** Training crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended, Bytespider…) are blocked; AI search assistants (OAI-SearchBot, ChatGPT-User, PerplexityBot…) can be allowed with one option and verified against their official IP lists.
+- **Per-IP limits** for pages, searches, REST / GraphQL, 404s and sitemaps (IPv6: per /64, optionally also per /56), with temporary blocks for repeat offenders and an invisible bot trap.
+- **Stricter limit for data centers:** visitors from the published addresses of AWS, Google Cloud, Oracle Cloud, DigitalOcean and Akamai / Linode (where scrapers run, people rarely browse) get a lower page limit.
+- **Human check** without a captcha: a light proof-of-work after the first real interaction; visitors without it get a stricter limit, not a block.
+- **Headless and fake browsers** that reveal themselves in their headers are blocked.
+- **Country rules** from Cloudflare's or Bunny CDN's country header, or the free DB-IP Lite database.
+- **Real visitor IP** behind Cloudflare, Bunny CDN or your own proxy, trusted only when the request really comes from it.
+
+### Content, feeds and API
+- **Text hidden from the REST API, WPGraphQL and full-text RSS** for visitors.
+- **Private XML feeds** (price comparison sites, Google Merchant, ERP) protected with a token in a header or the URL. Only the token hash is stored; rotation with a grace period.
+- Optional: hide the REST API index from visitors, turn off pingbacks, and see which REST routes anyone can call.
+- **Hide versions** of WordPress, PHP and the plugins (generator tags, `?ver=`, X-Powered-By, and readme / changelog files through the server rules), so scanners cannot match them against lists of known vulnerabilities.
+- **Hide that the site runs on WordPress, as far as possible** (3.6): no REST API, oEmbed, RSD and shortlink links, emoji script, X-Pingback or X-Redirect-By for visitors, for tools such as BuiltWith and for scanners. The `/wp-content/` paths still show it; no plugin can hide those.
+- Optional: excerpts instead of the full text on lists of articles (home, categories, search), and blocking of web archives (Wayback Machine).
+- Usernames hidden from `?author=N`, the users endpoint, the sitemap and oEmbed.
+
+### On the page and images
+- Copy, right click, drag and print protection (or copy with a source link), blur on screenshot shortcuts, no framing by other sites.
+- Machine-readable AI opt-out (TDM): header, meta tag and `/.well-known/tdmrep.json`.
+- Watermarks, never applied twice, with the clean original kept.
+
+### Members, courses and paid content (3.6)
+No web page can stop a screenshot, a screen recording or a photo of the screen. These options make copies traceable instead:
+- **Who is reading, on every screenshot:** a faint line repeated over protected pages with the member's user name and the date and time. It never takes clicks or selections, comes back when removed or hidden, and the page is sent as private. Optionally the IP and time for visitors who are not signed in (fetched by the page, so cached pages still work).
+- **An invisible trace in the text:** zero-width characters with the account, the day and an HMAC made with the site's keys in each paragraph; paste copied text under Log → "Find whose copy this is".
+- **Per-account page limit** and **shared account alert**: an email when one account is used from several addresses within 10 minutes, optionally signing it out everywhere else.
+
+### Server and CDN
+- Ready-made **Nginx, Apache and Cloudflare rules** generated for your own site and settings.
+- Optional **blocking at the CDN** (3.1): the IPs ScrapeLock blocks temporarily are also blocked by **Cloudflare** or **Bunny CDN** with your own account, and removed there when the block ends, so a persistent scraper is stopped before it reaches your server.
+- Optional **only through the CDN** (3.2): requests that go straight to the server's own address, around the CDN, get a 403.
+- Optional **early check** (mu-plugin) and **pre-cache check** (one line in `wp-config.php`) so pages served from a page cache are protected too.
+- **Emergency Mode:** one click for stricter limits during an attack, for 1 hour to 3 days, or **automatically** when the whole site gets five times its usual pages per minute for 3 minutes in a row (a scraper spread over many IPs).
+
+### Lockdown
+Freeze the whole site with one click and a code from your authenticator app (Google Authenticator, Microsoft Authenticator, Authy…).
+
+- While locked, users with a frozen role keep only `read`: nobody can install, update or activate plugins and themes, run updates, use the file editor, add users or administrators, change roles, staff emails or passwords, settings or content, from wp-admin, the REST API or XML-RPC.
+- Enforced against code too: protected options (active plugins, theme, site address, admin email, registration, default role, user roles, uploads folder, search engine visibility), role changes, staff email and password changes, password resets and new application passwords are refused while locked.
+- Visitors, customers, orders, payments, webhooks, cron jobs and members who post their own content keep working.
+- TOTP (RFC 6238), each code accepted once even under concurrent requests (database compare-and-set), the secret encrypted with libsodium using the keys in `wp-config.php`, ten one-time recovery codes stored only as hashes, wrong-code limits and an email on every unlock.
+- Temporary unlock (15 minutes to 2 hours, then it locks again by itself). A clear "The site is locked" page with an unlock button for administrators.
+- No WP-CLI command and no ability can unlock it.
+- **Sealed against database tampering (3.3):** the lock and the file fingerprint are signed (HMAC-SHA256, key derived from `AUTH_KEY`/`AUTH_SALT` in `wp-config.php`), and a must-use plugin (`scrapelock-lockdown-guard.php`) keeps a signed copy of the lock outside the database. SQL injection in another plugin cannot unlock the site: protected options changed in the database are put back, and accounts made administrator behind WordPress's back cannot sign in. A temporary unlock gives the rights back only to the administrator who unlocked.
+- **File integrity:** a fingerprint of every PHP, `.htaccess` and `.user.ini` file is taken when you lock and checked every hour; WordPress and the plugins from WordPress.org are also compared with their official checksums. A new or changed file (usually a backdoor uploaded through a vulnerable plugin) is emailed to you; optional quarantine deactivates the plugin and renames new PHP files in the uploads folder.
+- **No PHP in the uploads folder:** `.htaccess` for Apache and a rule for Nginx.
+- **Wider coverage (3.6):** widgets, the theme's settings and WooCommerce's own payment methods are kept and put back; capabilities given to one user outside their role do not work while locked; the Site Editor's templates cannot be changed by code; code that plugins keep in the database (Code Snippets, WPCode) and the templates are checked every hour; files changed during a temporary unlock are emailed when it locks again.
+
+Lockdown complements a firewall such as Wordfence: the firewall and two-factor login guard the door, Lockdown guards what happens after someone is inside, for example with a stolen session cookie.
+
+### Tools
+- **Site Health** tests and a ScrapeLock section on the Info tab.
+- **WP-CLI:** `wp scrapelock status | block | unblock | blocked | emergency | log`.
+- **Abilities API** (WordPress 6.9+): `scrapelock/get-summary`, `block-ip`, `unblock-ip`, `emergency-mode`, for administrators only.
+- Block log with a 24-hour summary, top IPs, User-Agents and the pages scrapers were after.
+
+Forms, cart, checkout, the WooCommerce Store API and payment webhooks are never affected.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Overview](wporg-assets/screenshot-1.png) | ![For my site](wporg-assets/screenshot-2.png) |
+| Overview: protection status, blocked requests in the last 24 hours, the tab groups, one-click presets and Emergency Mode. | For my site: detects the shop, cache plugin, CDN and web server and suggests matching settings; only the ticked ones are applied. |
+| ![On the page](wporg-assets/screenshot-3.png) | ![Members and readers](wporg-assets/screenshot-4.png) |
+| On the page: right click, copy shortcuts, dragging images and text, screenshot blur, copying with the source link appended, and printing. | Members and readers: a faint “who is reading” mark over protected pages, an invisible trace in copied text, per-account limits and shared-account alerts, plus iframe and AI opt-out (TDM) headers. |
+| ![Scrapers and bots](wporg-assets/screenshot-5.png) | ![AI search and training](wporg-assets/screenshot-6.png) |
+| Scrapers and bots: the bot list, requests without a User-Agent, fake Googlebot and Bingbot, headless browsers, the bot trap and bans for scanners. | AI search and training: AI search assistants may visit (checked against their official IP lists) while AI training crawlers stay blocked; robots.txt and Content Signals. |
+| ![Limits and reputation](wporg-assets/screenshot-7.png) | ![Check a request](wporg-assets/screenshot-8.png) |
+| Limits per IP for pages, searches, the REST API, “page not found”, sitemaps and data centers, automatic Emergency Mode, and the reputation of each IP. | Check a request: what ScrapeLock would answer to any IP, User-Agent and address, here a fake Googlebot. |
+| ![Feeds and API](wporg-assets/screenshot-9.png) | ![Vulnerable points](wporg-assets/screenshot-10.png) |
+| Feeds and API: an access token for private XML feeds with per-feed statistics, and post text hidden from the REST API, GraphQL and RSS. | Vulnerable points: XML-RPC, the file editor, usernames, PHP files and more, each with its attacks and the risk of locking it; lock with one click. |
+| ![Lockdown](wporg-assets/screenshot-11.png) | ![Server rules](wporg-assets/screenshot-12.png) |
+| Lockdown: freezes plugins, themes, users and settings behind a code from an authenticator app, with what is locked and what keeps working. | Server rules: Cloudflare and Apache rules (Nginx further down) generated for your own site. |
+| ![Bunny CDN](wporg-assets/screenshot-13.png) | ![Log summary](wporg-assets/screenshot-14.png) |
+| Bunny CDN: the Edge Rules ScrapeLock manages at Bunny, and the points that can be locked at the edge with one click. | Log: blocked requests in the last 24 hours by reason, and the top IPs. |
+| ![Blocked IPs and events](wporg-assets/screenshot-15.png) | ![AI referrals](wporg-assets/screenshot-16.png) |
+| Log: IPs blocked now, IPs that keep coming back, and the latest events with path and User-Agent. | Visitors sent by AI assistants (ChatGPT, Perplexity, Gemini…) in the last 30 days, and the pages they landed on. |
+| ![Attack report](wporg-assets/screenshot-17.png) | ![Traffic](wporg-assets/screenshot-18.png) |
+| Attack report: attacks per day, failed sign-ins, the share refused, and each kind of attack with how to close it. | Traffic: every request the site answered, per hour, by status code, by kind of visitor and by User-Agent. |
+| ![Dashboard widgets](wporg-assets/screenshot-19.png) | ![Site Health](wporg-assets/screenshot-20.png) |
+| Dashboard widgets: the protection status and the attacks of the last 7 days. | Site Health: ScrapeLock’s checks, e.g. password guessing and attacked points that are still open. |
+
+## Installation
+
+1. Download **`scrapelock.zip`** from the latest [release](../../releases/latest).
+2. In WordPress: **Plugins → Add New → Upload Plugin**, choose the zip, then **Activate**.
+3. Open **Settings → ScrapeLock**, pick a preset (Balanced is a good start) and check the **Real visitor IP** setting if your site is behind a CDN.
+
+The full description for the WordPress.org directory is in [`readme.txt`](readme.txt). A user guide in Greek is in [`docs/user-guide-el.md`](docs/user-guide-el.md).
+
+### Upgrading from Content Protect
+
+Deactivate Content Protect (folder `content-protect`) and activate ScrapeLock. Settings, feed tokens and the block log are kept. If you pasted the old Apache rules, replace the `# BEGIN Content Protect` block with the new `# BEGIN ScrapeLock` block from the "Server rules" tab.
+
+## Use it with Claude Code
+
+This repository is also a Claude Code plugin marketplace (CodeBunny) with a ScrapeLock skill. With it, Claude can install ScrapeLock with WP-CLI, set it up for your site, check that AI bots and fake Googlebots are refused while real visitors are not, read the log and help during a scraping attack. It asks before anything that blocks more or changes server files.
+
+```
+/plugin install scrapelock --marketplace Code-BunnyHUB/scrapelock-wp
+```
+
+On older Claude Code versions:
+
+```
+/plugin marketplace add Code-BunnyHUB/scrapelock-wp
+/plugin install scrapelock@codebunny
+```
+
+Or copy the folder [`agent-skill/skills/scrapelock`](agent-skill/skills/scrapelock) to `~/.claude/skills/`. Then ask, for example: "Block AI training bots on my WordPress site but keep AI search". Claude needs WP-CLI access to the site (local, over SSH or in a container).
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `scrapelock.php`, `includes/`, `assets/`, `languages/`, `uninstall.php`, `readme.txt` | The plugin, as installed in `wp-content/plugins/scrapelock/` |
+| `tests/` | Tests on a real WordPress (HTTP, watermark, admin, Lockdown, WP-CLI) and in Chromium |
+| `translations/` | Greek translation (`.po`), for translate.wordpress.org |
+| `wporg-assets/` | Icon, banner and screenshots for the WordPress.org page |
+| `docs/` | User guide in Greek |
+| `CHANGELOG.md` | Changes per version |
+| `.claude-plugin/`, `agent-skill/` | The Claude Code marketplace and the ScrapeLock skill (not in the plugin zip) |
+
+GitHub's **Download ZIP** and `git archive` contain only the plugin (`.gitattributes` leaves the rest out), but the folder from Download ZIP must be renamed to `scrapelock` before installing.
+
+## Build and checks
+
+```sh
+mkdir -p dist
+git archive --format=zip --prefix=scrapelock/ -o dist/scrapelock-$(sed -n 's/^ \* Version: *//p' scrapelock.php).zip HEAD
+phpcs                 # WordPress Coding Standards (phpcs.xml.dist)
+cd tests && WP_DIR=/path/to/wordpress BASE=http://127.0.0.1:8099 ./run-all.sh
+```
+
+The same checks run on GitHub Actions for every pull request (`.github/workflows/ci.yml`). The plugin zip is kept as an artifact for 3 days, then deleted automatically. The plugin passes the official WordPress Plugin Check with no errors and no warnings.
+
+To publish a release: **Actions → Release → Run workflow** on `main`, or push a version tag such as `v2.8.2`. `.github/workflows/release.yml` checks that the version matches `Version`, `PNCP_VERSION` and `Stable tag`, builds the zip and attaches it to the release.
+
+## Privacy
+
+When a request is blocked, its IP address, User-Agent, page and time are logged and deleted automatically after 1, 7 or 30 days. Public IP lists (search engines, CDNs, AI search providers) are downloaded only when the related settings are on; no site or visitor data is sent anywhere. Details are in the "External services" section of [`readme.txt`](readme.txt).
+
+## License
+
+[GPL-2.0-or-later](LICENSE) © CodeBunny

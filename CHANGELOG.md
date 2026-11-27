@@ -1,0 +1,976 @@
+# Αλλαγές
+
+## 3.13.0 — 2026-11-27
+
+Μεγάλη ενημέρωση ασφάλειας και προστασίας: το Lockdown δεν κλειδώνει ποτέ έξω τον διαχειριστή, διορθώσεις από έλεγχο ασφαλείας, ασφαλέστερη σύνδεση με το Bunny CDN και καλύτερο μπλοκάρισμα των bots.
+
+### Lockdown
+
+
+Το Lockdown δεν κλειδώνει ποτέ έξω τον διαχειριστή· μένει το ίδιο αυστηρό σε ό,τι παγώνει.
+
+- **Μετά τη σύνδεση ενώ είναι κλειδωμένο**: Πίνακας ελέγχου αντί για `profile.php` (το WordPress στέλνει εκεί όσους δεν έχουν `edit_posts`, και ήταν σελίδα «The site is locked»). Το δικό του προφίλ ανοίγει για ανάγνωση (η αποθήκευση απορρίπτεται, email / κωδικός μένουν ίδια).
+- **Οθόνη ξεκλειδώματος στη σύνδεση** (`wp-login.php?action=scrapelock-unlock`): δεν περνά από το wp-admin. Θέματα και plugins που διώχνουν από το wp-admin όσους δεν έχουν δικαιώματα διαχειριστή (το κλείδωμα τα παίρνει) έκλειναν και την καρτέλα Lockdown: κανένας δρόμος ξεκλειδώματος. Τώρα μια τέτοια ανακατεύθυνση (μόνο για διαχειριστή, μόνο όσο είναι κλειδωμένο) πάει εκεί. Ίδιοι έλεγχοι με την καρτέλα (nonce, κωδικός, όρια).
+- **Δρόμοι χωρίς εφαρμογή**, στην καρτέλα, στη σελίδα «The site is locked», στην οθόνη ξεκλειδώματος, στο μήνυμα σύνδεσης που απορρίπτεται (κωδικός αλλαγμένος στη βάση) και σε email για «Ξέχασα τον κωδικό» του προσωπικού: κωδικός ανάκτησης, `SCRAPELOCK_UNLOCK` (και `wp config set SCRAPELOCK_UNLOCK true --raw --type=constant`), το σβήσιμο του φύλακα δεν ξεκλειδώνει. Το `wp user update --user_pass` προειδοποιεί ότι ο κωδικός του προσωπικού δεν άλλαξε.
+- **guard.json**: μόνο η υπογεγραμμένη εγγραφή και το αρχείο του ScrapeLock· οι λίστες ενεργών plugins / θέματος (σε multisite κάθε site) στο `guard-values.json` του ιδιωτικού φακέλου `data-<hex>`, υπογεγραμμένες με το ίδιο κλειδί και δεμένες στη γενιά της εγγραφής. Μετάβαση από την 3.12.13 στην πρώτη σελίδα του wp-admin και στον ωριαίο έλεγχο· ως τότε ο νέος φύλακας διαβάζει και το παλιό guard.json.
+- **Δοκιμές**: νέο `t_31214_lockdown_access`· `t_lockdown`, `t_31211_lockdown_files` για το προφίλ και το guard-values.json.
+
+
+### Ασφάλεια
+
+- **Αυτο-υπογραφή του server**: η παλιά υπογραφή `X-ScrapeLock-Self` (επαναλήψιμη) καταργήθηκε· οι διευθύνσεις του server μαθαίνονται μόνο από τα δικά του υπογεγραμμένα αιτήματα. Όσες μάθαμε με την παλιά καθαρίζονται στην αναβάθμιση.
+- **CrowdSec**: όταν αλλάζει η διεύθυνση, το κλειδί σβήνεται (φόρμα, εισαγωγή, WP-CLI, επαναφορά)· `http://` μόνο για τοπικές διευθύνσεις.
+- **Παγίδα bots**: εικόνες και scripts από ξένες σελίδες δεν μετρούν (παλιοί browsers χωρίς Sec-Fetch).
+- **Email ξεκλειδώματος σύνδεσης**: το πολύ ένα ανά 6 ώρες, το προηγούμενο link μένει έγκυρο.
+- **Έλεγχος DNS crawlers**: όταν τελειώνει ο προϋπολογισμός, οι αληθινοί crawlers περνούν με όριο αντί να κόβονται· προϋπολογισμός και ανά δίκτυο.
+- Δοκιμές: `t_31214_security`.
+
+### Bunny CDN
+
+- **Κλείδωμα wp-login**: ακριβής εξαίρεση `postpass` και έλεγχος και στον server.
+- **«Μόνο μέσω CDN»**: κανόνες Nginx/Apache που κόβουν πριν από την cache· οδηγία για firewall.
+- **Νέοι edge servers** δεν μπλοκάρονται ποτέ· ένα ψεύτικο header δεν δίνει εμπιστοσύνη.
+- **Logs**: ανθεκτική ανάγνωση (`|` στο Referer), χωρίς διπλομετρήσεις, ορατό όταν μένει πίσω· προειδοποίηση στο Site Health.
+- **Νέα**: προαιρετικό μπλοκάρισμα AI bots στο Bunny, κρυφό header με ένα κλικ (`wp scrapelock bunny secret on`), purge μετά από αλλαγές Stealth/watermark.
+- Δοκιμές: `t_31214_bunny`.
+
+### Bots
+
+- **Webhooks πληρωμών** (WooCommerce, Stripe, PayPal κ.ά.) δεν μπλοκάρονται ποτέ, ούτε σε Emergency Mode.
+- **Ψεύτικοι Google/Bing** κόβονται και σε σελίδες της cache (έλεγχος πριν την cache, χάρτης Nginx).
+- **Headers browser που δεν συμφωνούν** με τον User-Agent: αυστηρότερο όριο.
+- **Όρια ανά δίκτυο** (/24, /48), **δυνατότερος έλεγχος ανθρώπου** για ύποπτους, **κυλιόμενο λεπτό**.
+- **Νέα AI bots**: ProRataInc, YisouSpider, Novellum, wpbot, magpie-crawler.
+- Νέες εγκαταστάσεις: αποσπάσματα στις λίστες, κρυφά author archives. Τα υπάρχοντα sites δεν αλλάζουν.
+- Πιο ειλικρινή κείμενα για το τι σταματά και τι απλώς επιβραδύνει.
+- Δοκιμές: `t_31214_bots`.
+
+## 3.12.13 — 2026-11-24
+
+Plugin Check (WordPress.org): 0 σφάλματα και 0 προειδοποιήσεις (πριν: 5 σφάλματα, 28 προειδοποιήσεις). Καμία αλλαγή στη λειτουργία.
+
+- **WP-CLI `rules install`**: οι εντολές test / reload του server τρέχουν μέσω του runner του ίδιου του WP-CLI (`WP_CLI\Process`, αυτό που χρησιμοποιεί το `WP_CLI::launch()`) αντί για `proc_open()`· το plugin δεν ξεκινά πια καμία διεργασία μόνο του. Η είσοδος μένει `/dev/null` (σε subshell), ο κωδικός εξόδου και η έξοδος (stdout και μετά stderr) ίδια.
+- **Βάση δεδομένων**: τα INSERT της κίνησης περνούν κάθε τιμή από ένα `$wpdb->prepare()` ανά εντολή (όχι πια ενωμένα tuples που είχαν γίνει prepare χωριστά· το NULL του `rt_ms` ως `NULLIF(%d, -1)`)· οι λίστες IN και OR χτίζονται μέσα στο `prepare()` από placeholders· το δείγμα User-Agent των «προβλημάτων» από τον ίδιο runner. Ίδια ερωτήματα, ίδιος αριθμός.
+- **Μεταφράσεις**: χωρίς `load_plugin_textdomain()`: ο φάκελος `languages/` δίνεται στη φόρτωση just-in-time (και για plugin ενεργό σε όλο το δίκτυο), και στο WordPress 6.2–6.6 το αρχείο φορτώνεται αμέσως· το language pack στο `wp-content/languages/plugins/` προηγείται όπως πριν.
+- **Μικρότερα**: όνομα προσωρινού αρχείου από `random_bytes()`· το Stealth δεν έχει πια το `s.w.org` ως string (regex, νέα ετικέτα της υπογραφής) και το `get_posts()` κρατά το προεπιλεγμένο `suppress_filters`· οι δύο σταθερές των cache plugins ορίζονται με το όνομά τους· ο έλεγχος πριν από την cache αναγνωρίζει το αίτημα συγχρονισμού από το query του `REQUEST_URI`, όχι από το `$_GET`.
+- **readme.txt**: σύντομη περιγραφή (2.317 χαρακτήρες) με τα βασικά χαρακτηριστικά, 13 ερωτήσεις στο FAQ, το changelog από την 3.12.10· η πλήρης λίστα χαρακτηριστικών και οι άλλες απαντήσεις στο `docs/user-guide.md`, οι αλλαγές 3.12.9–3.6 στο `changelog.txt`· τα upgrade notices έως 300 χαρακτήρες.
+- **Δοκιμές**: `t_3126_integration` (καμία κλήση διεργασίας του plugin), `t_311_i18n` (η διαδρομή του WordPress 6.6), οι έλεγχοι κειμένων του FAQ διαβάζουν και τον οδηγό.
+
+## 3.12.12 — 2026-11-24
+
+Διόρθωση: μετά το «Μεταφόρτωση πρόσθετου» της 3.12.11, το κουμπί «Ενεργοποίηση πρόσθετου» έδειχνε στο αρχείο του φύλακα του Lockdown (`includes/lockdown-guard.php`) αντί για το `scrapelock.php`, και η ενεργοποίηση τελείωνε με «The plugin does not have a valid header.»
+
+- **Αιτία**: ο φύλακας έχει δική του κεφαλίδα «Plugin Name:» (αντιγράφεται όπως είναι στο mu-plugins), και το WordPress διαβάζει τις κεφαλίδες των .php στον φάκελο του plugin και ένα επίπεδο πιο μέσα· διάλεξε το πρώτο αλφαβητικά. Η ενεργοποίηση από τη λίστα των πρόσθετων ή με WP-CLI δεν επηρεαζόταν.
+- **Διόρθωση**: ο φύλακας είναι πια στο `includes/lockdown/guard.php`, δύο επίπεδα μέσα, όπου το WordPress δεν ψάχνει. Ένας φύλακας που υπάρχει ήδη στο mu-plugins ανανεώνεται με την ενημέρωση.
+- **Tests**: νέο `t_31212_plugin_file` (το `get_plugins()` του φακέλου βρίσκει μόνο το `scrapelock.php`, καμία άλλη κεφαλίδα «Plugin Name:» στα αρχεία)· δοκιμή σε πραγματικό browser: ανέβασμα του zip και «Ενεργοποίηση πρόσθετου».
+
+## 3.12.11 — 2026-11-23
+
+Οι σαρωτές κακόβουλου λογισμικού των hosts (π.χ. SiteGround Site Scanner) έβλεπαν το ScrapeLock ως malware: τώρα δεν γράφεται κανένα αρχείο PHP την ώρα που τρέχει το site, το Lockdown χρησιμοποιεί σταθερό αρχείο φύλακα με κρυπτογραφημένα δεδομένα JSON, και οι λίστες υπογραφών επιθέσεων δεν μοιάζουν πια με επιθέσεις.
+
+- **Αιτία**: ο SiteGround Site Scanner ελέγχει κάθε νέο αρχείο και έβαλε σε καραντίνα την 3.12.10: το δοκιμαστικό `uploads/pncp-selftest-RANDOM.php` του σημείου «PHP στον φάκελο uploads», τα προσωρινά `wp-config.scrapelock-RANDOM.php` και `scrapelock-early.php.RANDOM.tmp`, τον φύλακα του Lockdown (PHP ανά site με base64(serialize()) σε σταθερά, κρυφά .php προσωρινά, αρχεία δεδομένων `.php` με `<?php exit; ?>`), και στα αρχεία του plugin τις λίστες υπογραφών (ονόματα web shells, `eval`, `/etc/passwd`, Log4Shell, Shellshock), base64 + zlib και γραμμές 6000 χαρακτήρων.
+- **Κανένα PHP σε runtime**: το «PHP στον φάκελο uploads» ζητά μια σταθερή διεύθυνση PHP που δεν υπάρχει αντί να γράφει αρχείο· τα προσωρινά του wp-config.php και του πρώιμου ελέγχου είναι `.tmp`· το μπλοκ του wp-config.php και το mu-plugin είναι απλοί, σχολιασμένοι loaders των αρχείων του plugin. Τα παλιά μπλοκ και τα κατάλοιπα της 3.12.10 αναγνωρίζονται, αντικαθίστανται και σβήνονται.
+- **Lockdown**: ο φύλακας είναι το σταθερό `includes/lockdown-guard.php`, αντιγραμμένο ως έχει στο mu-plugins (ίδιο hash σε κάθε site)· διαβάζει το υπογεγραμμένο `guard.json`. Το αντίγραφο των προστατευμένων ρυθμίσεων (`snapshot.json`, `lock.json`) έχει τις τιμές κρυπτογραφημένες (sodium secretbox) σε σύντομες γραμμές hex. Η μετατροπή από την 3.12.10 γίνεται μόνη της (στην αναβάθμιση, ωριαία, στην πρώτη σελίδα του wp-admin) και το site μένει κλειδωμένο.
+- **Υπογραφές**: κάθε λέξη των μοτίβων επιθέσεων έχει ένα γράμμα σε αγκύλες (`e[v]al`, ίδια regex)· το PNCP_Integrity αποθηκεύει hex αντί για base64 + zlib (διαβάζει και τα παλιά)· το protect.min.js/.css σε γραμμές κάτω από 500 χαρακτήρες· `rules install` τρέχει μόνο τα γνωστά προγράμματα. Με «Block technology profilers» οι κανόνες Apache / Nginx και το `config.json` του ελέγχου πριν από την cache γράφουν το όνομα του Netcraft ως `[N]etcraft` / `\u004e…` (`PNCP_Bots::unspell()`), με τον ίδιο αποκλεισμό.
+- **Δοκιμές**: `t_31211_no_php_writes` (inotify: κανένα νέο .php εκτός από wp-config.php και τα mu-plugins), `t_31211_lockdown_files`, `t_31211_signatures` (και τα παραγόμενα αρχεία)· σάρωση του zip και των αρχείων ενός πραγματικού site Apache με ClamAV, YARA (php-malware-finder, signature-base, Yara-Rules, YARA Forge), amwscan και php-malware-scanner.
+
+## 3.12.10 — 2026-11-22
+
+Τα αρχεία που γράφει το ScrapeLock κρατούν ιδιοκτήτη και δικαιώματα, ακόμα κι όταν το WP-CLI τρέχει ως root, και προειδοποίηση στο WP-CLI ως root.
+
+- **Αιτία**: με `wp … --allow-root` μια αλλαγή που άναβε τον έλεγχο πριν από την cache ή τον πρώιμο έλεγχο ξανάγραφε το wp-config.php (προσωρινό αρχείο + rename) ως `root:root 0640`· η PHP-FPM δεν μπορούσε να το διαβάσει («Failed opening required wp-config.php») και το site έπεφτε. Το ίδιο για το `mu-plugins/scrapelock-early.php` και το `uploads/scrapelock/*`.
+- **`PNCP_File_Owner`**: πριν από κάθε εγγραφή κρατά ιδιοκτήτη, ομάδα και δικαιώματα και τα επαναφέρει στο προσωρινό αρχείο πριν από το rename (το αρχείο δεν εμφανίζεται ποτέ με λάθος ιδιοκτήτη). Νέα αρχεία και φάκελοι ως root παίρνουν τον ιδιοκτήτη του φακέλου του WordPress (αρχεία 0644, φάκελοι 0755, ακόμα και με umask 077). Χρησιμοποιείται για wp-config.php, mu-plugin, Seal, Lockdown, .htaccess, κανόνες server (`rules install`, `cache status --save-constant`), δεδομένα της precheck, breaker, geo, Stealth debug log, watermark και αρχεία του site. Ένα `.conf` του server που δημιουργείται μένει του root.
+- **Έλεγχος πριν από την cache**: δικό του αντίγραφο της λογικής (δεν φορτώνει άλλο αρχείο του plugin)· όταν δεν τρέχει ως root κάνει μόνο έναν έλεγχο ανά διεργασία, οπότε με APCu ή Redis ένα αίτημα επισκέπτη μένει χωρίς καμία πρόσβαση σε αρχείο (strace). Το καθάρισμα ως root επιστρέφει στον ιδιοκτήτη του site τα αρχεία που άφησε του root η 3.12.9.
+- **WP-CLI**: προειδοποίηση όταν τρέχει ως root (`wp scrapelock …`, `wp option update pncp_*`, `wp plugin deactivate scrapelock`), με τον χρήστη για `sudo -u <χρήστης> wp …`· όχι με `--quiet` ή `--format=json`.
+- **Δοκιμές**: `t_3130_root_wpcli` (πραγματικός Nginx + PHP-FPM ως απλός χρήστης, WP-CLI ως root: το site απαντά 200 και τα αρχεία κρατούν ιδιοκτήτη μετά από κάθε εντολή· στην 3.12.9 αποτυγχάνει με «Failed opening required»), `t_3130_owner_files`, `t_3130_owner_data`, `t_3130_owner_static` (κάθε εγγραφή στον κώδικα έχει χειρισμό ιδιοκτήτη ή τεκμηριωμένη εξαίρεση).
+
+## 3.12.9 — 2026-11-22
+
+Με APCu ή Redis object cache, ένα αίτημα επισκέπτη δεν αγγίζει πια ούτε τον δίσκο ούτε τη βάση για λογαριασμό του ScrapeLock (η αιτία των 504 όταν ο δίσκος «παγώνει»), διακόπτης κυκλώματος (circuit breaker) για ό,τι αργεί, και `wp scrapelock precheck` / `breaker`.
+
+- **Αιτία των 504**: σε server που ο δίσκος σταματούσε για δευτερόλεπτα (iowait), τα αιτήματα περίμεναν στη δουλειά του ίδιου του ScrapeLock σε αρχεία και βάση: μετρητές του ελέγχου πριν από την cache (`ftruncate()` / `fclose()`), καθάρισμα των παλιών λεπτών (`scandir()` / `unlink()`) μέσα σε αίτημα επισκέπτη, η μέτρηση όλου του site με `update_option()`. Οι PHP workers τελείωναν και ο Nginx απαντούσε 504.
+- **Έλεγχος πριν από την cache** (`PNCP_Precheck_Runtime`): με APCu (κοινό στις διεργασίες του PHP-FPM) ή τον Redis του object cache κρατά μετρητές, αποκλεισμούς, strikes, μνήμη probes, nonces, events και τη ρύθμισή του στη μνήμη· ένα αίτημα επισκέπτη δεν ανοίγει, δεν διαβάζει και δεν κάνει stat σε κανένα αρχείο του φακέλου δεδομένων. Η σύνδεση Redis γράφεται στη γραμμή του wp-config.php (ο κωδικός μασκαρισμένος), 50 ms για σύνδεση και απάντηση, αλλιώς τα αρχεία για εκείνο το αίτημα. Χωρίς APCu ή Redis: καμία αναμονή σε κλειδαριά (μετρητές με append, αποκλεισμοί και strikes με νέο αρχείο και rename, events χωρίς LOCK_EX), το καθάρισμα από το ωριαίο event (χωρίς WP-Cron ένα αίτημα το λεπτό, ως 25 ms, LOCK_NB).
+- **WordPress** (`PNCP_Defer`): γραμμές του αρχείου, νέοι αποκλεισμοί, καταγραφές επιθέσεων, γραμμές Traffic, AI referrals και η κατάσταση του αυτόματου Emergency Mode μπαίνουν σε ουρά στο object cache ή στο APCu και τις γράφει στη βάση ένα event κάθε λεπτό, ποτέ το αίτημα του επισκέπτη· οι ρυθμίσεις και οι αποκλεισμοί διαβάζονται από εκεί. Με APCu χωρίς object cache το event του λεπτού ανανεώνει τα αντίγραφα των options πριν λήξουν, και ο πρώιμος έλεγχος (mu-plugin) τα διαβάζει κι αυτός από το APCu (πριν: τέσσερα queries ανά αίτημα).
+- **Circuit breaker** (`PNCP_Breaker`, `PNCP_Breaker_Status`): ένα βήμα μέτρησης ή αποθήκευσης πάνω από 200 ms (έλεγχος πριν από την cache, μέτρηση σελίδων όλου του site και η κατάστασή της· επαλήθευση crawlers με DNS: 1 s) σταματά για 10 λεπτά· τα αιτήματα περνούν χωρίς αυτό, οι αποκλεισμοί που υπάρχουν ισχύουν. Η κατάσταση στον Redis των μετρητών ή στο APCu· μόνο χωρίς αυτά σε μικρά αρχεία, όπου ο χρόνος τροποποίησης είναι το τέλος της παύσης (ένα stat, ποτέ ανάγνωση). Site Health «ScrapeLock counting and storage speed» και «ScrapeLock counters», ειδοποίηση με «Resume counting now», φίλτρα `pncp_breaker_ms`, `pncp_breaker_minutes`.
+- **WP-CLI**: `wp scrapelock precheck [status|sync|cleanup]` (ποιο store χρησιμοποιεί ο έλεγχος, ρωτώντας την PHP του web server, αφού το WP-CLI δεν βλέπει το APCu της· αντιγραφή αποκλεισμών μνήμης ↔ αρχείων· το ωριαίο καθάρισμα για system cron) και `wp scrapelock breaker [status|reset]`. Με APCu το WP-CLI βλέπει αντίγραφο που γράφουν οι σελίδες διαχείρισης, τα events του PHP-FPM και το υπογεγραμμένο αίτημα του `PNCP_Defer`· εκεί γίνεται και το `reset` του.
+- **Γραμμή στο wp-config.php**: με Redis object cache (σταθερές `WP_REDIS_*` ή `WP_REDIS_CONFIG`) και την επέκταση Redis της PHP έχει πλέον και τη σύνδεση Redis. Το ScrapeLock την ξαναγράφει μόνο του μετά την ενημέρωση· αν το wp-config.php δεν γράφεται, η σελίδα ρυθμίσεων ζητά να *αντικατασταθούν* οι παλιές γραμμές (όχι να προστεθούν δεύτερες). `define( 'SCRAPELOCK_PRECHECK_REDIS', false );` για χωρίς Redis.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις μένουν ίδιες (κανένα νέο κλειδί)· οι κανόνες server και Stealth επίσης.
+
+## 3.12.8 — 2026-11-21
+
+Το Stealth σε Nginx χρησιμοποιεί μόνο του τον νέο χάρτη μόλις ο server έχει τους κανόνες του (η αιτία του εσωτερικού wp-content στα minified αρχεία του WP Rocket), `wp scrapelock stealth check | debug`, το `cdn purge` αδειάζει και τις page caches των plugins, και διορθώσεις του Stealth σε ακραίες περιπτώσεις.
+
+- **Αιτία του εσωτερικού wp-content** (`PNCP_Stealth::refresh()`): οι σελίδες ξαναγράφονταν με τις λέξεις του τελευταίου «Test again» (`state['words']`), ενώ οι κανόνες που δείχνονται, εγκαθίστανται και ελέγχονται («installed and up to date») φτιάχνονται από το `build()`. Σε Nginx ο νέος χάρτης έμενε μόνο «pending»: site που δοκιμάστηκε πριν από την 3.12.6 ή πριν ενεργοποιηθεί το WP Rocket κρατούσε σε κάθε νέα σελίδα `/assets/<alias>/cache/min/1/wp-content/themes/<κωδικός>/…`. Τώρα ο νέος χάρτης μπαίνει σε χρήση όταν ο φάκελος βάσης δεν άλλαξε, η διεύθυνση ελέγχου απαντά το τρέχον αποτύπωμα και το self-test περνά· μετά αδειάζουν οι page caches. Η κατάσταση των κανόνων που βλέπει τους τρέχοντες κανόνες ενώ ένας χάρτης περιμένει προγραμματίζει αυτόν τον έλεγχο (μέσα σε ένα λεπτό).
+- **Δεύτερο πέρασμα** (`code_new_addresses()`, `encode_left()`): διεύθυνση ήδη νέα από πέρασμα με λιγότερες λέξεις παίρνει τους κωδικούς των λέξεων που κρατά (το πολύ δύο φορές ανά λέξη, όσες γυρίζουν πίσω οι κανόνες)· δεύτερο πέρασμα δεν αλλάζει τίποτα.
+- **WP-CLI**: `wp scrapelock stealth check [<url>]` (η σελίδα όπως τη βλέπει ο επισκέπτης, μέσα από τις caches: wp-content / wp-includes που έμειναν, διευθύνσεις `/cache/min/`, κωδικοί, headers cache, κατάσταση των κανόνων Stealth και «next»), `wp scrapelock stealth debug [--clear]`· το `stealth status` δείχνει αν ο χάρτης είναι σε χρήση ή περιμένει τους κανόνες του, και τι πρέπει να γίνει.
+- **Αρχείο debug του Stealth** (`PNCP_Stealth_Debug`, μόνο με `SCRAPELOCK_STEALTH_DEBUG` ή το φίλτρο `pncp_stealth_debug`): μία γραμμή ανά στάδιο της σελίδας με αριθμούς μόνο, χωρίς IP, User-Agent ή query string, έως 256 KB, σε όνομα που δεν μαντεύεται, λήγει μόνο του.
+- **`cdn purge`** (`pncp_purge_plugin_caches()`): πρώτα οι page caches των ενεργών plugins (WP Rocket, LiteSpeed Cache, W3 Total Cache, WP Super Cache, WP Fastest Cache, Nginx Helper, Cache Enabler, SiteGround Optimizer) με αναφορά για το καθένα, μετά η fastcgi cache, μετά το CDN· `--no-plugin-cache`, `--minify` (με `--all`: και τα minified CSS / JS του WP Rocket και του Autoptimize). Το `pncp_purge_page_cache()` επιστρέφει τι έτρεξε.
+- **`cache status`**: λέει αν ορίστηκε η `SCRAPELOCK_FASTCGI_CACHE_PATH` και τυπώνει έτοιμη τη γραμμή `wp config set … --anchor="require_once ABSPATH . 'wp-settings.php';" --placement=before` (σε κάποια wp-config.php λείπει το προεπιλεγμένο anchor του WP-CLI)· `--save-constant` την προσθέτει μετά από δοκιμή σε αντίγραφο.
+- **Stealth, ακραίες περιπτώσεις**: κανόνες για τους «αδελφούς» φακέλους που φτάνει ένα stylesheet με `../` (child theme → parent, plugin → άλλο plugin), όχι πάνω από πραγματικό φάκελο στη διεύθυνση βάσης· uploads τύπων που δεν σερβίρουν οι κανόνες (.zip, .docx, .csv…) κρατούν την πραγματική διεύθυνση· διευθύνσεις μετά από escaped εισαγωγικό (`url(&quot;…&quot;)`), URL-encoded διευθύνσεις του site σε links κοινοποίησης, cart fragments του WooCommerce (`wc-ajax`) για επισκέπτες· φάκελος με κενό ή άλλο χαρακτήρα που δεν χωρά σε κανόνα δεν παίρνει δική του διεύθυνση.
+- **Κανόνες μετά από ενημέρωση**: όπου το ScrapeLock γράφει τους κανόνες Stealth στο .htaccess, γράφονται ξανά όταν άλλαξε το κείμενό τους με τον ίδιο χάρτη (η αναβάθμιση προγραμματίζει τον έλεγχο). Οι κανόνες λένε σε σχόλιο γιατί ο κανόνας κάθε λέξης γράφεται δύο φορές.
+- **Διορθώσεις**: `cache purge <path>` / `cdn purge <path>` με το WordPress σε υποφάκελο χρησιμοποιούν τη διεύθυνση του home (τα αρχεία επαλήθευσης και το `/.well-known/` μένουν στη ρίζα)· `rules install` δεν λέει ποτέ «installed» χωρίς reload (systemctl ως εναλλακτική, αλλιώς σταματά και επαναφέρει τα αρχεία) και κρατά ιδιοκτήτη και ομάδα του αρχείου· το uninstall σβήνει και το `pncp_fastcgi_last`· η επικεφαλίδα του `selfcheck --log` μεταφράζεται.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις μένουν ίδιες· οι κανόνες server επίσης. Οι κανόνες Stealth άλλαξαν: μετά την ενημέρωση αντιγράψτε τους ξανά ή `wp scrapelock rules install --stealth=<αρχείο>`, μετά μία φορά `wp scrapelock stealth test` και `wp scrapelock cdn purge --all --minify --yes`.
+
+## 3.12.7 — 2026-11-21
+
+Η cache του Nginx (fastcgi) αδειάζει μαζί με τις άλλες page caches, εντολή `wp scrapelock cache`, και τα τελευταία ίχνη που άφηνε το Stealth (σχόλια των plugins cache, paths στις μεταφράσεις των scripts).
+
+- **Nginx fastcgi cache** (`PNCP_Fastcgi_Cache`, από το `pncp_purge_page_cache()`: αποθήκευση ρυθμίσεων, Stealth ανοιχτό / κλειστό ή νέος χάρτης, αναβάθμιση): σβήνονται οι σελίδες αυτού του site από τον φάκελο της cache όταν είναι γνωστός: σταθερά `SCRAPELOCK_FASTCGI_CACHE_PATH`, αλλιώς το `RT_WP_NGINX_HELPER_CACHE_PATH` του Nginx Helper ή ο προεπιλεγμένος φάκελός του με μέθοδο «unlink_files». Το purge του ίδιου του Nginx Helper δεν κάνει τίποτα όταν η μέθοδος ή ο φάκελός του δεν είναι του server. Σβήνονται μόνο κανονικά αρχεία με όνομα MD5, header cache του Nginx και γραμμή KEY της οποίας το MD5 είναι το όνομα (ή στο header για παραλλαγή Vary) και που ξεκινά με host του site· links ποτέ, φάκελοι συστήματος, home και WordPress απορρίπτονται, η δουλειά έχει όριο.
+- **WP-CLI** (`PNCP_Cli_Server::cache()`): `wp scrapelock cache status | purge [--all | <διευθύνσεις>…] [--cache-dir=…] [--nginx-conf=…] [--dry-run] [--yes]`: βρίσκει τον φάκελο (η σταθερά / Nginx Helper, αλλιώς το `fastcgi_cache_path` της zone που χρησιμοποιεί το server { } αυτού του site στο `nginx -T` ή στο `--nginx-conf`), δείχνει τις σελίδες του site στην cache, τις σβήνει και τυπώνει τη γραμμή `wp config set` για τη σταθερά. Το `cdn purge --all` αδειάζει πρώτα την cache του server (πριν το CDN ξαναζητήσει τη σελίδα) εκτός με `--no-server-cache`· `--server-cache` για διευθύνσεις. Το `run()` καλείται επιπλέον μόνο με `nginx -T` του προγράμματος που βρέθηκε (`escapeshellarg()`).
+- **Σχόλια των plugins cache** (`PNCP_Surface::quiet_cache_plugins()`, `PNCP_Stealth::without_footprints()`): με «Hide that the site runs on WordPress» ή Stealth ορίζονται για τους επισκέπτες (αν δεν τα έχει ορίσει το site) το `WP_ROCKET_WHITE_LABEL_FOOTPRINT` (το WP Rocket δεν έχει φίλτρο για το σχόλιό του, το γράφει στο δικό του buffer μετά από όλα) και το `WP_REDIS_DISABLE_COMMENT`. Το buffer του Stealth σβήνει επίσης, με τις ακριβείς λέξεις τους, τα σχόλια των WP Rocket, Redis Object Cache, W3 Total Cache, WP Super Cache, LiteSpeed Cache, Autoptimize, WP Fastest Cache, Hummingbird και SG Optimizer που φτάνουν σε αυτό· τα conditional και τα άλλα σχόλια μένουν.
+- **Μεταφράσεις των scripts** (`PNCP_Stealth::script_translations()`, φίλτρο `load_script_translations`): με Stealth το JSON για τους επισκέπτες χάνει τα `comment` (`wp-includes/js/dist/…` ή path plugin) και `generator`· το `locale_data`, το text domain και η γλώσσα μένουν, το «/» μένει escaped.
+- **Κείμενα**: γραμμή για την cache του Nginx στην κάρτα Stealth (το υπόλοιπο στο «More»), «What can never be hidden» για τα σχόλια που προσθέτει ένα plugin όταν αποθηκεύει τη σελίδα, νέες ερωτήσεις στο readme.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.6 μένουν ίδια (κανένα νέο κλειδί), οι κανόνες server και Stealth επίσης. Μετά την ενημέρωση, σε server με fastcgi cache: `wp scrapelock cache status`, η γραμμή που τυπώνει στο wp-config.php, και `wp scrapelock cache purge --all`.
+
+## 3.12.6 — 2026-11-21
+
+Stealth με WP Rocket και τα άλλα plugins βελτιστοποίησης, κατάσταση εγκατάστασης των κανόνων Stealth, εντολές WP-CLI για τους κανόνες και το CDN, αρχεία επαλήθευσης, «Block technology profilers» και «Dismiss» στο «For my site».
+
+- **E1 Stealth και plugins βελτιστοποίησης** (`PNCP_Stealth::optimizers()`, `cache_words()`): με WP Rocket, Autoptimize, LiteSpeed Cache ή W3 Total Cache (ενεργό plugin, η σταθερά του, ή οι φάκελοι cache/min, cache/busting, cache/background-css του WP Rocket· φίλτρο `pncp_stealth_optimizers`) τα εσωτερικά wp-content / wp-includes (και litespeed) στις διευθύνσεις των minified / combined αρχείων παίρνουν ουδέτερους κωδικούς όπως οι άλλες λέξεις, και οι κανόνες Nginx / Apache τα γυρίζουν πίσω με μοτίβο: και αρχεία που γράφονται μετά το «Clear cache» σερβίρονται, χωρίς λίστα αρχείων. Το HTML που αποθηκεύουν (`rocket_buffer`, `autoptimize_html_after_minify`, `litespeed_buffer_after`, `w3tc_process_content`) ξαναγράφεται τελευταίο. Η page cache αδειάζει όταν το Stealth ανοίγει, κλείνει ή αλλάζει χάρτη. Χωρίς τέτοιο plugin οι κανόνες μένουν ίδιοι. Στα «What can never be hidden»: τα data-rocket-…, rocket-lazyload, rocketlazyloadscript και οι διευθύνσεις μέσα στα αρχεία CSS / JS.
+- **E5 Αποτύπωμα των κανόνων Stealth** (`PNCP_Stealth_Status`): Nginx `if ($uri = /.well-known/scrapelock-stealth) { return 200 "<αποτύπωμα>\n"; }` σε επίπεδο server (πάνω από το rewrite του aaPanel) και `location =` ως εφεδρεία· Apache header `X-ScrapeLock-Stealth` μόνο στα υπογεγραμμένα αιτήματα του site. Κάρτα «Stealth» στο Server rules (κατάσταση: installed and up to date / out of date / χωρίς αποτύπωμα (πριν την 3.12.6) / not found / could not check, πρώτα απευθείας στον server, 5 λεπτά), γραμμή στην κάρτα Stealth των Vulnerable points, Site Health, και ειδοποίηση «copy the Stealth rules again» όταν άλλαξε ο φάκελος των διευθύνσεων ή φάκελος plugin / theme (κλείνει ανά αλλαγή). Οδηγίες aaPanel: αρχείο `extension/<site>/z-scrapelock-stealth.conf`, μετά το scrapelock.conf.
+- **E4 Όχι πια ψεύτικο «installed: not found»** (`PNCP_Rules_State`): το «installed» είναι ό,τι ανέφερε τελευταία ο server· μια αποθήκευση ρυθμίσεων ξαναϋπολογίζει μόνο το «current», και μια απάντηση χωρίς το header δεν σβήνει τίποτα. Το «not found» λέγεται μόνο όταν δύο φρέσκοι έλεγχοι του server, τουλάχιστον 3 δευτερόλεπτα μακριά, δεν βρουν κανόνες· τον δεύτερο τον ζητά η σελίδα (admin-ajax, nonce, manage_options) 4 δευτερόλεπτα μετά τη φόρτωση. Όταν διαφέρει μόνο το μέρος 1 ή μόνο το μέρος 2, η ειδοποίηση το λέει.
+- **E3 WP-CLI** (`PNCP_Cli_Server`): `wp scrapelock rules show --part=nginx-http|nginx-server|stealth-nginx|stealth-apache|apache`, `rules status [--format=json]` (state current / out_of_date / not_found, via, αποτυπώματα, και stealth_state / stealth_installed / stealth_current όσο το Stealth είναι ανοιχτό), `rules install --nginx-http=… --nginx-server=… [--stealth=…] | --apache=… [--stealth-apache=…] [--dry-run] [--yes] [--test-cmd=…] [--reload-cmd=…]`: γράφει μόνο τα αρχεία που δίνονται (.new, diff, .old, `nginx -t`, reload, αλλιώς όλα πίσω), μόνο .conf / .htaccess, χωρίς «..», symlink μόνο μέσα στον φάκελό του, κρατά το token των στατικών feeds χωρίς να το τυπώνει. `wp scrapelock cdn purge <διευθύνσεις>… | --all [--yes]` (νέες δημόσιες `PNCP_Bunny::purge_urls()` / `purge_all()`, `PNCP_Edge::purge_urls()` / `purge_all()` / `cdn_purge()`): μόνο διευθύνσεις των hosts του site, τα κλειδιά ποτέ στην έξοδο. Μόνο από WP-CLI, ποτέ όσο το site είναι κλειδωμένο. Το `proc_open()` υπάρχει μόνο εδώ· εκτός από τις προεπιλογές (πλήρη paths με `escapeshellarg()`) μόνο τα `--test-cmd` / `--reload-cmd` τρέχουν μέσω shell όπως γράφτηκαν.
+- **E6 Αρχεία επαλήθευσης** (`PNCP_Verify_Files`, κάρτα «Verification files» στο Server rules και `wp scrapelock verify-file add | list | remove`): ένα όνομα στη ρίζα ή κάτω από /.well-known/, μόνο txt / html / htm / xml / json, ως 64 KB, για 1 έως 168 ώρες (24). Σερβίρεται από το WordPress πριν από κάθε έλεγχο του plugin σε κάθε bot (και στο early check, στο pre-cache check και στους κανόνες: `$pncp_open_path` / συνθήκες Apache, έξω από το αποτύπωμα), με τον τύπο του, no-store, nosniff, `Content-Security-Policy: sandbox`. Purge στο CDN όταν μπαίνει και όταν φεύγει· προαιρετικά και αρχείο στη ρίζα (ποτέ πάνω σε υπάρχον, σβήνει μόνο αν δεν άλλαξε). HTML / XML με markup θέλει unfiltered_html. Κάθε άνοιγμα PHP ή ASP (`<?`, `<%`) απορρίπτεται, εκτός από το `<?xml`. Στο robots.txt κάθε ομάδα «Disallow: /» του ScrapeLock παίρνει `Allow: <path>`.
+- **E7 «Block technology profilers (BuiltWith, Wappalyzer, WhatCMS…)»** (`block_tech_profilers`, κλειστό, και στην αναβάθμιση μέσω `new_in_3126()`): λίστα `PNCP_Bots::tech_profiler_agents()` (BuiltWith, Wappalyzer, WhatCMS, Netcraft, W3Techs, IsItWP, WPThemeDetector, WhatRuns, SimilarTech, Datanyze, WebTechSurvey) με φίλτρο `pncp_tech_profiler_agents`, σε κάθε επίπεδο όπως οι SEO crawlers (WordPress, early, pre-cache, Nginx / Apache, robots.txt, log, Traffic, Site Health, export / import). Το «For my site» το προτείνει χωρίς τσεκ όταν τέτοια ονόματα είναι στο bot list, και βγάζει αυτές τις γραμμές.
+- **E2 «For my site»**: «Dismiss» ανά πρόταση (option `pncp_wizard_state`, όχι autoload, μία για όλο το site)· η πρόταση ξαναβγαίνει μόνο όταν αλλάξει η ρύθμιση ή η ίδια η πρόταση (hash)· δεν μετρά στο badge και δεν εφαρμόζεται ποτέ· «Show dismissed (N)» με «Restore»· «you chose this» όταν η τιμή είναι επιλογή του διαχειριστή μετά από πρόταση (και τότε χωρίς τσεκ). `wp scrapelock wizard dismiss | restore <setting>`, `--include-dismissed`.
+- **Διορθώσεις από τον έλεγχο ενοποίησης**: το `rules status` καλεί κατευθείαν το `PNCP_Stealth_Status::status()`· η απεγκατάσταση σβήνει και το `pncp_stealth_rules_seen` και το event `pncp_verify_files_expire`· η απενεργοποίηση σβήνει τα αρχεία επαλήθευσης· η σημείωση «A real page here?» του Log σε μία γραμμή με το υπόλοιπο στο «More».
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.5 μένουν ίδια (νέο κλειδί μόνο `block_tech_profilers` = 0). Μετά την ενημέρωση: αντιγραφή των κανόνων server και των κανόνων Stealth ξανά, ή `wp scrapelock rules install`.
+
+## 3.12.5 — 2026-11-21
+
+Νέα ρύθμιση: το θόλωμα στα screenshots μπορεί να ισχύει μόνο για όσους δεν έχουν συνδεθεί.
+
+- **«Applies to: Everyone / Only visitors who are not signed in»** κάτω από το «Blur the page on screenshot shortcuts» (καρτέλα On the page), κλειδί `blur_on_capture_scope` = `all` | `guests`. Προεπιλογή `all`, όπως πριν· η αναβάθμιση το αποθηκεύει ως `all` (`new_in_3125()`) και δεν αλλάζει καμία άλλη ρύθμιση· κάθε άλλη τιμή γίνεται `all`. Θαμπό με τη σημείωση «Takes effect only when …» όσο το θόλωμα είναι κλειστό. Περνά από export / import και `wp scrapelock settings`. Οι εξαιρεμένοι («Who is excluded») δεν παίρνουν το script, όπως πριν.
+- **Το αποφασίζει η σελίδα, όχι η PHP**: το `pncpConfig` έχει `blurScope`, ίδιο για όλους (σωστό και από page cache, WP Rocket, Bunny). Με `guests` το `protect.js` δεν ενεργοποιεί το θόλωμα σε συνδεδεμένο browser: cookie `pncp_si=1`, ή η κλάση `logged-in` του body (σελίδα χωρίς cache· το body δεν υπάρχει ακόμη στο `<head>`, οπότε ελέγχεται ξανά στο layer και σε κάθε θόλωμα). Το `protect.min.js` ξαναχτίστηκε από την πηγή (terser -c -m, σφραγίδα SHA-1).
+- **Cookie `pncp_si`** (`PNCP_Signin_Hint`): το `logged_in` του WordPress είναι HttpOnly, άρα αόρατο στη JavaScript. Μπαίνει μαζί με το `logged_in` (ίδια paths COOKIEPATH / SITECOOKIEPATH, domain, Secure και λήξη, SameSite=Lax, όχι HttpOnly), σβήνει στην αποσύνδεση, μπαίνει σε κανονικό αίτημα (και στο wp-admin) συνδεδεμένου browser που δεν το έχει (λογαριασμοί συνδεδεμένοι πριν την 3.12.5· εκεί cookie συνεδρίας) και σβήνει από browser που δεν είναι πια συνδεδεμένος. Ποτέ όσο η προστασία είναι κλειστή. Χωρίς προσωπικά δεδομένα· το αναφέρει το κείμενο της πολιτικής απορρήτου. Όποιος το βάλει με το χέρι κλείνει το θόλωμα μόνο στον δικό του browser.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.4 μένουν ίδια.
+
+## 3.12.4 — 2026-11-21
+
+Διόρθωση: η καρτέλα Server rules έλεγε «Not installed» στο aaPanel, ενώ το μέρος 2 των κανόνων Nginx ήταν στο server { } του site.
+
+- **Rewrite του WordPress σε επίπεδο server**: το rewrite του aaPanel για το WordPress (και του BT Panel, του CloudPanel) είναι `if (!-e $request_filename) { rewrite ^(.*)$ /index.php last; }` μέσα στο server { }. Οι εντολές rewrite σε επίπεδο server τρέχουν πριν ο Nginx διαλέξει location, οπότε η διεύθυνση ελέγχου γινόταν `/index.php` πριν τη δει ποτέ το `location = /.well-known/scrapelock-nginx`: απαντούσε το WordPress με 404, και απευθείας στον server. Το μέρος 2 απαντά τώρα τη διεύθυνση ελέγχου και σε επίπεδο server, πάνω από κάθε άλλη γραμμή: `if ($uri = <διεύθυνση ελέγχου>) { return 200 "<http> <server>\n"; }` (με το `nginx_check_path()`, άρα και για WordPress σε υποφάκελο). Όπως οι γραμμές που κρατούν το αποτύπωμα, δεν μπαίνει σε αυτό: οι εγκατεστημένοι κανόνες μένουν «τρέχοντες». Το header `X-ScrapeLock-Rules` του server { } ισχύει και σε αυτή την απάντηση· το `location =` μένει για όσους δεν έχουν τέτοιο rewrite. Ο evaluator (`PNCP_Rules::evaluate()`) απαντά το ίδιο.
+- **Ο έλεγχος ρωτά τον ίδιο τον server**: πρώτα απευθείας (ο host και η θύρα του site καρφωμένα στο 127.0.0.1, στη διεύθυνση του server ή στο `SCRAPELOCK_SERVER_IPS`, με υπογραφή και το User-Agent του αυτοελέγχου, 3 δευτερόλεπτα), μετά από τη δημόσια διεύθυνση· κρατά από πού απάντησε. Πίσω από Bunny χωρίς «Forward Host Header» απαντούσε άλλο server { }, και ένα 404 στην cache του CDN έμενε μετά την εγκατάσταση. Χωρίς αποτύπωμα στη διεύθυνση ελέγχου μετρά το header `X-ScrapeLock-Rules` της απάντησης του WordPress στο δικό του αίτημα, όπως σε κάθε αυτοέλεγχο: η καρτέλα και η ειδοποίηση «out of date» λένε το ίδιο. Μια διεύθυνση site http:// που ο server στέλνει σε https:// ακολουθείται μία φορά. Απάντηση της 3.12.3 στο transient ρωτιέται ξανά.
+- **Τι απάντησε αντί για τους κανόνες**, σε μία γραμμή με τις λεπτομέρειες στο «More», στην καρτέλα, στο Site Health και στα `wp scrapelock status` / `selfcheck`: το WordPress (το μέρος 2 δεν είναι ενεργό στο server { }, ή είναι κάτω από rewrite σε επίπεδο server), ο ίδιος ο Nginx (άλλο location πήρε τη διεύθυνση: λείπει ή είναι μέσα σε άλλο location), μόνο το CDN (Forward Host Header, `SCRAPELOCK_SERVER_IPS`), η cache του CDN (purge), κάτι άλλο. Στο aaPanel λέει και πού. Το Site Health και ο αυτοέλεγχος το λένε μόνο σε site που χρησιμοποίησε τους κανόνες.
+- **Apache**: η κάρτα Apache δείχνει αν είναι εγκατεστημένοι οι κανόνες, από το header τους (mod_headers, έξω από τα RewriteRules, άρα η σειρά τους δεν παίζει ρόλο), ρωτώντας πρώτα τον server· το .htaccess δεν διαβάζεται ποτέ.
+- **Πού μπαίνει το μέρος 2**: ξεκινά με «# Put these lines directly inside server { }, not inside a location { }.» (σχόλιο: το αποτύπωμα μένει ίδιο). Οι οδηγίες του aaPanel λένε Config ακριβώς κάτω από το `#SSL-END`, ή αρχείο στον φάκελο extension όταν το Config τον κάνει include πάνω από τα location του, μόνο το ένα από τα δύο (δύο φορές, το `nginx -t` αποτυγχάνει)· και ότι στα aaPanel, BT Panel, CloudPanel το μέρος 2 μπαίνει πάνω από το include του rewrite.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.3 μένουν ίδια. Μετά την ενημέρωση: αντιγραφή του μέρους 2 ξανά από το Server rules (Nginx), `nginx -t` και reload.
+
+## 3.12.3 — 2026-11-21
+
+Διορθώσεις: οι κανόνες server που φτιάχνει το ίδιο το ScrapeLock δεν αρνούνται πια τον ίδιο τον server, και το plugin βλέπει πότε οι εγκατεστημένοι κανόνες είναι παλιοί.
+
+- **Ο έλεγχος του site έμοιαζε με ψεύτικο browser**: οι έλεγχοι του site προς τον εαυτό του («Check again» στα Vulnerable points, Site Health, «Run a real self-check now», `wp scrapelock selfcheck`) έστελναν User-Agent του Chrome χωρίς Sec-Fetch-Mode και Sec-CH-UA πάνω από HTTPS, και ο κανόνας fake_browser των κανόνων Nginx του ίδιου του ScrapeLock τους έδινε 403 πριν φτάσουν στην PHP, όπου θα μετρούσε η υπογραφή. Τώρα κάθε έλεγχος στέλνει `ScrapeLock-Selftest/<έκδοση> (+<διεύθυνση του site>)`, που δεν είναι browser, μαζί με την υπογραφή· οι έλεγχοι της PHP τον αφήνουν να περάσει από την υπογραφή, ποτέ από το όνομα.
+- **Οι διευθύνσεις του server εξαιρούνται από τους κανόνες**: Nginx `geo $pncp_self_<site>` (127.0.0.1, ::1, η διεύθυνση του server, η διεύθυνση εξόδου που μαθαίνεται από τα υπογεγραμμένα αιτήματα, `SCRAPELOCK_SERVER_IPS`) που κερδίζει κάθε λόγο αποκλεισμού στο `$pncp_block_<site>`· Apache `RewriteCond %{REMOTE_ADDR}` πριν από κάθε ομάδα αποκλεισμού (ranges με εκφράσεις του Apache 2.4, όχι στο LiteSpeed). Το 127.0.0.1 και οι ιδιωτικές διευθύνσεις μετρούν μόνο όταν δεν τις πέρασε proxy (κανένα X-Forwarded-For, X-Real-IP, Forwarded, CF-Connecting-IP). Ποτέ edge CDN, ποτέ άκυρη τιμή, ποτέ ιδιωτικό range ευρύτερο από /24. Η καρτέλα Server rules τις γράφει· πίσω από CDN χρειάζεται `real_ip` (Nginx) ή `mod_remoteip` (Apache).
+- **Αποτύπωμα των κανόνων στο header `X-ScrapeLock-Rules`**, μόνο για τα υπογεγραμμένα αιτήματα του site (Nginx: `add_header … always` στο server { }, με τη γνωστή κληρονομικότητα των add_header· Apache: `Header always set … "expr=-n %{HTTP:X-ScrapeLock-Sig}"` με mod_headers). Κάθε έλεγχος το συγκρίνει με τους κανόνες των τρεχουσών ρυθμίσεων (option `pncp_rules_state`, όχι autoload).
+- **Ειδοποίηση για παλιούς κανόνες**: όταν διαφέρουν, και αμέσως μετά από αποθήκευση ρύθμισης που αλλάζει τους κανόνες, ειδοποίηση στις σελίδες του ScrapeLock και στον πίνακα ελέγχου (μόνο manage_options, κλείνει ανά αποτύπωμα) και αποτέλεσμα «recommended» στο Site Health: «The server rules are out of date (installed: X, current: Y)», με «See what changed» (διαφορές γραμμή προς γραμμή από το κείμενο που έδειξε η καρτέλα, option `pncp_rules_texts`). Site που δεν εγκατέστησε ποτέ κανόνες δεν ενοχλείται. Οι κανόνες Nginx πριν από την 3.12.3 αναγνωρίζονται από τη διεύθυνση ελέγχου τους.
+- **Ποιος κανόνας αρνήθηκε**: όταν ο web server αρνείται το αίτημα του site πριν από το WordPress, ο έλεγχος το περνά από τους κανόνες του ScrapeLock (ίδια maps με τους κανόνες Nginx) και λέει «Refused by ScrapeLock's own server rule (fake browser)» (ή τον κανόνα που ήταν) και τι να γίνει, αντί για «web server».
+- **«Allow AI search»** στους κανόνες: τα AI search bots δεν είναι στους αποκλεισμένους User-Agents όσο είναι ανοιχτό, και μπλοκάρονται από την ενσωματωμένη λίστα όσο είναι κλειστό (όπως στην PHP από την 3.12.1)· τώρα με δοκιμή.
+- **Όριο σελίδων Nginx**: με «Always allowed IPs» δεν μετρά ούτε τον server. Μια ζώνη χωρίς αυτές κρατά το κλειδί της, γιατί ο Nginx αρνείται reload όταν αλλάζει το κλειδί υπάρχουσας ζώνης.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.2 μένουν ίδια. Μετά την ενημέρωση: αντιγραφή των κανόνων ξανά από το Server rules.
+
+## 3.12.2 — 2026-11-20
+
+Διορθώσεις: τα αιτήματα του site προς τον εαυτό του πίσω από Bunny CDN χωρίς «Forward Host Header», και ποιος τα αρνείται.
+
+- **Η υπογραφή για τον host που έγινε**: το Bunny χωρίς «Forward Host Header» (η προεπιλογή του) στέλνει στον server το όνομα του origin της pull zone ως Host, και η υπογραφή της 3.12.1 ήταν δεμένη σε αυτό, οπότε το «Check again» στα Vulnerable points και το Site Health έπαιρναν ακόμα 403. Η υπογραφή λέει τώρα για ποιον host του site και ποια διαδρομή έγινε (`χρόνος.nonce.hmac.hint`) και επαληθεύεται για εκείνον, ό,τι Host κι αν φτάσει· «//» στη διαδρομή και HEAD που έγινε GET ταιριάζουν κι αυτά. Οι υπογραφές της 3.12.1 γίνονται δεκτές όσο γίνεται η αλλαγή, και στο pre-cache check.
+- **Ποιος αρνήθηκε**: όταν κάτι στον δρόμο αρνείται το αίτημα του site, η σημείωση λέει ποιος: το ScrapeLock (με τον έλεγχο), το edge του Bunny, το Cloudflare, το Wordfence, άλλο plugin ή ο web server, και τι να ελέγξεις εκεί. Οι αρνήσεις του ScrapeLock έχουν header `X-ScrapeLock: refused` (ο λόγος μόνο για το αίτημα του ίδιου του site· ένας άγνωστος με πλαστή υπογραφή βλέπει μόνο «refused»), και μια έγκυρη υπογραφή παίρνει `X-ScrapeLock: ok id=…`.
+- **Κατευθείαν στον server**: τότε το αίτημα γίνεται ξανά απευθείας στον server (ο host και η θύρα του site καρφωμένα στο 127.0.0.1, στη διεύθυνση του server ή στο `SCRAPELOCK_SERVER_IPS` με CURLOPT_RESOLVE, ο έλεγχος TLS όπως πριν). Τα Vulnerable points δίνουν πραγματικό αποτέλεσμα με την ένδειξη «Checked at the server», με τις λεπτομέρειες στο «More». Για 6 ώρες και τα άλλα αιτήματα του site προς τον εαυτό του (Site Health, WP cron) πάνε από εκεί, μόνο αφού απάντησε εκεί αυτό το ίδιο το WordPress, μόνο για τον host και τη θύρα του site, ώσπου να απαντήσει ξανά η δημόσια διεύθυνση ή να σταματήσει να απαντά ο server.
+- **Εργαλεία**: «Run a real self-check now» και το preset «The site itself (loopback)» (κάθε επίπεδο, χωρίς να σταλεί τίποτα) στο Log → Check a request, ο έλεγχος «ScrapeLock self-request test» στο Site Health και `wp scrapelock selfcheck [--log]`. Τα τελευταία 30 αιτήματα του site σημειώνονται (option `pncp_selfcheck_log`, όχι autoload) χωρίς IP, User-Agent, query string, cookie ή nonce· η απεγκατάσταση τα σβήνει.
+- **Αποκλεισμός του server στο CDN**: ένας αποκλεισμός της διεύθυνσης του server που στάλθηκε στο CDN παλιότερα αφαιρείται αμέσως, όχι στην επόμενη αλλαγή των bans.
+- **«=» στο «Always allowed User-Agents»** (ολόκληρο το User-Agent): ισχύει στο WordPress και στο pre-cache check· πριν δεν ταίριαζε με τίποτα.
+- **«Check a request»** και `wp scrapelock check`: για προεπισκόπηση συνδέσμου του «Always allowed» σε εικόνα ή αρχείο λένε «Not counted», όχι μετρητή.
+- **«For my site»**: κάθε ρύθμιση με την ετικέτα της· το εσωτερικό όνομα σε tooltip «?».
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.1 μένουν ίδια.
+
+## 3.12.1 — 2026-11-20
+
+Διορθώσεις: τα αιτήματα του site προς τον εαυτό του πίσω από CDN, τα μέλη του FluentCommunity, τα AI search bots, και πιο προσεκτικές προεπιλογές.
+
+- **Τα αιτήματα του ίδιου του site** («Check again» στα Vulnerable points, Site Health, η δοκιμή του Stealth, cron) έπαιρναν 403 πίσω από Bunny CDN χωρίς CDN secret. Το WordPress τα υπογράφει τώρα (`X-ScrapeLock-Sig`: HMAC μεθόδου, host και διαδρομής, ισχύει 60 δευτερόλεπτα και μία φορά) και ένα υπογεγραμμένο αίτημα περνά από κάθε έλεγχο, και από το pre-cache check· η γραμμή του στο wp-config.php ξαναγράφεται με το κλειδί στην επόμενη σελίδα του wp-admin (το κλειδί ποτέ στον φάκελο δεδομένων του uploads).
+- **Η διεύθυνση εξόδου του server** μαθαίνεται από τις απαντήσεις στα υπογεγραμμένα αιτήματα του site (24 ώρες), ποτέ από αίτημα κάποιου άλλου. Όταν το ScrapeLock δεν μπορεί να τη μάθει (NAT, proxy εξόδου, cluster): `define( 'SCRAPELOCK_SERVER_IPS', '203.0.113.50, 2001:db8::/64' );` στο wp-config.php.
+- **Οι διευθύνσεις του server ποτέ μπλοκαρισμένες στο CDN**: όχι στους προσωρινούς αποκλεισμούς προς Cloudflare / Bunny, όχι στη μέτρηση των logs του Bunny· περνούν από το κλείδωμα του wp-login.php στο Bunny (μέσα στις 5 θέσεις ανά συνθήκη)· δεν καταγράφονται ως επιθέσεις.
+- **FluentCommunity**: οι αναγνώσεις REST της πύλης από συνδεδεμένα μέλη μετρούν ανά λογαριασμό, έως 4 × «REST API requests per minute», και τέσσερις μαζί ως μία σελίδα στο «Pages per minute per signed-in account». Πάνω από αυτό 429 μόνο για εκείνον τον λογαριασμό (λόγος «rate_member» με το username στη νέα στήλη account του log)· οι επισκέπτες κρατούν το όριο ανά IP, καμία παράβαση για ban.
+- **AI search bots με κλειστό «Allow AI search»**: μπλοκάρονται από την ενσωματωμένη λίστα του ScrapeLock, και όταν η αναβάθμιση της 3.11 ή το «Remove from the list» τα έβγαλε από τη λίστα bots· τίποτα δεν ξαναγράφεται στη λίστα.
+- **«Check a request»**: εικόνες, βίντεο, γραμματοσειρές, CSS και JS ελέγχονται ως «Media», με τον μετρητή που αποφασίζει («N of M this minute»), και στο `wp scrapelock check`. Κάθε λόγος με την ετικέτα του, ποτέ το εσωτερικό κλειδί (Log, Check a request, WP-CLI).
+- **Traffic**: στις νέες εγκαταστάσεις οι IP αποθηκεύονται masked· το «Start collecting» ρωτά πώς, με προεπιλεγμένο το Masked, και λέει πόσο κρατιούνται. Τα υπάρχοντα sites κρατούν τη ρύθμισή τους. Το προτεινόμενο κείμενο πολιτικής απορρήτου περιγράφει το Traffic και το username που κρατιέται με όριο ανά λογαριασμό.
+- **«For my site»**: προτείνει και λογικές τιμές (ban στο πρώτο probe, άρνηση αιτημάτων με IP, reputation, πιο σύντομοι αποκλεισμοί, όριο σελίδων πολύ χαμηλό δίπλα στο human check, όριο REST πολύ χαμηλό για FluentCommunity / WooCommerce, όριο ανά λογαριασμό για sites μελών, OneSignal στο «Always allowed», κλείσιμο επιλογών που μόνο ενοχλούν), η καθεμία με τον λόγο της, όλες τσεκαρισμένες.
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.12.0 μένουν ίδια.
+
+## 3.12.0 — 2026-11-20
+
+Νέα καρτέλα Κίνηση (Traffic): κάθε αίτημα που απαντά το site, χωρίς υπηρεσία τρίτων.
+
+- **Καρτέλα Traffic** (Records → Traffic), κλειστή μέχρι το «Start collecting». Πηγή: τα logs του Bunny CDN όσο η εισαγωγή τους είναι ανοιχτή (βλέπουν και τις σελίδες από το cache του CDN), αλλιώς το access log του web server (μορφή «combined» του Nginx / Apache, και τα αρχεία rotation .1 / .1.gz, με «Test this path»), αλλιώς οι σελίδες που σερβίρει το ίδιο το WordPress. Μετράει μία πηγή κάθε φορά, οπότε κανένα αίτημα δεν μετριέται δύο φορές.
+- **Προβολές**: αιτήματα στον χρόνο, User-Agents ανά οικογένεια (browsers, επαληθευμένες και ψεύτικες μηχανές αναζήτησης, AI bots, εργαλεία SEO, προεπισκοπήσεις συνδέσμων, scripts…), Problem URLs (404 με τους συνδέσμους που οδηγούν εκεί· ο σύνδεσμος από το δικό σας site σημειώνεται ως αυτός που διορθώνετε πρώτα· 5xx, redirects, σελίδες εκτός cache, μεγαλύτερες, πιο αργές), Visitors με χώρα και αν είναι μπλοκαρισμένοι, και κάθε αίτημα με «Export CSV». Όλα τα φίλτρα μένουν στη διεύθυνση (σελιδοδείκτες).
+- **«Block this User-Agent» / «Always allow»** από κάθε User-Agent, με επιβεβαίωση που δείχνει ακριβώς τη γραμμή που προστίθεται και δεύτερο τσεκ για μηχανή αναζήτησης ή browser· πριν από την αλλαγή αντίγραφο στις «Earlier versions» με Undo. Ο δικός σας browser δεν μπλοκάρεται ποτέ.
+- **Ειδοποιήσεις με email** για ασυνήθιστη κίνηση (σφάλματα 5xx ή 404 πολύ πάνω από το συνηθισμένο, νέο βαρύ User-Agent, πηγή που σταμάτησε), το πολύ μία κάθε είδους ανά 6 ώρες· μέρος Traffic στο εβδομαδιαίο email και στο widget, έλεγχος στο Site Health όσο συλλέγει. `wp scrapelock traffic` (status, overview, top, problems, raw, export, purge, run, test-path).
+- **Ιδιωτικότητα**: όλα μένουν στη βάση του site· κάθε αίτημα 3 ημέρες (1–14, το πολύ ένα εκατομμύριο), τα ημερήσια σύνολα 90 ημέρες (7–365). Με «Masked» IP κρύβεται το τελευταίο μέρος κάθε διεύθυνσης, και όσων ήταν ήδη αποθηκευμένες. Οι συνδεδεμένοι διαχειριστές, το wp-admin, το AJAX, το cron και τα αιτήματα του site προς τον εαυτό του δεν καταγράφονται· σε multisite μόνο ο διαχειριστής δικτύου ορίζει ή δοκιμάζει το access log.
+- **Ταχύτητα**: με ένα εκατομμύριο αιτήματα κάθε προβολή απαντά σε λίγα δευτερόλεπτα (covering index, φίλτρα status σε μεγάλες περιόδους από τα ημερήσια σύνολα, ένα πέρασμα για ένα User-Agent, μια διαδρομή ή μια IP).
+- **Ελληνική μετάφραση** των νέων κειμένων. Οι ρυθμίσεις και τα exports της 3.11 μένουν ίδια· οι νέες ρυθμίσεις μπαίνουν κλειστές.
+
+## 3.11.0 — 2026-11-20
+
+Διορθώσεις από τα logs 7 ημερών του site παραγωγής (Bunny CDN, WP Rocket, FluentCommunity, OneSignal, Nginx), ένας οδηγός ρυθμίσεων και πιο απλό περιβάλλον.
+
+- **Τα αιτήματα του ίδιου του site μέσω CDN** (Site Health, έλεγχος security headers, cron, preload) δεν παίρνουν πια 403 «No browser headers»: οι διευθύνσεις του server (SERVER_ADDR, ό,τι δίνουν τα ονόματα του site χωρίς τις διευθύνσεις του CDN, και όσες μαθαίνει από τα υπογεγραμμένα αιτήματά του προς τον εαυτό του) περνούν από κάθε έλεγχο, και στο early και στο pre-cache check και στο log των Vulnerable points. Ποτέ με βάση το User-Agent, μόνο με IP επισκέπτη που εμπιστευόμαστε. Η υπογραφή δεν ακολουθεί ποτέ ανακατεύθυνση σε άλλο host, και μια διεύθυνση που μόλις έμαθε φτάνει στο pre-cache check στο ίδιο αίτημα (το Site Health δεν το λέει πια «on but not running» μέχρι να τρέξει το WP cron). Φίλτρο `pncp_server_ips`.
+- **Bots ενεργών plugins** (WP-Rocket-SaaS) επιτρέπονται και στο pre-cache check· το early check ξέρει και τα bots που προσθέτουν άλλα plugins με `pncp_plugin_bots`.
+- **/.well-known/**: GET/HEAD χωρίς User-Agent δεν απορρίπτονται· GoogleAssociationService, Chrome Privacy Preserving Prefetch Proxy, AuthenticationServices της Apple και OneSignal επιτρέπονται εκεί. Διευθύνσεις των επίσημων λιστών Google/Apple δεν απορρίπτονται από τους ελέγχους κενού User-Agent, «Browsers only» και headless. Οι νέες εγκαταστάσεις τα έχουν και στο «Always allowed». Φίλτρο `pncp_well_known_agents`.
+- **Στατικά αρχεία** (εικόνες, βίντεο, γραμματοσειρές, CSS, JS) δεν μετρούν ως σελίδες στα όρια ούτε στο αυτόματο Emergency Mode· έχουν δικό τους μετρητή (10 × «Pages per minute», χωρίς παράβαση). Φίλτρο `pncp_static_extensions`.
+- **«Allow AI search» πάνω από τη λίστα bots**: τα OAI-SearchBot, ChatGPT-User, PerplexityBot κ.λπ. βγαίνουν από τη λίστα παντού (WordPress, early/pre-cache, κανόνες server, import των logs του Bunny)· προειδοποίηση με κουμπί «Remove from the list» και μία αφαίρεση στην αναβάθμιση (με αποθηκευμένη έκδοση). Οι crawlers εκπαίδευσης μένουν μπλοκαρισμένοι.
+- **Probes άλλου λογισμικού** στο «Ban scanners on their first probe»: /actuator, Dockerfile, docker-compose, Railway, credentials/secrets, .aws, .vscode/sftp.json, *.git/config, wp-conflg.php. Φίλτρο `pncp_probe_paths`.
+- **Ban και όταν ο scanner απορρίπτεται πρώτα για το User-Agent** («Browsers only», headless, κενό User-Agent, λίστα bots): python-requests και παρόμοια για /actuator/env ή /.env έπαιρναν 403 αλλά δεν αποκλείονταν ποτέ. Οι ίδιες εξαιρέσεις (προσωπικό, επαληθευμένες μηχανές αναζήτησης, always-allowed IP και User-Agents, πραγματικά αρχεία, Private URLs, Monitor only, φίλτρο `pncp_probe_ban`). Στο early check, πριν το WordPress ξέρει αν η διεύθυνση είναι σελίδα, μόνο για .env, .git, αντίγραφα του wp-config.php, dumps και αρχεία backup.
+- **Ενδείξεις σε τρεις καταστάσεις**: «Set but not active» με τον λόγο (loader όχι στο wp-config.php, λείπει το CDN secret, προστασία κλειστή…) αντί για «Off», στη μπάρα, στο Network and CDN, στο widget, στο Site Health, στο Stealth και στο εβδομαδιαίο email.
+- **Ρυθμίσεις με λέξεις** αντί για κλειδιά («block_ip_host: 1») στο Emergency Mode, στους πίνακες «Reset this tab» και import και στο Site Health. Φίλτρο `pncp_setting_labels`.
+- **FluentCommunity**: όσο είναι ενεργό, η πύλη (/hub/) μετρά ως content address στο Log και οι αναγνώσεις REST των συνδεδεμένων μελών δεν μετρούν στο όριο REST· όλοι οι άλλοι έλεγχοι μένουν.
+- **Log**: ποια γραμμή της λίστας bots μπλόκαρε κάθε αίτημα· για υπηρεσία που μπλοκαρίστηκε ως γενική βιβλιοθήκη HTTP, κουμπί «Allow this service» (μόνο το ακριβές User-Agent της).
+- **«For my site»** στην πρώτη καρτέλα και `wp scrapelock wizard`: βρίσκει plugins, CDN και server, προτείνει ρυθμίσεις με τον λόγο τους και δίνει συμβουλές· όσες μπλοκάρουν περισσότερα δεν είναι τσεκαρισμένες. Τίποτα δεν αλλάζει χωρίς «Apply selected», με αποθηκευμένη έκδοση και Undo.
+- **Περιβάλλον**: καρτέλες σε ομάδες (Content, Bots & limits, Security, Records)· η καρτέλα Bots ως accordion με «Advanced»· οι μακριές λίστες ως «N entries» με Edit· κάθε ρύθμιση με βοήθεια μίας γραμμής και τα υπόλοιπα στο «More»· το «May affect visitors/SEO» ως εικονίδιο· «Default: N» σε κάθε αριθμό· ειδοποιήσεις σφάλματος σε μία πρόταση που λέει τι να κάνεις. Κανένα πεδίο δεν άλλαξε όνομα ή φόρμα.
+- **Ελληνική μετάφραση** όλου του plugin, μέσα στο zip (languages/scrapelock-el.mo), που φορτώνεται από WordPress 6.2 και μετά· ένα language pack του translate.wordpress.org έχει προτεραιότητα. Οι προτάσεις που ήταν κομμένες σε κομμάτια έγιναν ολόκληρες για τους μεταφραστές. (Αντικαθιστά την απόφαση της 2.x για μόνο αγγλικά στο zip.)
+- **Νέες προεπιλογές μόνο σε νέες εγκαταστάσεις**: «Ban scanners on their first probe», άρνηση αιτημάτων με την IP αντί για το όνομα, reputation, προσωρινός αποκλεισμός 120 λεπτά. Τα υπάρχοντα sites κρατούν τις τιμές τους· τα exports της 3.10.1 γίνονται import χωρίς απώλεια.
+
+## 3.10.1 — 2026-11-19
+
+Δύο θέματα του site που φάνηκαν όταν η 3.10.0 σταμάτησε να μπλοκάρει αυτά τα αιτήματα.
+
+- **Site Health «ScrapeLock site files»**: ελέγχει τα /apple-touch-icon.png (όταν υπάρχει Site Icon) και /OneSignalSDKWorker.js (όσο το OneSignal είναι ενεργό). Αν απαντούν «not found», κουμπί «Create it»: εικόνα PNG 180 × 180 από το Site Icon (και -precomposed) ή η μία γραμμή importScripts του OneSignal v16. Χωρίς Site Icon, σύνδεσμος για να επιλέξεις. Τίποτα δεν γράφεται χωρίς το κλικ, ποτέ πάνω σε αρχείο του site· το Remove και η απεγκατάσταση σβήνουν μόνο αρχεία του ScrapeLock που δεν άλλαξαν.
+- **Site Health «Wordfence and the visitor address»** (όσο το Wordfence είναι ενεργό): συγκρίνει τη IP που βλέπει το Wordfence με αυτή του ScrapeLock στην επίσκεψή σου μέσω CDN· critical όταν το Wordfence βλέπει server του Bunny, με τα βήματα (X-Forwarded-For, Trusted Proxies) και τη λίστα διευθύνσεων του Bunny για αντιγραφή. Δεν αλλάζει τίποτα στο Wordfence.
+
+## 3.10.0 — 2026-11-19
+
+Διορθώσεις από τα πραγματικά logs 7 ημερών του site παραγωγής (Bunny CDN, WP Rocket, OneSignal, Nginx).
+
+- **Edge Rules στο Bunny μέσα στο όριο των 5 ανά συνθήκη**: το «Secret files» (21 patterns) αποτύγχανε με HTTP 400 «Maximum 5 triggers are allowed per condition». Τα patterns και οι IP μοιράζονται σε ομάδες των 5, σε έναν κανόνα (Match Any) ή σε περισσότερους «ScrapeLock: … (1/3)», και είναι ένα κλείδωμα παντού: ένα Remove τα σβήνει όλα, rollback αν αποτύχει κάποιο κομμάτι (και για κομμάτι που το Bunny αποθήκευσε ενώ η απάντηση έληξε σε timeout), παλιά κλειδώματα 3.8/3.9 ξαναστέλνονται χωρισμένα. Allowed IPs του wp-login: έως 15. Φίλτρο `pncp_bunny_edge_limits`.
+- **Λιγότερα ψευδώς θετικά στο «No browser headers»**: τα αρχεία του site για υπηρεσίες (/.well-known/*, favicon, apple-touch-icon*, manifest, robots.txt, llms.txt…) με GET/HEAD δεν περνούν από τους ελέγχους «μοιάζει με bot»· διεύθυνση από τις επίσημες λίστες της Google δεν παίρνει ποτέ 403 για headers. Επαλήθευση των άλλων fetchers της Google, του Applebot και του DuckDuckBot από τις επίσημες λίστες τους (νέες λίστες Apple και DuckDuckGo, που ελέγχει και το Site Health).
+- **Bots ενεργών plugins**: το WP-Rocket-SaaS και το preload του WP Rocket, και το Jetpack, επιτρέπονται όσο το plugin είναι ενεργό, με «Stop allowing» / «Allow» και προειδοποίηση όταν μπλοκαρίστηκαν. Τα όρια και οι έλεγχοι επιθέσεων μένουν. Φίλτρο `pncp_plugin_bots`.
+- **Claude-User δεν είναι πια «Fake AI search bot»** από το εύρος 160.79.104.0/21 της Anthropic (φίλτρο `pncp_ip_extra_ranges`)· διαβάζονται όλες οι μορφές των λιστών AI· λίστα παλιότερη από μία εβδομάδα δεν χαρακτηρίζει bot ως ψεύτικο.
+- **Attacks**: τα /llms.txt, /ai.txt, /.well-known/*, εικονίδια και service workers (π.χ. /OneSignalSDKWorker.js) δεν μετρούν ως «Scanner probe» ούτε ως 4xx flood στο Bunny· οι παλιές γραμμές σβήνονται μία φορά. Φίλτρο `pncp_site_metadata_paths` (ένας κοινός κατάλογος και για το «No browser headers»).
+- **Vulnerable points → Security headers**: ο έλεγχος διαβάζει τη δημόσια αρχική σελίδα (GET, ακολουθεί redirects, ξέρει το Bunny/Cloudflare) και γράφει ποια απάντηση διάβασε· «δεν ελέγχθηκε» αντί για «λείπει» όταν η απάντηση δεν πέρασε από το CDN. Τα αποθηκευμένα αποτελέσματα της 3.9 ξαναελέγχονται.
+- **Site Health, ιδιωτικοί φάκελοι**: οι ακριβείς γραμμές Nginx και Apache φαίνονται πάντα ως απλό κείμενο· με Bunny, κουμπί «Lock at Bunny…» και νέο preset «ScrapeLock's private folders» (με προεπισκόπηση και Confirm).
+- **UX**: άλλα ονόματα καρτελών στο URL (&tab=vulnerable, &tab=server…) και ειδοποίηση για άγνωστη καρτέλα· οι ενότητες μένουν ανοιχτές μετά από Save και η σελίδα γυρίζει στο κουμπί.
+
+## 3.9.1 — 2026-11-19
+
+- Όσο το wp-login.php είναι κλειδωμένο στο Bunny, η λίστα «Allowed IPs for the login page at Bunny» δεν αδειάζει και δεν αποθηκεύεται χωρίς την IP του διαχειριστή· κάθε αλλαγή στέλνεται αμέσως στο Bunny και η κάρτα προειδοποιεί όσο ο κανόνας έχει την παλιά λίστα.
+- `wp scrapelock bunny unlock` δέχεται και `preset_<id>` και βγάζει σφάλμα όταν δεν υπάρχει κανόνας· `wp scrapelock settings set` μετρά μόνο ό,τι αποθηκεύτηκε.
+
+## 3.9.0 — 2026-11-19
+
+Βελτιώσεις της σύνδεσης με το Bunny CDN (πρώτη δοκιμή με το πραγματικό API στο site παραγωγής).
+
+- Νέος διακόπτης **«Send temporary blocks to the CDN»** (κλειστός σε νέες εγκαταστάσεις· ανοιχτός, με ειδοποίηση, σε sites που ήδη συγχρόνιζαν). Το «Save and test» μόνο συνδέει και δοκιμάζει· στο Monitor only δεν στέλνεται τίποτα που μπλοκάρει.
+- Έλεγχος σε κάθε import αν τα logs του Bunny έχουν ολόκληρες ή ανωνυμοποιημένες IP, και με 0 επιθέσεις.
+- Οθόνη **«What would be blocked»** πριν από κάθε κλείδωμα στο Bunny (διευθύνσεις, αιτήματα και IP 7 ημερών, IP με κανονική κίνηση)· κλείδωμα μόνο με Confirm. Φίλτρο `pncp_bunny_lock_preview`.
+- Κλείδωμα wp-login.php: προτάσεις IP διαχειριστών 30 ημερών (IPv6 ως /64) με επιβεβαίωση· άρνηση με άδεια λίστα ή χωρίς την τωρινή IP.
+- Προειδοποίηση πριν το κλείδωμα του XML-RPC (Jetpack, application passwords, πρόσφατη χρήση).
+- «Trust Bunny CDN addresses»: το κείμενο εξηγεί ότι sites πριν από την 2.6 το πήραν κλειστό· προειδοποίηση με κουμπί ενεργοποίησης.
+- Μετά από Save / Test / Import now / Confirm η σελίδα γυρίζει ανοιχτή στην ίδια ενότητα.
+
+## 3.8.0 — 2026-11-19
+
+- Καρτέλα **Attacks**: πού χτυπούν τα bots (αποτυχημένες συνδέσεις και usernames, wp-admin, wp-login, XML-RPC, ανίχνευση χρηστών, scanners, plugin probes, injection, επιθέσεις στο CDN), γραφήματα, «Lock this» / «Block», CSV, widget και εβδομαδιαίο email. Πίνακας `pncp_attacks`.
+- Καρτέλα **Vulnerable points**: κλείδωμα με ένα κλικ (XML-RPC, wp-admin, login, αρχεία του core, file editor, application passwords, usernames, PHP στα uploads, security headers κ.ά.), κανόνες Apache με self-test και rollback, κανόνες Nginx.
+- Προστασία σύνδεσης: όριο αποτυχιών ανά IP και username, γενικό μήνυμα λάθους, προαιρετική κρυφή διεύθυνση σύνδεσης (`SCRAPELOCK_LOGIN_SLUG_OFF` για ανάκτηση).
+- **Bunny CDN**: εισαγωγή logs και Edge Rules με ένα κλικ.
+- **Stealth** (προαιρετικό): ουδέτερες διευθύνσεις αρχείων, δικό σου REST prefix, αφαίρεση σημαδιών WordPress, σάρωση.
+
+## 3.7.0 — 2026-11-18
+
+- Site rippers, SEO crawlers και κακόβουλα User-Agents· έλεγχος Host που είναι γυμνή IP.
+- Φήμη IP με χρονική απόσβεση, όριο για scrapers που καλούν μόνο το API.
+- CrowdSec (LAPI ή blocklist, προαιρετικό), γραμμή syslog για fail2ban, τοπική μέτρηση επισκέψεων από AI.
+- Διορθώσεις Plugin Check (φίλτρα αυτόματων ενημερώσεων, μήκος readme, παράμετροι DB).
+
+## 3.6.1 — 2026-11-18
+
+Νέες οθόνες ρυθμίσεων, διορθώσεις ασφαλείας και απόδοσης (λεπτομέρειες στο `readme.txt`).
+
+## 3.6.0 — 2026-11-15
+
+Μέλη και πληρωμένο περιεχόμενο (ποιος διαβάζει, κοινοί λογαριασμοί), λιγότερα σημάδια του WordPress, ευρύτερο Lockdown, ταχύτερο frontend, και οι διορθώσεις ασφαλείας του ελέγχου κώδικα. Η 3.5.1 δεν κυκλοφόρησε: οι διορθώσεις της είναι εδώ. Η πλήρης λίστα είναι στο `readme.txt`· οι αλλαγές της 3.5.0 και παλιότερων στο `changelog.txt`.
+
+### Νέα
+
+- **«Show who is reading over protected pages»** (`PNCP_Mark`, `assets/js/mark.js`):
+  - ημιδιαφανής γραμμή σε όλη τη σελίδα με το όνομα χρήστη και την ώρα, ώστε κάθε screenshot, εγγραφή ή φωτογραφία της οθόνης να δείχνει τον λογαριασμό;
+  - custom element με τυχαίο όνομα και κλειστό shadow root, με inline `!important`· ξαναμπαίνει αν σβηστεί ή κρυφτεί (MutationObserver, έλεγχος κάθε 2″) και δεν εμποδίζει κλικ και επιλογή (`pointer-events: none`);
+  - για συνδεδεμένους: η σελίδα στέλνεται με `Cache-Control: private, no-store`;
+  - προαιρετικά για επισκέπτες: IP και ώρα από το admin-ajax (`pncp_mark`), ώστε οι σελίδες στην cache να μένουν κοινές;
+  - φίλτρα `pncp_mark_user_line`, `pncp_mark_guest_line`.
+- **Αόρατο ίχνος στο κείμενο** (`PNCP_Trace`):
+  - 64 αόρατοι χαρακτήρες σε κάθε παράγραφο, μετά την πρώτη λέξη: λογαριασμός (32 bit), ημέρα (16 bit) και HMAC με τα κλειδιά του site (16 bit);
+  - εργαλείο «Find whose copy this is» στην καρτέλα Log.
+- **Όριο σελίδων ανά λογαριασμό** (`rate_limit_account`, λόγος `rate_account`, χωρίς ban IP).
+- **Κοινός λογαριασμός** (`PNCP_Accounts`):
+  - email όταν ένας λογαριασμός χρησιμοποιείται από N διευθύνσεις μέσα σε 10 λεπτά (το πολύ ένα την ημέρα ανά λογαριασμό);
+  - προαιρετικά αποσύνδεση των άλλων συνεδριών;
+  - action `pncp_shared_account`.
+- **«Hide that the site runs on WordPress»** (`hide_fingerprint`, στο `PNCP_Surface`):
+  - περιλαμβάνει το «Hide the versions»;
+  - αφαιρεί τα links REST, oEmbed, RSD και shortlink, τα emoji, το `X-Pingback` και το `X-Redirect-By`.
+- **Lockdown, πρότυπα του Site Editor:**
+  - `wp_template` και `wp_template_part` δεν δημιουργούνται, δεν αλλάζουν και δεν σβήνονται από κώδικα όσο το site είναι κλειδωμένο;
+  - templates, template parts και global styles μπαίνουν στον ωριαίο έλεγχο του κώδικα στη βάση.
+- **Παγίδα και ban των scanners:** τα DuckDuckBot, Baiduspider και τα υπόλοιπα εξαιρούνται μόνο όταν είναι πιθανό ότι είναι γνήσια (`trap_exempt_real()`):
+  - reverse DNS στο δικό τους domain, όπου το τεκμηριώνουν;
+  - αλλιώς, διεύθυνση εκτός data center.
+- **Ταχύτερο frontend:**
+  - autoloader για τις κλάσεις `PNCP_*`;
+  - Site Health, «Check a request», έλεγχος αρχείων και Abilities φορτώνονται μόνο όπου χρειάζονται;
+  - σελίδα επισκέπτη: από 34 αρχεία / 33.138 γραμμές σε 23 / 25.908.
+
+### Διορθώσεις (από τον έλεγχο της 3.5.0)
+
+- **Πλαστή τοπική IP:** μια διεύθυνση 127.0.0.1 ή η IP του server στο header του «Real visitor IP» δεν περνά πια ως «ο ίδιος ο server».
+  - Πριν, με «Trust Bunny CDN addresses» χωρίς CDN secret, αρκούσε ένα δικό σου pull zone στο Bunny με `X-Real-IP: 127.0.0.1` για να παρακαμφθεί κάθε έλεγχος: αποκλεισμοί, bans, λίστα bots, όρια. Το ίδιο ίσχυε στο early check και στο pre-cache check.
+  - Τώρα ένα αίτημα είναι «ο ίδιος ο server» μόνο όταν κάθε διεύθυνση στη διαδρομή του είναι ο server ή το ιδιωτικό του δίκτυο, και η IP είναι αξιόπιστη. Το cron, το cache preload και ένα τοπικό Nginx ή Varnish δουλεύουν όπως πριν.
+  - Νέα `PNCP_Ip::is_local_request()` και `PNCP_Precheck_Runtime::is_local_request()`.
+- **Edge του CDN χωρίς IP επισκέπτη:** όταν ένα αξιόπιστο edge στέλνει το header χωρίς IP (λείπει ή είναι άκυρο), δεν εξαιρείται πια ως κοινό edge. Μετριέται και μπλοκάρεται όπως κάθε άλλη διεύθυνση.
+- **DNS των crawlers:** ο προϋπολογισμός αναζητήσεων ανά λεπτό παίρνεται με ατομική αύξηση: APCu, object cache, ή `LAST_INSERT_ID()` στη βάση. Ταυτόχρονα αιτήματα δεν ξεκινούν πια όλα μαζί αναζητήσεις DNS.
+- **Γνήσιοι crawlers:** όταν η επαλήθευση με DNS δεν ολοκληρώνεται, δεν παίρνουν πια 403 `no_browser`, ούτε σε Emergency Mode. Τα όρια ισχύουν κανονικά.
+- **Lockdown:** ο ωριαίος έλεγχος ξαναπρογραμματίζεται όταν το event του μετατεθεί από τη βάση πάνω από 2 ώρες μπροστά ή σε μεγαλύτερο διάστημα, και αυτό σημειώνεται στο ημερολόγιο του Lockdown.
+- **Απόδοση με Redis/Memcached:** το `PNCP_Seal::fresh_option()` γράφει το `alloptions` στο cache μόνο όταν άλλαξε η τιμή. Πριν το ξανάγραφε ολόκληρο σε κάθε αίτημα.
+- **Ψεύτικα Applebot / YandexBot:** από διεύθυνση χωρίς καμία εγγραφή PTR είναι πλέον ψεύτικος crawler, όπως ήδη ίσχυε για τα Googlebot και Bingbot. Η Apple και η Yandex δίνουν PTR σε κάθε crawler τους. Μια αποτυχία του DNS (χωρίς απάντηση) δεν είναι ετυμηγορία.
+- **Lockdown, δικαιώματα:** ένα δικαίωμα που έχει μόνο ένας χρήστης, και όχι ο ρόλος του, δεν ισχύει όσο το site είναι κλειδωμένο (`PNCP_Lockdown::own_caps()`).
+- **Lockdown, ρυθμίσεις:** τα widgets (`widget_*`, `sidebars_widgets`), το `theme_mods_*` του ενεργού theme, και οι τρόποι πληρωμής και οι τραπεζικοί λογαριασμοί του WooCommerce κρατιούνται και επανέρχονται. Νέο φίλτρο `pncp_lockdown_protected_options`.
+- **Lockdown, κώδικας στη βάση:** τα ενεργά snippets του Code Snippets και του WPCode ελέγχονται κάθε ώρα. Νέο ή αλλαγμένο snippet στέλνεται με email και γράφεται στο ημερολόγιο, και με την καραντίνα το plugin απενεργοποιείται. Φίλτρα `pncp_lockdown_db_code` και `pncp_lockdown_db_code_plugins`.
+- **Lockdown, προσωρινό ξεκλείδωμα:** στο ξανακλείδωμα, τα αρχεία που άλλαξαν όσο ήταν ανοιχτό στέλνονται με email και φαίνονται στην καρτέλα Lockdown, πριν μπουν στο νέο αποτύπωμα.
+- **Pre-cache check χωρίς APCu:** το πολύ 2.000 νέα αρχεία το λεπτό (φίλτρο `pncp_precheck_new_files_per_minute`).
+- **Readme:** η ενότητα του Lockdown λέει ακριβώς τι επανέρχεται και τι όχι.
+- **phpcs:** διορθώθηκαν τα 10 σφάλματα της 3.5.0 (Yoda, `count()` σε loop, σχόλια escaping).
+- **Έλεγχοι:** 1.157 αυτόματοι έλεγχοι σε πραγματικό WordPress (όλοι περνούν), phpcs χωρίς σφάλματα, και το υδατογράφημα σε Chromium: εμφανίζεται, το κλικ περνά από κάτω, ξαναμπαίνει αν σβηστεί ή κρυφτεί με CSS.
+
+## 3.5.0 — 2026-11-07
+
+Βελτιώσεις από τη σύγκριση με 24 παρόμοια plugins. Ελέγχθηκαν στο ίδιο εργαστήριο με την 3.4.3: php -S, nginx + PHP-FPM με APCu, Redis, WooCommerce σε browser, page caches, και αναβάθμιση από 3.4.3 με Lockdown. Η πλήρης λίστα είναι στο `readme.txt`.
+
+- **«Check a request»** στην καρτέλα Log. Δείχνει αν ένα αίτημα θα περάσει, θα μπλοκαριστεί ή θα περιοριστεί, και γιατί. Έχει έτοιμα σενάρια: GPTBot, ψεύτικο Googlebot, curl, python-requests, browser, το δικό σου αίτημα. Δεν μετρά, δεν καταγράφει και δεν μπλοκάρει τίποτα. Δίνει έτοιμες εντολές curl, και στη μπάρα του admin υπενθυμίζει ότι το προσωπικό εξαιρείται.
+- **Site Health:**
+  - αν ένα πραγματικό robots.txt κρύβει τις γραμμές του ScrapeLock·
+  - αν οι ιδιωτικοί φάκελοι ανοίγουν από τον browser·
+  - αν το REST, το RSS ή το GraphQL δίνουν ακόμα όλο το κείμενο ενώ είναι ενεργή η προστασία αντιγραφής·
+  - αν υπάρχουν plugins που συγκρούονται.
+- **Ban σαρωτών στο πρώτο αίτημα,** προαιρετικό. Αφορά τα `.env`, `.git`, backups του wp-config, dumps και αρχεία backup στη ρίζα, κλειδιά SSH, phpMyAdmin, Adminer και PHP στα uploads. Ισχύει και στον έλεγχο πριν από το cache και στους κανόνες nginx/Apache.
+- **Φόρμα ρυθμίσεων:**
+  - αναφέρει ποιες γραμμές απορρίφθηκαν·
+  - σημαδεύει τις μη αποθηκευμένες αλλαγές·
+  - σκουραίνει τις εξαρτημένες επιλογές·
+  - δείχνει ετικέτες προεπιλογής και κινδύνου.
+- **REST:** οι αναγνώσεις λιστών με πολλά αποτελέσματα μετρούν 2 ή 3, και κάθε JSON 429 έχει `retry_after`. Οι εσωτερικές αναγνώσεις του `_embed` δεν μετρούν πια.
+- **Κανόνες nginx:** κλείνουν τους φακέλους δεδομένων του ελέγχου πριν από το cache και της βάσης χωρών.
+- **readme:** νέο κείμενο για το WordPress.org.
+
+## 3.4.3 — 2026-11-06
+
+Μεγάλη έκδοση διορθώσεων, ελεγμένη σε εργαστήριο με 22 WordPress sites (PHP built-in server, nginx + PHP-FPM με APCu, Redis object cache, WooCommerce 11.2 με πραγματικό browser, WP Super Cache, W3 Total Cache, Cache Enabler, LiteSpeed Cache, nginx FastCGI cache) και αναβάθμιση από 3.4.2 με Lockdown. Η πλήρης λίστα είναι στο `readme.txt`. Οι αλλαγές των 3.3.2–3.4.2 είναι στο `changelog.txt`.
+
+- **Page cache:** ο έλεγχος πριν από το cache εφαρμόζει πλέον τη λίστα bots και το «χωρίς User-Agent» και στις σελίδες του cache. Με WP Super Cache, W3 Total Cache ή Cache Enabler, το GPTBot και τα άλλα bots διάβαζαν τις σελίδες του cache. Τα Applebot/YandexBot που δεν επαληθεύονται, και τα cookies σύνδεσης, παίρνουν τετραπλάσιο όριο αντί για κανένα. Το αυστηρό όριο του ελέγχου ανθρώπου ισχύει και στις σελίδες του cache. Καθαρίζεται και το cache του Cache Enabler, και κάθε cache όταν αλλάζει το watermark. Το Site Health προειδοποιεί όταν ένα page cache απαντά πριν από το ScrapeLock.
+- **Object cache (Redis):** το Lockdown και ο έλεγχος αρχείων διαβάζουν τα υπογεγραμμένα δεδομένα τους από τη βάση, όχι από το cache.
+- **PHP-FPM / APCu:**
+  - διπλές εγγραφές στο log υπό φόρτο·
+  - το ξεμπλοκάρισμα υπό φόρτο·
+  - τα `wp scrapelock block` / `unblock` και οι λίστες data center από το WP-CLI ισχύουν αμέσως.
+- **WooCommerce:**
+  - το Store API δεν δίνει πια τη μεγάλη περιγραφή στις απαντήσεις order/checkout·
+  - το Lockdown μπλοκάρει τη δημιουργία πελατών·
+  - στο Emergency Mode δεν μπλοκάρεται αγοραστής εξαιτίας των λανθασμένων αιτημάτων 404 του Mini-Cart.
+- **Lockdown:** δεν αφήνει εγκατάσταση, αναβάθμιση ή διαγραφή plugins/themes όσο είναι κλειδωμένο. Στέλνει email «Updates are waiting» με επανάληψη.
+- **Κανόνες nginx:** εισαγωγικά σε διαδρομές με κενό ή `;`, και τα «πάντα επιτρεπόμενα IP» δεν περιορίζονται από το `limit_req`.
+- **readme:** πιο σωστή διατύπωση για τους headless browsers και για το τι σταματά το Lockdown. Τα changelog των 3.4.1 και 3.4.2 μεταφέρθηκαν στο `changelog.txt`.
+
+## 3.3.1 — 2026-10-26
+
+Διορθώσεις από τον έλεγχο του WordPress.org.
+
+- **Έλεγχος πριν από το cache:** τα δεδομένα του (ρυθμίσεις, μετρητές, συμβάντα) γράφονται πλέον σε προστατευμένο φάκελο με τυχαίο όνομα μέσα στο uploads, `uploads/scrapelock/`, ως απλά αρχεία δεδομένων (`config.json`, `events.log`): δεν παράγεται πια κανένα αρχείο PHP. Η γραμμή στο `wp-config.php` φορτώνει τον έλεγχο από τον φάκελο του plugin. Ο παλιός φάκελος `wp-content/scrapelock-precheck` σβήνεται στην αναβάθμιση και τα συμβάντα του περνούν στο Αρχείο. Ο έλεγχος ξαναρχίζει μόλις ένας διαχειριστής ανοίξει το wp-admin.
+- **Μυστικό του CDN:** στο αρχείο ρυθμίσεων του ελέγχου γράφεται μόνο το hash του.
+- **Lockdown:** η σελίδα «The site is locked» παίρνει το στυλ της από καταχωρημένο αρχείο CSS (`assets/css/locked.css`) αντί για μπλοκ `<style>`.
+- **Θέσεις αρχείων:** κάθε φάκελος που διαβάζει ή γράφει το ScrapeLock (φάκελος του WordPress, wp-content, plugins, mu-plugins, uploads, themes, `wp-config.php`) βρίσκεται πλέον με τις συναρτήσεις του WordPress (`get_home_path()`, `get_theme_root()`, `plugin_dir_path()`, `wp_get_mu_plugins()`, `wp_upload_dir()`), στη νέα κλάση `PNCP_Paths`, αντί για τις εσωτερικές σταθερές (`ABSPATH`, `WP_CONTENT_DIR`, `WP_PLUGIN_DIR`, `WPMU_PLUGIN_DIR`). Ο κανόνας Cloudflare παίρνει τις διαδρομές wp-admin, wp-includes και wp-content από τα `admin_url()`, `includes_url()` και `content_url()`.
+- Η βάση χωρών και ο φάκελος με τα καθαρά πρωτότυπα εικόνων παίρνουν κενό `index.html` αντί για `index.php`: το ScrapeLock δεν γράφει κανένα αρχείο PHP στο uploads.
+- **readme:** κάθε λίστα data center περιγράφεται ως ξεχωριστή εξωτερική υπηρεσία, και ο σύνδεσμος όρων της Akamai Cloud (Linode) δείχνει στη σωστή σελίδα.
+
+## 3.3.0 — 2026-10-23
+
+Το Lockdown «σφραγίζεται»: όποιος γράφει μόνο στη βάση (π.χ. SQL injection σε άλλο plugin) δεν το ξεκλειδώνει.
+
+- **Υπογραφές** (νέα κλάση `PNCP_Seal`): η κατάσταση του κλειδώματος και το αποτύπωμα των αρχείων υπογράφονται με HMAC-SHA256, με κλειδί από τα `AUTH_KEY` / `AUTH_SALT` του `wp-config.php` (δεν είναι στη βάση). Πλαστή ή αλλαγμένη τιμή δεν ταιριάζει με την υπογραφή της.
+- **Φύλακας (mu-plugin):** όσο το site είναι κλειδωμένο, το `wp-content/mu-plugins/scrapelock-lockdown-guard.php` κρατά υπογεγραμμένο αντίγραφο του «κλειδωμένο / ως πότε» έξω από τη βάση, και κρατά ενεργό το ScrapeLock αν σβηστεί από τα ενεργά plugins στη βάση. Σβήσιμο ή αλλαγή της κατάστασης στη βάση, ή επαναφορά παλιού αντιγράφου, αφήνει το site κλειδωμένο· η σελίδα ξεκλειδώματος δεν δουλεύει με πλαστά δεδομένα. Γράφεται πριν από τη βάση όταν ξεκλειδώνει (ποτέ «κλειδωμένο» στο αρχείο και «ξεκλείδωτο» στη βάση χωρίς λόγο) και μετά από τη βάση όταν κλειδώνει. Σβήνεται με το πλήρες ξεκλείδωμα, την απενεργοποίηση και την απεγκατάσταση. Χωρίς άμεση πρόσβαση σε αρχεία το Lockdown δουλεύει όπως πριν.
+- **Αλλαγμένα κλειδιά δεν σε κλειδώνουν έξω:** υπογραφή που δεν ταιριάζει χωρίς φύλακα (π.χ. άλλαξαν τα salts) μόνο αναφέρεται. Κλείδωμα επιβάλλεται μόνο όταν ο έγκυρος φύλακας λέει «κλειδωμένο» και η βάση διαφωνεί.
+- **Αντίγραφο ρυθμίσεων και διαχειριστών:** στο κλείδωμα αποθηκεύονται (υπογεγραμμένα) οι προστατευμένες ρυθμίσεις και η λίστα των λογαριασμών που μπορούν να διαχειριστούν το site. Ρύθμιση που αλλάζει κατευθείαν στη βάση επιστρέφει στο επόμενο αίτημα· λογαριασμός που έγινε διαχειριστής έτσι δεν συνδέεται όσο είναι κλειδωμένο και αναφέρεται στον ωριαίο έλεγχο. Κάθε είδος ευρήματος: Αρχείο και email το πολύ μία φορά την ώρα.
+- **Προσωρινό ξεκλείδωμα μόνο για όποιον ξεκλείδωσε:** οι υπόλοιποι του προσωπικού μένουν παγωμένοι.
+- **Νέες προστατευμένες ρυθμίσεις:** φάκελος και διεύθυνση uploads (`upload_path`, `upload_url_path`), «Αποθάρρυνση μηχανών αναζήτησης» (`blog_public`).
+- **Ακεραιότητα:** αποτύπωμα αλλαγμένο, σβησμένο ή παλιό στη βάση → «παραποιημένο» (critical στην Υγεία ιστότοπου), ποτέ δεν αντικαθίσταται σιωπηλά όσο είναι κλειδωμένο.
+- **Υγεία ιστότοπου:** σύσταση όταν τα `AUTH_KEY` / `AUTH_SALT` δεν είναι στο `wp-config.php`, όταν λείπει ο φύλακας ενώ είναι κλειδωμένο, ή όταν ο ωριαίος έλεγχος αρχείων δεν έτρεξε για 3 ώρες.
+- **Αναβάθμιση:** τα δεδομένα των παλιότερων εκδόσεων γίνονται δεκτά μέχρι την αναβάθμιση, που τα υπογράφει, γράφει τον φύλακα και παίρνει το αντίγραφο αν είναι κλειδωμένο.
+- **Δοκιμές:** `t_lockdown.php` (σύνολο 163): φύλακας, πλαστή / σβησμένη / παλιά κατάσταση, ξεκλείδωμα με πλαστά δεδομένα, επαναφορά ρυθμίσεων, πλαστό αντίγραφο, νέος διαχειριστής από τη βάση, ποιος ξεκλείδωσε, παραποιημένο αποτύπωμα, αναβάθμιση από 3.2.
+
+## 3.2.0 — 2026-10-23
+
+Κανείς δεν παρακάμπτει το CDN, και ο αποκλεισμός στο CDN ελέγχεται με ένα κουμπί.
+
+- **Μόνο μέσω CDN** (νέα κλάση `PNCP_Origin`, καρτέλα Bots and limits → Real visitor IP): όποιος βρει τη διεύθυνση του ίδιου του server παρακάμπτει το CDN και ό,τι μπλοκάρει εκεί. Με τη ρύθμιση, κάθε αίτημα χωρίς το μυστικό («CDN shared secret») στο header `X-ScrapeLock-CDN` παίρνει 403 «Access denied.» νωρίς (`plugins_loaded`, πριν από το theme, το REST, το XML-RPC, το wp-login), και, με τον έλεγχο πριν από την cache ανοιχτό, και οι σελίδες της page cache. Το CDN προσθέτει το header: στο Bunny ένα Edge Rule «Set Request Header», στην Cloudflare ένα Transform Rule «Modify Request Header». Δεν επηρεάζονται ο ίδιος ο server (cron, preload), το cron του WordPress και το WP-CLI. Τα αρχεία που σερβίρει ο web server χωρίς WordPress (εικόνες, CSS, JS) δεν καλύπτονται. Νέα αιτία στο Αρχείο: «Not through the CDN».
+- **Δεν κλειδώνεις τον εαυτό σου έξω:** η ρύθμιση ανάβει (ή αλλάζει το μυστικό της) μόνο από αίτημα που έφερε το μυστικό, που αποδεικνύει ότι το CDN το στέλνει· χωρίς μυστικό δεν ανάβει ποτέ. Η σελίδα ρυθμίσεων λέει αν το τρέχον αίτημα έφερε το μυστικό. Αν το CDN σταματήσει κάποτε να το στέλνει: `define( 'SCRAPELOCK_CDN_ONLY', false );` στο `wp-config.php`. Ο έλεγχος πριν από την cache τρέχει πριν οριστεί η σταθερά, οπότε κρατά δικό του αντίγραφο της ρύθμισης, που ξαναγράφεται στην επόμενη σελίδα του wp-admin (το wp-admin δεν το απορρίπτει ποτέ ο έλεγχος πριν από την cache). Κλειστό από προεπιλογή.
+- **Κουμπί «Test blocking at the CDN»:** μπλοκάρει στο CDN μια διεύθυνση τεκμηρίωσης (`203.0.113.x`, δεν ανήκει σε κανέναν), ελέγχει ότι το CDN τη δείχνει, τη σβήνει και ελέγχει ότι έφυγε. Λέει σε ποιο βήμα απέτυχε και τι απάντησε το CDN. Χωρίς αλλαγή σε όρια και χωρίς να μπλοκαριστεί επισκέπτης (στη δοκιμή της 3.1 με χαμηλωμένα όρια μπλοκαρίστηκε για λίγο ένας πραγματικός επισκέπτης).
+- **Επιβεβαίωση σε πραγματικό site:** ο αποκλεισμός στο CDN της 3.1 δοκιμάστηκε σε ζωντανό site με Bunny CDN: σύνδεση, προσθήκη μέσα σε 1–2 λεπτά, αφαίρεση μετά την άρση, ο κανόνας του ιδιοκτήτη (`49.36.80.*`) ανέγγιχτος. Η Cloudflare μένει δοκιμασμένη με ψεύτικο API· το κουμπί δοκιμής είναι ο τρόπος να επιβεβαιωθεί.
+- **Δεν μπήκε:** το «Managed Challenge αντί για block» στην Cloudflare. Ο άνθρωπος που θα περνούσε τον έλεγχο της Cloudflare θα έπαιρνε ούτως ή άλλως 403 από τον αποκλεισμό του ScrapeLock στον server, οπότε δεν θα βοηθούσε.
+- **Δοκιμές:** `t_edge.php` (+24, σύνολο 69): κουμπί δοκιμής (Cloudflare, Bunny, λάθος token, σφάλμα 500, τίποτα δεν μένει στο CDN, μήνυμα), μόνο μέσω CDN (δεν ανάβει χωρίς / με λάθος μυστικό ή χωρίς μυστικό, ανάβει με το μυστικό, άλλη καρτέλα δεν το σβήνει, 403 σε σελίδα / wp-login / REST, 200 με το μυστικό και από τον ίδιο τον server, Αρχείο, έλεγχος πριν από την cache: 403, περνά με το μυστικό, ο server, wp-admin).
+
+## 3.1.0 — 2026-10-22
+
+Ο scraper σταματά στο CDN, πριν φτάσει στον server.
+
+- **Αποκλεισμός στο CDN** (νέα κλάση `PNCP_Edge`, καρτέλα Bots and limits → «Blocking at the CDN»): οι IP που το ScrapeLock αποκλείει προσωρινά αποκλείονται και από την Cloudflare (IP Access rules της ζώνης) ή το Bunny CDN (Blocked IPs του Pull Zone), με τον δικό σας λογαριασμό. Ένας scraper που επιμένει σταματά στο CDN: τα αιτήματά του δεν φτάνουν καθόλου στον server (καμία PHP, καμία βάση, κανένα bandwidth). Κάθε αποκλεισμός φεύγει από το CDN όταν λήξει ή αρθεί.
+- **Στο παρασκήνιο, όχι ενώ περιμένει ο επισκέπτης:** κάθε αποκλεισμός ή άρση προγραμματίζει μια εκτέλεση του cron του WordPress, που φέρνει το CDN στην ίδια κατάσταση με τους ενεργούς αποκλεισμούς: το πολύ 25 κλήσεις στο API ανά εκτέλεση (η επόμενη σε ένα λεπτό αν μένουν), οι 500 νεότεροι αποκλεισμοί (filter `pncp_edge_max`). Η επόμενη εκτέλεση γίνεται όταν λήγει ο επόμενος αποκλεισμός.
+- **Σφάλματα:** 429 → ξανά σε 5 λεπτά, σφάλμα δικτύου ή 5xx → ξανά σε 5 λεπτά, λάθος token ή ζώνη → ξανά σε μία ώρα (όχι κάθε λεπτό). Διεύθυνση που το CDN δεν δέχεται δεν μπλοκάρει τις άλλες και δεν ξαναδοκιμάζεται. Κανόνας που σβήστηκε με το χέρι στο CDN (404) δεν μένει «κολλημένος». Το τελευταίο σφάλμα φαίνεται στη ρύθμιση και στην Υγεία ιστότοπου.
+- **Ποτέ στο CDN:** οι IP των διαχειριστών που μπήκαν στο wp-admin τις τελευταίες 30 ημέρες (ο αποκλεισμός στο CDN καλύπτει και το wp-admin και τη σελίδα σύνδεσης, ενώ ο αποκλεισμός του ScrapeLock όχι), οι μηχανές αναζήτησης, οι υπηρεσίες αναζήτησης AI και οι διευθύνσεις των ίδιων των CDN. Κανόνες που είχατε ήδη στο CDN δεν αλλάζουν ποτέ και δεν σβήνονται. Σε παύση όσο είναι ανοιχτό το «Trust every request»: τότε όποιος γράφει την IP στο header θα έβαζε οποιαδήποτε διεύθυνση στο CDN.
+- **IPv6:** η Cloudflare δέχεται ολόκληρο το /64 (ίδιο με τον αποκλεισμό του ScrapeLock). Το Bunny δέχεται μόνο μεμονωμένες διευθύνσεις, οπότε εκεί ένα αποκλεισμένο /64 μένει μόνο στο ScrapeLock.
+- **Token:** δοκιμάζεται με ένα αίτημα μόνο ανάγνωσης πριν αποθηκευτεί (λάθος token ή ζώνη = τίποτα δεν αποθηκεύεται, με το μήνυμα του CDN), δεν εμφανίζεται ποτέ ξανά, δεν φορτώνεται σε κάθε σελίδα, μπορεί να μπει στο `wp-config.php` (`SCRAPELOCK_EDGE_TOKEN`) και δεν αλλάζει όσο το site είναι κλειδωμένο (προστατευμένη επιλογή του Κλειδώματος). Για την Cloudflare αρκεί token με μόνο το δικαίωμα Zone → Firewall Services → Edit για τη ζώνη. Νέο token για την ίδια ζώνη κρατά τους ίδιους κανόνες· άλλη ζώνη ή άλλο CDN: οι παλιοί κανόνες σβήνονται στο παρασκήνιο με τα παλιά στοιχεία.
+- **Απενεργοποίηση:** οι κανόνες που έφτιαξε το ScrapeLock σβήνονται αμέσως (έως 20 δευτερόλεπτα· στην Cloudflare όσοι μείνουν έχουν τη σημείωση «ScrapeLock» και σβήνονται από τον πίνακα ελέγχου). Η απεγκατάσταση καθαρίζει τις ρυθμίσεις.
+- **readme:** η ενότητα «External services» αναφέρει τα API της Cloudflare και του Bunny, τι στέλνεται και πότε.
+- **Τίμιο όριο:** δεν δοκιμάστηκε με πραγματικό λογαριασμό Cloudflare / Bunny (το δίκτυο των δοκιμών δεν φτάνει τα API τους). Οι κλήσεις ακολουθούν την επίσημη προδιαγραφή OpenAPI της Cloudflare και την τεκμηρίωση του Bunny, και δοκιμάστηκαν με ψεύτικο API που απαντά όπως αυτά.
+- **Δοκιμές:** νέο `t_edge.php` (45 έλεγχοι, ψεύτικο API στο `mu-test-harness.php`): ρύθμιση και έλεγχος σύνδεσης, προσθήκη (IPv4, IPv6 /64), σημείωση, ποτέ διαχειριστής / Cloudflare, καμία κλήση χωρίς αλλαγές, κανόνας του ιδιοκτήτη, άρση, λήξη, 404, 429, 500, διεύθυνση που δεν γίνεται δεκτή, λάθος token, 25 κλήσεις ανά εκτέλεση, `pncp_edge_max`, «Trust every request», προστασία κλειστή, αλλαγή σε Bunny με σβήσιμο των κανόνων της Cloudflare, Bunny χωρίς IPv6 /64, απενεργοποίηση, φόρμα (λάθος ζώνη / token, μήνυμα, κενό token κρατά το παλιό, Off, editor 403). `t_lockdown.php` (+1): η ρύθμιση δεν αλλάζει από κώδικα όσο το site είναι κλειδωμένο.
+
+## 3.0.0 — 2026-10-22
+
+Το Κλείδωμα βλέπει πλέον και τα αρχεία: ό,τι γράφτηκε στον server πίσω από την πλάτη του WordPress.
+
+- **Έλεγχος ακεραιότητας αρχείων** (νέα κλάση `PNCP_Integrity`): όταν κλειδώνετε, κρατιέται αποτύπωμα (SHA-256) κάθε αρχείου PHP, `.htaccess` και `.user.ini` του WordPress, των plugins, των themes, του φακέλου uploads και του `wp-config.php`, και ελέγχεται κάθε ώρα όσο το site μένει κλειδωμένο. Όσο είναι κλειδωμένο κανείς δεν εγκαθιστά ή ενημερώνει τίποτα, άρα ένα νέο ή αλλαγμένο αρχείο σημαίνει ότι κάτι το έγραψε μόνο του: συνήθως backdoor μέσα από ευάλωτο plugin. Τότε: ένα email για κάθε νέο εύρημα (όχι κάθε ώρα για τα ίδια), εγγραφή στο αρχείο του Κλειδώματος, ειδοποίηση στο wp-admin και «κρίσιμο» στην Υγεία ιστότοπου. Μετά από προσωρινό ξεκλείδωμα (όπου επιτρέπονται ενημερώσεις) παίρνεται νέο αποτύπωμα αντί για συναγερμό. Οι caches, οι φάκελοι του updater και τα logs άλλων plugins ασφαλείας μένουν εκτός (filter `pncp_integrity_exclude`). Σε αυτό το site: 1.550 αρχεία σε περίπου 1 δευτερόλεπτο.
+- **Επίσημα checksums:** μία φορά την ημέρα το WordPress και τα plugins του WordPress.org συγκρίνονται με τα επίσημα checksums (τις λίστες του `wp core / plugin verify-checksums`), οπότε φαίνεται και αλλαγή που έγινε **πριν** από το κλείδωμα. Τα premium και custom plugins εμφανίζονται ως «δεν συγκρίνονται». Όταν το WordPress.org δεν απαντά, δεν γράφεται PHP warning κάθε μέρα.
+- **Καραντίνα (επιλογή, κλειστή από προεπιλογή):** απενεργοποιεί το plugin με αλλαγμένα αρχεία (ακόμη και κλειδωμένο) και μετονομάζει τα νέα αρχεία PHP στα uploads σε `….pncp-quarantine`, ώστε να μην εκτελούνται. Τίποτα δεν σβήνεται· το ίδιο το ScrapeLock δεν απενεργοποιείται ποτέ. Αποθηκεύεται με τον κωδικό της εφαρμογής και μόνο ξεκλείδωτο, όπως οι ρόλοι.
+- **Αυτόματο Emergency Mode** (νέα κλάση `PNCP_Surge`, καρτέλα Bots and limits → Limits): τα όρια ανά IP δεν βλέπουν έναν scraper που μοιράζει τα αιτήματά του σε εκατοντάδες IP· όλο το site τον βλέπει. Το ScrapeLock μετρά τις σελίδες όλου του site ανά λεπτό, μαθαίνει τον συνηθισμένο ρυθμό (κινητός μέσος όρος, περίπου 2 ωρών μνήμη) και, όταν ξεπεραστεί **5 φορές** για **3 λεπτά στη σειρά** και ποτέ κάτω από ένα ελάχιστο (300 σελίδες το λεπτό από προεπιλογή), ξεκινά το Emergency Mode για 1 ώρα, στέλνει email και το δείχνει στην κάρτα του Emergency Mode. Δεν μετρώνται οι επαληθευμένες μηχανές αναζήτησης και το προσωπικό που εξαιρείται· η επίθεση δεν ανεβάζει τον μέσο όρο (κάθε λεπτό τον μετακινεί λίγο, και όχι όσο ισχύει το Emergency Mode). Η μέτρηση γίνεται μόνο με την επιλογή ανοιχτή: ένα επιπλέον γράψιμο μετρητή ανά σελίδα. Οι σελίδες που σερβίρει η page cache χωρίς να φτάσουν στο WordPress δεν μετρώνται. Filters `pncp_auto_emergency_factor`, `pncp_auto_emergency_minutes`, `pncp_auto_emergency_hours`. Ανοιχτό στις νέες εγκαταστάσεις, κλειστό στα υπάρχοντα sites.
+- **Αυστηρότερο όριο για data centers** (καρτέλα Bots and limits → Limits): οι άνθρωποι σπάνια σερφάρουν από server, οι scrapers πολύ συχνά τρέχουν σε έναν. Οι επισκέπτες από τις δημοσιευμένες διευθύνσεις των AWS (μόνο οι servers, EC2· όχι το CloudFront, από όπου περνούν πραγματικοί επισκέπτες), Google Cloud, Oracle Cloud, DigitalOcean και Akamai / Linode παίρνουν χαμηλότερο όριο σελίδων: 15 το λεπτό στις νέες εγκαταστάσεις, 5 στο Emergency Mode, κλειστό στα υπάρχοντα sites. Οι λίστες κατεβαίνουν μία φορά την ημέρα με τον μηχανισμό των λιστών Google / Bing, μόνο με την επιλογή ανοιχτή. Επειδή είναι χιλιάδες περιοχές (μόνο η AWS: 1.887 IPv4 και 2.552 IPv6), αποθηκεύονται σε μικρές ομάδες ανά πρώτο byte (IPv4) ή πρώτα δύο bytes (IPv6): κάθε έλεγχος διαβάζει μία ομάδα, περίπου 0,08 ms. Τα «πάντα επιτρεπτά» (monitoring, πλατφόρμες τιμών) και οι επαληθευμένες μηχανές αναζήτησης δεν επηρεάζονται. Κάποια VPN τρέχουν σε αυτούς τους παρόχους: οι χρήστες τους παίρνουν το ίδιο όριο, αρκετό για ανάγνωση. Το Azure δεν περιλαμβάνεται: δημοσιεύει τη λίστα του σε διεύθυνση που αλλάζει κάθε εβδομάδα. Η μορφή της AWS δοκιμάστηκε με την πραγματική λίστα· των Google Cloud, Oracle, DigitalOcean και Linode με δείγματα της δομής τους (το δίκτυο των δοκιμών δεν τις έφτανε).
+- **Χωρίς PHP στον φάκελο uploads** (καρτέλα Feeds and API): για Apache γράφεται αμέσως στο `.htaccess` του φακέλου uploads, ανάμεσα στους δείκτες του ScrapeLock (ό,τι έγραψαν άλλα plugins μένει), και μπαίνει στους κανόνες Nginx / Apache. Βγαίνει με την απενεργοποίηση και την απεγκατάσταση. Ανοιχτό στις νέες εγκαταστάσεις, κλειστό στα υπάρχοντα sites.
+- **Τίμιο όριο:** κώδικας που ήδη τρέχει στον server μπορεί να σταματήσει και το ίδιο το ScrapeLock. Ο έλεγχος το βρίσκει μέσα σε μία ώρα και σας ειδοποιεί· αυτό που σταματά τα περισσότερα backdoors από την αρχή είναι ο κανόνας «Χωρίς PHP στα uploads».
+- **Δοκιμές data centers:** `t_http.php` (+16 έλεγχοι): οι πέντε μορφές λιστών (AWS μόνο EC2, Oracle, Google Cloud, CSV με σχόλια), αναγνώριση IPv4 / IPv6 / IPv4 μέσα σε IPv6 και του παρόχου, γειτονικές και άκυρες διευθύνσεις όχι, οι λίστες κατεβαίνουν μόνο με την επιλογή ανοιχτή, όριο 2 → 200, 200, 429 από data center (IPv4 και IPv6), άλλη IP ανέπαφη, monitoring ανέπαφο, Emergency Mode, νέες εγκαταστάσεις / υπάρχοντα sites.
+- **Δοκιμές αυτόματου Emergency Mode:** `t_http.php` (+11 έλεγχοι): μαθαίνει τον ρυθμό, μικρή άνοδος όχι / επίθεση 3 λεπτά ναι, η επίθεση δεν ανεβάζει τον μέσο όρο, 5 × σε μεγάλο site, ήσυχα λεπτά, κλειστό δεν ξεκινά, έναρξη για 1 ώρα με email, όχι διπλή μέτρηση του ίδιου λεπτού, καμία μέτρηση με την επιλογή κλειστή, 3 IP μετρώνται για όλο το site αλλά όχι το προσωπικό.
+- **Δοκιμές:** `t_lockdown.php` (+19 έλεγχοι): αποτύπωμα στο κλείδωμα, caches εκτός, νέο PHP στα uploads / `.user.ini` / αλλαγμένο αρχείο plugin, ένα email, καραντίνα (plugin απενεργοποιημένο και κλειδωμένο, backdoor μετονομασμένο, ScrapeLock ενεργό), επίσημα checksums (πυρήνας και plugin, με λίστες της δοκιμής), Site Health, καρτέλα και ειδοποίηση, ξεκλείδωμα → νέο αποτύπωμα, `.htaccess` των uploads. Η σειρά δοκιμών του Κλειδώματος σταματά αμέσως αν ο server των δοκιμών δεν απαντά: πριν, οι δοκιμές «από τον κώδικα» άλλαζαν στ' αλήθεια το WordPress των δοκιμών (ενεργά plugins, ρόλος του διαχειριστή, ρυθμίσεις).
+
+## 2.9.0 — 2026-10-22
+
+Λιγότερα στοιχεία για όποιον σαρώνει το site, λιγότερο κείμενο σε κάθε αίτημα, και κλείσιμο της εναλλαγής διευθύνσεων IPv6.
+
+- **Απόκρυψη εκδόσεων** (καρτέλα Feeds and API, «Εκδόσεις»): τα εργαλεία σάρωσης διαβάζουν την έκδοση του WordPress και κάθε plugin και την ψάχνουν σε λίστες γνωστών ευπαθειών. Βγαίνουν το `generator` (κεφαλίδα σελίδας, feeds, και όσα plugins το χρησιμοποιούν, π.χ. WooCommerce) και το header `X-Powered-By` με την έκδοση της PHP· το `?ver=7.1.3` στα CSS / JS του site γίνεται κωδικός δεμένος με τα κλειδιά του site, που αλλάζει μόνο όταν αλλάζει η έκδοση (οι caches δουλεύουν). Τα `readme.html`, `license.txt` και τα readme / changelog των plugins και themes είναι στατικά αρχεία· τα αρνούνται πλέον οι κανόνες Nginx και Apache (404). Ανοιχτό στις νέες εγκαταστάσεις.
+- **Λίστες άρθρων με απόσπασμα:** πολλά themes τυπώνουν ολόκληρο κάθε άρθρο στην αρχική, στις κατηγορίες, στα αρχεία και στην αναζήτηση· στη δοκιμή, ένα αίτημα στην αρχική έδινε 8 πλήρη άρθρα. Με τη νέα επιλογή οι επισκέπτες βλέπουν απόσπασμα και σύνδεσμο, οπότε κάθε άρθρο ανοίγει και μετρά χωριστά. Οι σελίδες των άρθρων, τα feeds και το προσωπικό που εξαιρείται δεν επηρεάζονται· άρθρο με κωδικό δεν δίνει ποτέ το κείμενό του. Κλειστό από προεπιλογή, γιατί αλλάζει την εμφάνιση.
+- **IPv6 ανά /56:** με νέο /64 σε κάθε αίτημα ένας scraper περνούσε το όριο (στη δοκιμή 150 από 150). Τώρα, με την επιλογή, μετρά και το /56, μέχρι 4 × το όριο σελίδων, με 429 χωρίς αποκλεισμό (οι αποκλεισμοί μένουν ανά /64). Κλειστό από προεπιλογή, γιατί κάποια δίκτυα κινητής δίνουν σε γειτονικά κινητά το ίδιο /56. Ισχύει και στον έλεγχο πριν από το cache. Νέα αιτία στο Αρχείο: «Σελίδες ανά λεπτό για το δίκτυο IPv6 (/56)».
+- **Web archives:** νέα επιλογή που μπλοκάρει τα `ia_archiver`, `archive.org_bot`, `heritrix` του Wayback Machine και τους το ζητά στο robots.txt: ό,τι αποθηκεύουν μπορεί να αντιγραφεί από το αρχείο χωρίς να φτάσει κανείς στο site. Κλειστό από προεπιλογή.
+- **Emergency Mode:** ανοίγει πλέον και τα αποσπάσματα στις λίστες και το όριο IPv6 /56.
+- **Υγεία ιστότοπου:** οι νέες ρυθμίσεις στην ενότητα ScrapeLock της καρτέλας «Πληροφορίες».
+- **Υπάρχοντα sites:** οι νέες ρυθμίσεις μένουν κλειστές μέχρι να τις ανοίξετε.
+- Η λίστα «πάντα επιτρεπτά» δεν άλλαξε: ο κανόνας που σχεδιάστηκε (να μην ακυρώνει η εγγραφή μόνο με User-Agent τη λίστα bots) θα έκοβε πραγματικές προεπισκοπήσεις, π.χ. του LinkedIn (`LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient …)`), ενώ ένας scraper κερδίζει το ίδιο με ένα User-Agent του Chrome.
+- **Δοκιμές:** `t_http.php` (+20 έλεγχοι): εκδόσεις κρυφές και ορατές, σταθερό `?ver=`, ξένα URL ανέπαφα, feed, κανόνες Nginx / Apache, αποσπάσματα (αρχική, αναζήτηση, άρθρο με κωδικό, σελίδα άρθρου, προσωπικό), IPv6 /56 (8 περνούν, μετά 429, χωρίς αποκλεισμό, άλλο /56 ανέπαφο), web archives, Emergency Mode, νέες εγκαταστάσεις και αναβάθμιση από 2.8.3.
+
+## 2.8.3 — 2026-10-22
+
+Διόρθωση ασφαλείας στα όρια ανά λεπτό, και πολύ περισσότερα bots στον αποκλεισμό. Τα ευρήματα προέκυψαν από δοκιμή «σαν scraper» σε πραγματικό WordPress 7.1.
+
+- **Το κενό:** το όριο σελίδων ανά λεπτό παρακαμπτόταν από **μία IP, χωρίς παράβαση και χωρίς αποκλεισμό**:
+  - με τα headers του prefetch του browser (`Sec-Fetch-Dest` μαζί με `Sec-Purpose` ή `Purpose: prefetch`), που μπορεί να τα στείλει οποιοδήποτε script (curl, Python)· η διόρθωση της 2.x βασιζόταν στο ότι ένα script δεν στέλνει `Sec-Fetch-Dest`, που ισχύει μόνο για JavaScript μέσα σε browser·
+  - με POST και ένα cookie με όνομα `wordpress_logged_in_…` ή `woocommerce_…` (ελεγχόταν μόνο το όνομα).
+  Στη δοκιμή: 150 από 150 σελίδες πέρασαν και με τους δύο τρόπους, αντί για 60.
+- **Τώρα:** μετράει κάθε αίτημα σελίδας, στον κανονικό έλεγχο και στον έλεγχο πριν από το cache. Το **prefetch έχει δικό του όριο**, τριπλάσιο του ορίου σελίδων, και ποτέ δεν μετρά ως παράβαση: τα plugins ταχύτητας (Flying Pages, instant.page, speculative loading του WordPress) κάνουν prefetch πολλούς συνδέσμους σε κάθε σελίδα, και με το όριο σελίδων ένας πραγματικός επισκέπτης θα μπορούσε να σταματήσει ή και να αποκλειστεί. Ένα script με τα ίδια headers παίρνει έτσι το πολύ 180 σελίδες το λεπτό (με όριο 60), όχι απεριόριστες. Νέα αιτία στο Αρχείο: «Prefetch ανά λεπτό». Δεν μετράνε, όπως πριν, το AJAX του WooCommerce, το καλάθι και το checkout. Το προσωπικό που είναι συνδεδεμένο εξαιρείται με βάση τον ρόλο του, που ελέγχεται κανονικά.
+- **Πάνω από 100 νέοι AI crawlers και agents** (DeepSeekBot, GrokBot / xAI-Grok, QwenBot, DoubaoBot, ERNIEBot, Hunyuan, MistralAI-Training, meta-webindexer, NotebookLM, Gemini-Deep-Research, Amzn-SearchBot κ.ά., από το [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt)): ενσωματωμένοι στο plugin (`PNCP_Bots::known_ai_agents()`, filter `pncp_known_ai_agents`), μπλοκάρονται με το όνομά τους και μπαίνουν στο robots.txt και στους κανόνες Nginx / Apache. Η λίστα ενημερώνεται με κάθε έκδοση και δεν πιάνει χώρο από τις 200 γραμμές της δικής σας λίστας. Έξω έμειναν τα πολύ γενικά ονόματα (`Code`, `Spider`, `Operator`, `Trae`…, που θα έπιαναν και πραγματικούς επισκέπτες ή εργαλεία όπως το `Traefik`) και όσα δουλεύουν για τους επισκέπτες σας (PetalBot, AmazonBuyForMe, atlassian-bot, EchoboxBot): αυτά δηλώνονται μόνο στο robots.txt. Μια εγγραφή στα «πάντα επιτρεπτά» εξακολουθεί να περνά.
+- **Εργαλεία HTTP που περνούσαν** (το User-Agent μετρήθηκε με το ίδιο το εργαλείο): Node.js fetch (`node`), Ruby, Java 11+ (`Java-http-client`), Apache HttpClient, Guzzle, Bun, Deno, Dart, Perl HTTP::Tiny, PowerShell, Faraday, Mechanize. Μπαίνουν στη λίστα bots και στα υπάρχοντα sites με την ενημέρωση· οι δικές σας γραμμές μένουν, μια λίστα που αδειάσατε επίτηδες μένει άδεια.
+- **Νέο στη λίστα bots: «=»** = ολόκληρο το User-Agent. Το `=node` μπλοκάρει το fetch της Node.js, όχι το `Node-RED`. Ισχύει και στους κανόνες Nginx / Apache (`^node$`) και Cloudflare (`eq`).
+- **Διόρθωση:** οι ελληνικές διευθύνσεις γράφονταν στο αρχείο χωρίς τα ελληνικά (`/άρθρο-8/` → `/-8/`), επειδή το `sanitize_text_field()` σβήνει τα `%ce%ac…`. Έτσι η αναφορά «ποιες σελίδες ήθελαν οι scrapers» δεν τις έβρισκε. Τώρα γράφονται όπως τις στέλνει ο browser (όπως ήδη ο έλεγχος πριν από το cache) και εμφανίζονται με ελληνικούς χαρακτήρες στο Αρχείο και στο `wp scrapelock log`.
+- **Δοκιμές:** `t_http.php` (+44 έλεγχοι): το prefetch έχει δικό του όριο χωρίς αποκλεισμό, τα ψεύτικα cookies μετράνε, οι νέοι crawlers και τα εργαλεία μπλοκάρονται, browsers / in-app browsers / link previews / Skroutz / UptimeRobot / άλλο WordPress / `Node-RED` / `Traefik` περνούν, robots.txt, κανόνες Nginx, ελληνική διεύθυνση στο αρχείο, αναβάθμιση από 2.8.2. Με τον κώδικα της 2.8.2 αποτυγχάνουν 22. `t_precheck.php`: το prefetch μετράει στο δικό του όριο. Η ίδια επίθεση από μία IP, με όριο 60: κανονικά 60 σελίδες, με headers prefetch 180, με POST και ψεύτικο cookie 60· πριν, με τους δύο τελευταίους τρόπους περνούσαν όλα τα αιτήματα. Η δοκιμή των pingbacks λαμβάνει υπόψη ότι το WordPress 7.1 βγάζει μόνο του το `pingback.ping` εκτός production.
+
+## 2.8.2 — 2026-10-21
+
+Το plugin περιέχει πλέον και το πλήρες κείμενο της άδειάς του.
+
+- **Νέο αρχείο `LICENSE`** με το πλήρες κείμενο της GNU GPL έκδοση 2, μέσα στο zip του plugin. Η άδεια (GPL-2.0-or-later) ήταν ήδη δηλωμένη στο `scrapelock.php` και στο `readme.txt`· τώρα τη βλέπει και το GitHub («GPL-2.0 license»).
+- Δύο σχόλια στον κώδικα έχουν ουδέτερο παράδειγμα (`example_com`). Καμία αλλαγή στη λειτουργία.
+
+## 2.8.1 — 2026-10-21
+
+Καθαρή σελίδα «Το site είναι κλειδωμένο» αντί για το ξερό μήνυμα του WordPress.
+
+- **Πριν:** όσο ήταν κλειδωμένο, μια σελίδα του wp-admin που δεν επιτρέπεται (π.χ. το δικό σας Προφίλ) έδειχνε μόνο το «Sorry, you are not allowed to edit this user» του WordPress, χωρίς να λέει γιατί.
+- **Τώρα:** σελίδα με εικονίδιο κλειδαριάς, τίτλο «Το site είναι κλειδωμένο», τι είναι παγωμένο και γιατί (ασφάλεια ακόμη κι αν κλαπεί κωδικός), κουμπί **«Ξεκλείδωμα του site»** για τους διαχειριστές, «ζητήστε από έναν διαχειριστή» για τον υπόλοιπο ρόλο προσωπικού, και «Πίσω στον Πίνακα ελέγχου». Το μήνυμα του WordPress μένει μόνο στην «Τεχνική λεπτομέρεια» (κλειστή). Δουλεύει και σε κινητό. Απάντηση 403.
+- Χωρίς αλλαγή στην ασφάλεια: η σελίδα ξεκλειδώματος ήταν ήδη στη μπάρα και στο μενού, και ζητά πάντα τον κωδικό της εφαρμογής. Οι editors / shop managers δεν βλέπουν σύνδεσμο ξεκλειδώματος.
+- Οι απαντήσεις AJAX, REST και XML-RPC μένουν ίδιες· οι σελίδες του ίδιου του Κλειδώματος και η συμπεριφορά όσο είναι ξεκλείδωτο δεν αλλάζουν.
+- **Δοκιμές:** `t_lockdown.php` (121 έλεγχοι): Προφίλ και plugin-install.php κλειδωμένα με τη νέα σελίδα και το κουμπί για τον διαχειριστή, το μήνυμα του WordPress μόνο στην τεχνική λεπτομέρεια, ο editor χωρίς σύνδεσμο, AJAX ανέπαφο, ξεκλείδωτο όπως πριν. Με τον κώδικα της 2.8.0 αποτυγχάνουν.
+
+## 2.8.0 — 2026-10-21
+
+Υγεία ιστότοπου, WP-CLI, Abilities API για AI agents, και λιγότερα όσα δείχνει το site σε όλους.
+
+- **Υγεία ιστότοπου (Εργαλεία → Υγεία ιστότοπου):** έλεγχοι για προστασία κλειστή, όλους τους επισκέπτες με διεύθυνση Cloudflare ή Bunny CDN (τότε τα όρια χτυπούν το ίδιο το CDN), πρώιμο έλεγχο ή έλεγχο πριν από το cache ανοιχτό αλλά χωρίς να τρέχει, Lockdown ανοιχτό από τον server (`SCRAPELOCK_UNLOCK`, κρίσιμο) και ενημερώσεις που περιμένουν όσο είναι κλειδωμένο. Στην καρτέλα «Πληροφορίες» ενότητα ScrapeLock με ό,τι είναι ανοιχτό και κλειστό, χωρίς μυστικά.
+- **WP-CLI:** `wp scrapelock status`, `block <ip> [--minutes=]`, `unblock <ip>… | --all`, `blocked`, `emergency on|off|status [--hours=]`, `log [--top] [--hours=] [--limit=]`. Καμία εντολή για ξεκλείδωμα του Lockdown.
+- **Abilities API (WordPress 6.9+):** `scrapelock/get-summary`, `scrapelock/block-ip`, `scrapelock/unblock-ip`, `scrapelock/emergency-mode`, μόνο για διαχειριστές (`manage_options`), και μέσα από το `/wp-json/wp-abilities/v1`. Όσο είναι κλειδωμένο, οι αλλαγές απορρίπτονται και διαβάζεται μόνο η σύνοψη· καμία ability δεν ξεκλειδώνει.
+- **Νέο στην καρτέλα Feeds and API:** «Απόκρυψη του χάρτη REST από επισκέπτες» (το `/wp-json/` χωρίς namespaces και routes, χωρίς links στο `<head>` και στο header `Link`· κάθε route δουλεύει κανονικά, οι συνδεδεμένοι βλέπουν τα πάντα), «Χωρίς pingbacks» (βγαίνουν τα `pingback.ping` / `pingback.extensions.getPingbacks` και το `X-Pingback`· το υπόλοιπο XML-RPC, π.χ. Jetpack, δουλεύει), και λίστα με τα REST routes που μπορεί να καλέσει ο καθένας χωρίς σύνδεση. Και τα δύο κλειστά από προεπιλογή.
+- **«Απόκρυψη ονομάτων χρηστών» και στο oEmbed:** όνομα και διεύθυνση του site αντί για το username του συντάκτη.
+- **Διόρθωση:** το «Unblock» στη λίστα «IPs blocked now» δεν έκανε τίποτα για IPv6 (μπλοκάρονται ανά δίκτυο /64 και η λίστα δείχνει το /64).
+- **WordPress 7.2:** όλες οι δοκιμές περνούν στο 7.2-beta1 χωρίς κανένα warning· «Tested up to: 7.2».
+- **Δοκιμές:** `t_cli.php` (17 έλεγχοι, μέσα από το πραγματικό `wp`), Abilities μέσα από REST (διαχειριστής, editor, χωρίς σύνδεση, κλειδωμένο), Site Health (Cloudflare / Bunny, early, pre-cache, Lockdown), ξεμπλοκάρισμα IPv6 /64 (αποτυγχάνει με τον κώδικα της 2.7.2), oEmbed, pingbacks, χάρτης REST.
+
+## 2.7.2 — 2026-10-21
+
+Διόρθωση στο Κλείδωμα: τα μέλη που ανεβάζουν μόνα τους περιεχόμενο δεν παγώνουν πια.
+
+- **Το λάθος:** το Κλείδωμα θεωρούσε «προσωπικό» κάθε ρόλο με έστω ένα δικαίωμα πέρα από την ανάγνωση. Σε site όπου οι subscribers έχουν επιπλέον δικαιώματα από άλλο plugin (π.χ. οι φαρμακοποιοί που ανεβάζουν αγγελίες ή δημοσιεύσεις στο Hub), όσο ήταν κλειδωμένο έχαναν τα δικαιώματά τους και το «ξέχασα τον κωδικό».
+- **Τώρα:** παγώνουν μόνο οι ρόλοι που διαχειρίζονται το site. Πάντα όσοι μπορούν να αλλάξουν plugins, themes, χρήστες ή ρυθμίσεις (διαχειριστής κ.ά.)· από προεπιλογή editor, author, contributor, shop manager και όποιος ρόλος διαχειρίζεται περιεχόμενο άλλων ή παραγγελίες. Όλοι οι άλλοι ρόλοι (subscriber, customer, μέλη) δουλεύουν κανονικά, με τα δικά τους email και κωδικούς.
+- **Νέο στην καρτέλα Lockdown, «Ποιοι παγώνουν όσο είναι κλειδωμένο»:** κάθε ρόλος με τον αριθμό των χρηστών του, τσεκαρισμένος αν παγώνει. Αποθήκευση με τον κωδικό της εφαρμογής, μόνο όταν δεν είναι κλειδωμένο· οι ρόλοι που μπορούν να πάρουν τον έλεγχο του site δεν ξετσεκάρονται.
+- **Αλλαγές ρόλων όσο είναι κλειδωμένο:** απορρίπτονται μόνο όταν ο παλιός ή ο νέος ρόλος παγώνει. Ένα plugin αγγελιών μπορεί να αλλάζει ένα μέλος ανάμεσα σε ρόλους μελών· κανείς δεν γίνεται editor ή διαχειριστής.
+- **Η αναφορά** δείχνει ανά ρόλο ποιοι λογαριασμοί παγώνουν και ποιοι δουλεύουν κανονικά.
+- **Δοκιμές:** `t_lockdown.php` (106 έλεγχοι): ρόλος μέλους με δικαίωμα δημοσίευσης δημοσιεύει (REST 201), αλλάζει email, κάνει «ξέχασα τον κωδικό» με το site κλειδωμένο· συνδρομητής → μέλος επιτρέπεται, μέλος → editor όχι· επιλογή ρόλων με κωδικό, όχι όσο είναι κλειδωμένο, ο διαχειριστής πάντα. Με τον κώδικα της 2.7.1 το ίδιο μέλος μετρούσε ως προσωπικό.
+
+## 2.7.1 — 2026-10-21
+
+Διορθώσεις μετά το Plugin Check (3 warnings, 0 errors στην 2.7.0). Καμία αλλαγή στη λειτουργία.
+
+- **«Plugin Updater detected» (`auto_update_plugin`):** οι ρυθμίσεις `auto_update_plugins` / `auto_update_themes` βγήκαν από τη λίστα που κρατά ίδια το Κλείδωμα. Όσο είναι κλειδωμένο, οι αυτόματες ενημερώσεις είναι ήδη κλειστές με τα φίλτρα του WordPress (`automatic_updater_disabled`, `file_mod_allowed`).
+- **«Unescaped parameter $where used in $wpdb->query()»** (γραμμές 626 και 641): τα queries του κλειδώματος ελέγχου γίνονται πλέον το καθένα με ένα πλήρες `prepare` (χωριστό για wp_options και για wp_sitemeta), χωρίς ένωση κειμένου μετά.
+- Έλεγχος: Plugin Check 2.1.0 τοπικά (όλες οι κατηγορίες, και experimental) και ο κανόνας PluginCheck.Security.DirectDB σε όλα τα αρχεία: στην 2.7.0 βγάζουν ακριβώς τα 3 warnings, στην 2.7.1 κανένα.
+
+## 2.7.0 — 2026-10-20
+
+Νέα λειτουργία **Κλείδωμα (Lockdown)**: παγώνει κάθε αλλαγή στο site μέχρι να το ξεκλειδώσει ένας διαχειριστής με κωδικό από εφαρμογή authenticator (Google Authenticator, Microsoft Authenticator, Authy κ.ά.). Οι επισκέπτες και οι πελάτες δεν επηρεάζονται.
+
+- **Κομμάτι του ScrapeLock:** καρτέλα «Lockdown» στις Ρυθμίσεις → ScrapeLock και γραμμή «Lockdown» κάτω από το κουμπί «Protection» της μπάρας (με εικονίδιο ανοιχτής ή κλειστής κλειδαριάς). Όσο είναι κλειδωμένο, οι διαχειριστές φτάνουν στη σελίδα του ScrapeLock, που δείχνει μόνο την καρτέλα Lockdown (οι άλλες γκρίζες, χωρίς τη γραμμή κατάστασης), και το κουμπί γράφει «Protection: ON · Locked» με μόνο το Lockdown από κάτω. Μόνο για διαχειριστές.
+- **Προειδοποίηση:** «υπάρχει μόνο ένας τρόπος ξεκλειδώματος» (η εφαρμογή, οι κωδικοί ανάκτησης ή ο server· όχι email, SMS ή υποστήριξη), και πριν από το πρώτο κλείδωμα κουτάκι «τύπωσα ή φύλαξα τους κωδικούς ανάκτησης» (ελέγχεται πριν χρησιμοποιηθεί ο κωδικός· ξαναζητείται με νέα εφαρμογή).
+- **Πλήρης αναφορά** στην καρτέλα: τι παγώνει ανά ενότητα (plugins, themes, WordPress, χρήστες, ρυθμίσεις, περιεχόμενο, πού ισχύει), τι συνεχίζει να δουλεύει, και στο δικό σας site: λογαριασμοί προσωπικού ανά ρόλο, πελάτες που δεν επηρεάζονται, ενεργά plugins και theme, τι δεν καλύπτεται (server).
+- Σύνδεση εφαρμογής Σύνδεση εφαρμογής με QR code (σχεδιάζεται στον browser με το qrcode-generator 1.4.4, MIT· το κλειδί δεν στέλνεται πουθενά) ή με πληκτρολόγηση του κλειδιού, επιβεβαίωση με κωδικό, 10 κωδικοί ανάκτησης μίας χρήσης.
+- **Τι παγώνει:** εγκατάσταση, ενημέρωση, διαγραφή, ενεργοποίηση και απενεργοποίηση plugins και themes· ενημερώσεις WordPress (και αυτόματες)· επεξεργαστής αρχείων· νέοι χρήστες, αλλαγές ρόλων, νέοι διαχειριστές· email και κωδικός του προσωπικού, «ξέχασα τον κωδικό» και νέα application passwords για το προσωπικό· όλες οι ρυθμίσεις· άρθρα, σελίδες, προϊόντα, πολυμέσα, μενού.
+- **Πώς:** όσο είναι κλειδωμένο, κάθε χρήστης με δικαιώματα πέρα από την ανάγνωση (author, editor, shop manager, administrator) κρατά μόνο το «read»: συνδέεται και βλέπει τον Πίνακα ελέγχου, αλλά δεν αλλάζει τίποτα (wp-admin, REST API, XML-RPC). Πελάτες και συνδρομητές δεν επηρεάζονται.
+- **Και απέναντι σε κώδικα:** αν παραβιαστεί ένα άλλο plugin, δεν μπορεί να αλλάξει τα ενεργά plugins, το theme, τη διεύθυνση του site, το email διαχείρισης, τις εγγραφές, τον προεπιλεγμένο ρόλο, τους ρόλους, τις ρυθμίσεις του ScrapeLock ή το ίδιο το κλείδωμα, ούτε να φτιάξει διαχειριστή ή να αλλάξει email / κωδικό μέλους του προσωπικού (και δεν στέλνεται παραπλανητικό email «άλλαξε»).
+- **Ξεκλείδωμα:** για 15 λεπτά έως 2 ώρες (ξανακλειδώνει μόνο του) ή «μέχρι να το κλειδώσω ξανά». «Ξανά κλείδωμα τώρα» χωρίς κωδικό. Μήνυμα όταν περιμένουν ενημερώσεις.
+- **Ασφάλεια των κωδικών:** ±30″ ανοχή στο ρολόι του κινητού, κάθε κωδικός μία φορά ακόμη κι αν τον στείλουν δύο αιτήματα την ίδια στιγμή (ο έλεγχος γίνεται με σύντομο κλείδωμα στη βάση, πάνω στην κατάσταση όπως είναι στη βάση εκείνη τη στιγμή· το ίδιο και για τους κωδικούς ανάκτησης), οι νέοι κωδικοί ανάκτησης μένουν σε καθαρή μορφή στη βάση το πολύ 2 λεπτά μέχρι να εμφανιστούν, 5 λάθος κωδικοί ανά 15 λεπτά (και 20 συνολικά ανά ώρα). Το κλειδί αποθηκεύεται κρυπτογραφημένο με τα keys του `wp-config.php`· οι κωδικοί ανάκτησης μόνο ως hash. Αρχείο με τα 30 τελευταία συμβάντα και email στη διεύθυνση διαχείρισης σε κάθε ξεκλείδωμα, κωδικό ανάκτησης, αφαίρεση εφαρμογής ή πολλούς λάθος κωδικούς.
+- **Χαμένο κινητό:** κωδικός ανάκτησης στο πεδίο ξεκλειδώματος· αλλιώς `define( 'SCRAPELOCK_UNLOCK', true );` στο `wp-config.php`, αφαίρεση της εφαρμογής και νέα σύνδεση.
+- **WooCommerce:** το προσωπικό δεν «διώχνεται» από το wp-admin όσο είναι κλειδωμένο (το WooCommerce στέλνει όσους δεν επεξεργάζονται άρθρα στο «Ο λογαριασμός μου»), ώστε να φτάνει στη σελίδα ξεκλειδώματος. Όσο είναι κλειδωμένο, οι παραγγελίες δεν επεξεργάζονται από το wp-admin.
+- Ό,τι **βλέπει** το προσωπικό από το ScrapeLock δεν αλλάζει όσο είναι κλειδωμένο: εξαίρεση από τα όρια, πλήρες κείμενο στο REST / GraphQL, πρόσβαση στα ιδιωτικά feeds.
+- **Δοκιμές:** `t_lockdown.php` (90 έλεγχοι): RFC 6238, σύνδεση και QR, κλείδωμα, κάθε οθόνη του wp-admin, REST, ρυθμίσεις, αλλαγές από κώδικα, editor, πελάτης, ξεκλείδωμα με κωδικό ανάκτησης, λήξη, ταυτόχρονα αιτήματα με τον ίδιο κωδικό, καρτέλα και μπάρα κλειδωμένες και ξεκλείδωτες, προειδοποίηση, κουτάκι, αναφορά, όριο λάθος κωδικών, αφαίρεση, `SCRAPELOCK_UNLOCK`.
+
+## 2.6.8 — 2026-10-20
+
+Σκλήρυνση, ιδιωτικότητα και καθαρισμός κατά την απεγκατάσταση.
+
+- **Έλεγχος των λιστών IP:** οι λίστες που κατεβαίνουν (Google, Bing, Cloudflare, Bunny, AI bots) ελέγχονται πριν χρησιμοποιηθούν. Υπερβολικά πλατιές εγγραφές (`0.0.0.0/0`, `::/0`, ή πρόθεμα μικρότερο από /8 στο IPv4 και /16 στο IPv6) απορρίπτονται, ώστε μια λάθος ή κακόβουλη πηγή να μην κάνει κάθε IP επίσημο crawler, έμπιστο proxy ή μπλοκαρισμένη.
+- **GDPR:** τα στατιστικά των feeds κρατούν την τελευταία IP ανωνυμοποιημένη (IPv4 με μηδενικό τελευταίο octet, IPv6 χωρίς τα τελευταία 80 bits), όχι ολόκληρη και επ' αόριστον.
+- **Token feed:** το token σε απλό κείμενο, που εμφανίζεται μία φορά, μένει στη βάση 2 λεπτά αντί για 10.
+- **Strikes:** ο μετρητής που οδηγεί σε προσωρινό αποκλεισμό είναι ατομικός όταν υπάρχει persistent object cache· δύο ταυτόχρονες παραβιάσεις δεν χάνουν πια strike.
+- **Απεγκατάσταση:** σβήνεται και ο φάκελος της βάσης χωρών (όχι μόνο τα αρχεία του), σε multisite ανά site, και το meta `_pncp_wm` των συνημμένων. Τα καθαρά πρωτότυπα των εικόνων και ο δείκτης προς αυτά μένουν σκόπιμα.
+- **Διόρθωση:** ο σύνδεσμος «Feeds and token» στην ειδοποίηση για το παλιό token άνοιγε καρτέλα που δεν υπάρχει· τώρα ανοίγει την «Feeds and API».
+
+## 2.6.7 — 2026-10-20
+
+- **robots.txt πάντα ανοιχτό:** ένα μπλοκαρισμένο bot (π.χ. ClaudeBot) μπορούσε σε ορισμένα setups να πάρει 403 στο `/robots.txt`. Τα robots.txt, llms.txt και το TDM opt-out αναγνωρίζονται πλέον απευθείας από τη διαδρομή του αιτήματος, ανεξάρτητα από υποφάκελο / home path, και ο κύριος έλεγχος έχει δίχτυ ασφαλείας ώστε να μη δίνουν ποτέ 403. Κάθε bot μπορεί να διαβάσει τους κανόνες που του ζητείται να τηρεί.
+- Το πεδίο «CDN shared secret» είναι πεδίο κωδικού μίας γραμμής αντί για πλαίσιο πολλών γραμμών.
+
+## 2.6.6 — 2026-10-20
+
+- **CDN shared secret (M4):** ένα CDN με πολλούς πελάτες (Bunny, Cloudflare) μοιράζεται τις IP του, άρα οποιοσδήποτε μπορούσε να στρέψει δική του ζώνη στον server σας και να πλαστογραφήσει το header της πραγματικής IP. Με ένα μυστικό στο «Real visitor IP», που το CDN στέλνει ως `X-ScrapeLock-CDN`, το header του CDN γίνεται δεκτό μόνο όταν ταιριάζει. Κενό = όπως πριν.
+- **WooCommerce Store API (M6):** ο κατάλογος προϊόντων (`/wc/store/.../products`) μετράει στο όριο REST· εξαιρούνται μόνο cart, checkout και batch. Οι περιγραφές προϊόντων αφαιρούνται και από τα στοιχεία του καλαθιού.
+- **Παγίδα bots (M8):** δεν αποκλείει πια επιτρεπτά bots (link preview, σύγκριση τιμών, monitoring) ή επιτρεπτά AI search bots. Ένας παλιός browser χωρίς Sec-Fetch headers θεωρείται bot μόνο από το τρίτο χτύπημα, με μετρητή ανά /64.
+- **Επαλήθευση crawlers (M10):** όταν τελειώνει ο προϋπολογισμός DNS ή αποτυγχάνει το DNS, το αίτημα δεν μπλοκάρεται ως ψεύτικος crawler (περνά στα κανονικά όρια). Κάθε οικογένεια crawlers έχει δικό της προϋπολογισμό DNS.
+- **Απόδοση (M9):** οι επιλογές `pncp_version` και `pncp_db_version` φορτώνονται αυτόματα (autoload), ένα query λιγότερο ανά αίτημα χωρίς persistent object cache.
+
+## 2.6.5 — 2026-10-20
+
+- **Αποκλεισμοί ανά IPv6 /64:** οι προσωρινοί αποκλεισμοί κρατιούνται ανά /64 (όπως τα όρια και τα strikes)· η αλλαγή διεύθυνσης μέσα στο ίδιο /64 δεν τους παρακάμπτει. Το IPv4 δεν αλλάζει.
+- **Έλεγχος ανθρώπου:** όριο αιτημάτων challenge και προσπαθειών απάντησης ανά IP (ανά /64 στο IPv6), και κάθε challenge χρησιμοποιείται μία φορά.
+- **«Always allowed»:** μια εγγραφή μόνο με User-Agent δεν παρακάμπτει πια τον αποκλεισμό χωρών. Για πλήρη εξαίρεση, δέστε την με εύρος IP (`UA@1.2.3.0/24`). Τα επαληθευμένα AI search bots μένουν εξαιρεμένα.
+- Το `/.well-known/tdmrep.json` είναι πάντα αναγνώσιμο (κανονικός, πρώιμος και pre-cache έλεγχος, κανόνες Nginx / Apache / Cloudflare). Όσοι έχουν εγκατεστημένους κανόνες server πρέπει να τους αντιγράψουν ξανά.
+
+## 2.6.4 — 2026-10-20
+
+- **Όρια ανά λεπτό:** ένα αίτημα μπορούσε να τα παρακάμψει (και μαζί strikes και αποκλεισμούς) με header «prefetch» ή με POST. Το prefetch γίνεται δεκτό μόνο με το `Sec-Fetch-Dest` του browser και ένα ανώνυμο POST μετράει σαν προβολή. Ο pre-cache έλεγχος εφαρμόζει σε κάθε αίτημα τη λίστα «always blocked» και τους αποκλεισμούς.
+- **Αρχείο events του pre-cache:** η προστασία `<?php exit;` και η πρώτη γραμμή γράφονται με ένα κλείδωμα, και οι τιμές δεν μπορούν να περιέχουν `<`, `>` ή `?`· το αρχείο δεν μπορεί ποτέ να γίνει εκτελέσιμος κώδικας.
+- **wp-config.php:** ενημερώνεται ατομικά (προσωρινό αρχείο + rename) με έλεγχο για ταυτόχρονη αλλαγή, ποτέ σε αίτημα front-end (περιμένει το wp-admin), και δεν αγγίζεται όταν ξεκινά με `declare()` ή `namespace`.
+
+## 2.6.3 — 2026-10-20
+
+Συμπληρώσεις στην καρτέλα Log, μετά τον έλεγχο της 2.6.2 στο pharmacyneeds.gr, και κανόνες Nginx για κάθε server. Δεν αλλάζει κανένας έλεγχος ή αποκλεισμός του plugin.
+
+- **Σελίδες άλλων plugins στα «Pages»:** το `/hub/space/.../post/...` (πραγματική σελίδα, 200) έπεφτε στα «Addresses that do not exist», γιατί το WordPress δεν το βρίσκει με το `url_to_postid()`. Τώρα:
+  - ελέγχονται και τα rewrite rules: όταν ο πρώτος κανόνας που ταιριάζει έχει μόνο δικές του μεταβλητές (π.χ. `index.php?fcom_route=…`), η διαδρομή είναι σελίδα plugin. Τα endpoints με `pagename` (τύπου WooCommerce) μένουν στον κανονικό έλεγχο·
+  - νέα ρύθμιση «Content addresses» (Bots and limits), μία αρχή διαδρομής ανά γραμμή, για plugins χωρίς rewrite rules (φίλτρο `pncp_content_paths`). Αφορά μόνο το Log, δεν μπλοκάρει και δεν επιτρέπει τίποτα. Η αποθηκευμένη απάντηση (6 ώρες) ξαναρωτιέται μόλις αλλάξει η ρύθμιση.
+- **Χωρίς «Block permanently» σε επίσημες διευθύνσεις:** Google, Bing, OpenAI, Perplexity, Anthropic, Cloudflare, Bunny CDN. Στη θέση του κουμπιού η σήμανση «Official Anthropic address» κ.λπ., με εξήγηση. Π.χ. η 216.73.217.114 (ClaudeBot) είναι στη λίστα της Anthropic που επαληθεύει τα Claude-SearchBot / Claude-User: ο αποκλεισμός της θα έκοβε και την AI αναζήτηση. Το ClaudeBot το μπλοκάρει ήδη η λίστα bots. Ο έλεγχος γίνεται και στον server (`refused`), όχι μόνο στο κουμπί.
+- **Λίστες IP αμέσως:** όσες χρειάζονται οι ρυθμίσεις αλλά δεν έχουν κατέβει ποτέ (π.χ. η Anthropic μετά την αναβάθμιση, ή μια λίστα που άναψε μια ρύθμιση) κατεβαίνουν αμέσως μετά το update και μετά από αλλαγή ρυθμίσεων, όχι με τον ημερήσιο κύκλο. Αν μια πηγή δεν απαντά, ξαναδοκιμάζεται το πολύ μία φορά την ώρα. Το κουμπί λέγεται πλέον «Refresh lists now» (Official IP lists).
+- **robots.txt με ένα `User-agent: *`:** η παγίδα και το Content-Signal μπαίνουν μέσα στο υπάρχον group του WordPress (μετά τον τελευταίο κανόνα, πριν από το Sitemap), όχι σε δύο νέα. Τα απλά parsers διαβάζουν μόνο το πρώτο group. Χωρίς group για όλους, γίνεται ένα νέο.
+- **Κανόνες Nginx για κάθε server:**
+  - Οι μεταβλητές και η ζώνη ορίου έχουν την κατάληξη του site (`$pncp_block_pharmacyneeds_gr`, `zone=pncp_pages_pharmacyneeds_gr`). Πριν, δύο sites WordPress στον ίδιο Nginx σταματούσαν το `nginx -t` (διπλό `map`, `limit_req_zone`, `limit_req_status`). Το `limit_req_status 429;` μεταφέρθηκε στο `server { }`.
+  - **Κατάσταση στην καρτέλα:** εγκατεστημένοι και τρέχοντες / παλιοί (με το μέρος που αλλάζει) / δεν υπάρχουν / δεν έγινε έλεγχος. Ο Nginx απαντά στο `/.well-known/scrapelock-nginx` με αποτύπωμα των δύο μερών, χωρίς σχόλια, άρα μια νέα έκδοση με ίδιους κανόνες δεν τους δείχνει παλιούς. Η διεύθυνση είναι ανοιχτή και για μπλοκαρισμένα User-Agents. Το αποτέλεσμα κρατιέται 5 λεπτά και ξαναρωτιέται μόλις αλλάξουν οι κανόνες.
+  - Οδηγίες για το πού μπαίνει κάθε μέρος: Debian / Ubuntu, CentOS / RHEL, Plesk, aaPanel, άλλα πάνελ, χωρίς πρόσβαση στον Nginx.
+  - Όσοι έχουν ήδη κανόνες της 2.6.2 πρέπει να αντιγράψουν **και τα δύο** μέρη ξανά, γιατί άλλαξαν τα ονόματα.
+
+- **Τρεις ομάδες διαδρομών:**
+  - «Pages»: μόνο οι διευθύνσεις που υπάρχουν στο site (αρχική, άρθρα, σελίδες, προϊόντα, συνημμένα, με τις σελιδοποιήσεις και τα feeds τους, αρχεία ημερομηνίας, αρχεία τύπων περιεχομένου, κατηγορίες / ετικέτες / άλλοι όροι, συγγραφείς, sitemaps, REST API)·
+  - νέα ομάδα «Addresses that do not exist», για τυχαία strings (`/axscaz1unupmtl4ld90t`), μαντεψιές (`/z9x8c7v6b5-debug-trigger`) και ανύπαρκτες κατηγορίες·
+  - «Files and admin paths» όπως πριν.
+  
+  Ο έλεγχος γίνεται τη στιγμή που εμφανίζεται η σελίδα, άρα ισχύει και για τα παλιά events. Αποθηκεύεται για 6 ώρες ανά διαδρομή.
+- **«Block permanently» και στα Top IPs και στα Latest events** (μία φορά ανά IP, στην πιο πρόσφατη γραμμή της). Οι ίδιες εξαιρέσεις: ποτέ ο server, η IP του διαχειριστή, ιδιωτικές διευθύνσεις, πάντα επιτρεπτές IP ή διευθύνσεις του Google / Bing.
+- **«Persistent IPs (last 7 days)»** (πρώην «Blocked again and again»):
+  - IP με τουλάχιστον δύο προσωρινούς αποκλεισμούς **ή τουλάχιστον 100 μπλοκαρισμένα αιτήματα** (φίλτρο `pncp_persistent_requests`)·
+  - πιάνει και όσες μπλοκάρονται συνέχεια χωρίς να πάρουν ποτέ προσωρινό αποκλεισμό, π.χ. από τη λίστα User-Agents·
+  - νέα στήλη «Main reason»· ταξινόμηση κατά πλήθος αιτημάτων.
+- **Δοκιμές:**
+  - `t_http.php`: άρθρο, αρχική, κατηγορία και σελίδα 2, αρχείο ημερομηνίας στα Pages· τυχαία strings και ανύπαρκτη κατηγορία στην νέα ομάδα· 317 αιτήματα χωρίς αποκλεισμό μπαίνουν στις επίμονες, 99 όχι· κύριος λόγος· ταξινόμηση.
+  - `t_admin.php`: κουμπί στα Top IPs και στα Latest events (μία φορά ανά IP), νέα ενότητα και στήλη, τρεις ομάδες.
+  - `t_admin.php`: κατάληξη ονομάτων, άλλο site / μακρύ όνομα, `limit_req_status` στο server, αποτυπώματα, κατάσταση χωρίς κανόνες.
+  - `t_http.php`: διαδρομή plugin από rewrite rule = σελίδα, endpoint με pagename ανύπαρκτης σελίδας όχι, «Content addresses» (και πλήρης διεύθυνση, και όχι το `/hub/spaceship`), επίσημες διευθύνσεις Anthropic / Cloudflare `refused`, λίστα που λείπει κατεβαίνει αμέσως, όχι ξανά μέσα στην ώρα, ξανά μετά από αλλαγή ρυθμίσεων, ένα group `User-agent: *`.
+  - `t_admin.php`: IP της Anthropic στα Latest events χωρίς κουμπί, με σήμανση.
+  - `t_server_rules.php`: `nginx -t` με δεύτερο site στον ίδιο Nginx, κατάσταση «τρέχοντες» και «παλιοί» μετά από αλλαγή ρύθμισης, διεύθυνση ελέγχου ανοιχτή για μπλοκαρισμένο User-Agent. Δοκιμάστηκε και σε Nginx 1.24 με δύο server { }.
+
+## 2.6.2 — 2026-10-19
+
+Διορθώσεις και βελτιώσεις μετά τη χρήση στο pharmacyneeds.gr. Στις υπάρχουσες εγκαταστάσεις δεν ενεργοποιείται τίποτα καινούργιο μόνο του.
+
+### AI search bots σε κάθε επίπεδο
+- Με το «Allow AI search engines and assistants», τα επιτρεπτά AI bots αναζήτησης (και όσα είναι στη λίστα «Πάντα επιτρεπτά») δεν περνούν από το αυστηρότερο όριο της επαλήθευσης ανθρώπου: δεν τρέχουν JavaScript, οπότε κρατούν το κανονικό όριο σελίδων.
+- **Cloudflare:** ο κανόνας AI μπλοκάρει πλέον μόνο την κατηγορία «AI Crawler» όταν η AI αναζήτηση επιτρέπεται (πριν: και «AI Assistant» / «AI Search»). Τα επιτρεπτά AI bots δεν μπαίνουν καν στη λίστα του κανόνα bots.
+- **Anthropic:** τα Claude-SearchBot και Claude-User επαληθεύονται με την επίσημη λίστα `https://claude.com/crawling/bots.json` (όπως OpenAI και Perplexity), όταν είναι ενεργό το «Verify AI search bots». Χωρίς λίστα ακόμη δεν αλλάζει τίποτα.
+
+### robots.txt και llms.txt πάντα ανοιχτά
+- Τα `/robots.txt`, `/llms.txt` και `/llms-full.txt` δεν μπλοκάρονται ποτέ, για κανένα bot: στο WordPress, στον πρώιμο έλεγχο, στον έλεγχο πριν από το cache και στους κανόνες Nginx / Apache / Cloudflare. Στο Cloudflare ως πρώτος κανόνας «Skip».
+
+### Ψεύτικοι browsers και σε scanners
+- Στο WordPress ο έλεγχος ισχύει ήδη και σε σελίδες 404 (π.χ. `/id_ed25519`, `.php` που φτάνει στο WordPress). Δοκιμάζεται πλέον ρητά.
+- **Νέο στους κανόνες Nginx και Apache:** ο ίδιος έλεγχος (Chrome / Edge 90+ χωρίς `Sec-Fetch-Mode` και `Sec-CH-UA`, Firefox 90+ χωρίς `Sec-Fetch-Mode`, μόνο σε HTTPS) πριν από το cache, και για αρχεία που δεν φτάνουν ποτέ στο WordPress (π.χ. scanners που ζητούν `.php`). Οι μηχανές αναζήτησης και τα bots που γράφουν «Chrome/» στο User-Agent, τα Android WebViews και τα «Πάντα επιτρεπτά» δεν επηρεάζονται. Δοκιμάστηκε με πραγματικό Nginx 1.24 και Apache 2.4 (17 και 15 σενάρια, ανάμεσά τους το πραγματικό Googlebot smartphone).
+- Στο Nginx ένα ενιαίο `if ($pncp_block) { return 403; }` για bots και ψεύτικους browsers, με εξαίρεση τα robots.txt / llms.txt.
+
+### Αρχείο καταγραφής
+- **Pages / Files:** ιδιωτικά κλειδιά (`id_rsa`, `id_ed25519`…), GraphQL άλλων εφαρμογών (`/v1/graphql`, `/graphql/api`), πάνελ σύνδεσης και διαχείρισης άλλου λογισμικού (`/login/`, `/phpmyadmin/`…) πάνε στα «Files», εκτός αν το site έχει σελίδα σε εκείνη τη διεύθυνση. Η κατάταξη γίνεται τη στιγμή που εμφανίζεται, άρα ισχύει και για παλιά events.
+- **Top User-Agents:** σήμανση «Ψεύτικο: όχι από τις επίσημες διευθύνσεις» και «Γνωστό όνομα bot, χωρίς επαλήθευση», και ο κύριος λόγος αποκλεισμού.
+- **Ετικέτες ορίων** με το όνομα της ρύθμισης: «Σελίδες ανά λεπτό», «Σελίδες ανά λεπτό χωρίς επαλήθευση ανθρώπου», «Αναζητήσεις ανά λεπτό» κ.λπ.
+- **Πολλά User-Agents σε ένα event:** τα αιτήματα της ίδιας IP με τον ίδιο λόγο στο ίδιο λεπτό γίνονται μία γραμμή, όπως πριν, που τώρα δείχνει και «N διαφορετικά User-Agents σε αυτό το λεπτό». Νέα στήλη `uas` στον πίνακα του log, με `dbDelta`. Αν η βάση δεν τη δεχτεί, το log γράφει όπως πριν.
+- **Κουμπί «Μόνιμος αποκλεισμός»** στις προσωρινά αποκλεισμένες IP: η IP μπαίνει στις «πάντα αποκλεισμένες». Ποτέ ο server, η IP του διαχειριστή, ιδιωτικές διευθύνσεις, πάντα επιτρεπτές IP ή διευθύνσεις του Google / Bing. Δεν αδειάζει το cache σελίδων.
+- **Νέα ενότητα «Αποκλείστηκαν ξανά και ξανά (7 ημέρες)»:** IP με τουλάχιστον δύο προσωρινούς αποκλεισμούς, με το ίδιο κουμπί.
+
+### Διόρθωση
+- **Cloudflare:** με την AI αναζήτηση επιτρεπτή, η έκφραση του κανόνα bots έφτανε τους 4.467 χαρακτήρες, πάνω από το όριο των 4.096 της Cloudflare. Τώρα είναι 4.056, και μια ακόμη μεγαλύτερη λίστα μοιράζεται σε περισσότερους κανόνες, ο καθένας κάτω από το όριο.
+
+### Δοκιμές
+- `t_http.php`: scanners με ψεύτικο browser σε 404 και `.php`· robots.txt / llms.txt / llms-full.txt με bot της λίστας, και με τον πρώιμο έλεγχο· AI search χωρίς το αυστηρό όριο· Anthropic (επίσημη IP, ψεύτικο, χωρίς λίστα, μορφή λίστας)· κανόνες Cloudflare / Nginx / Apache· Pages / Files· ετικέτες· διαφορετικά User-Agents· λόγοι ανά User-Agent· επαναλαμβανόμενοι· μόνιμος αποκλεισμός και οι εξαιρέσεις του.
+- `t_admin.php`: η νέα ενότητα, οι σημάνσεις, το κουμπί με λάθος και σωστό nonce, το μήνυμα, η άρνηση για τον server.
+
+## 2.6.1 — 2026-10-19
+
+Διορθώσεις μετά τον πρώτο (αυτόματο) έλεγχο του WordPress.org. Καμία λειτουργία δεν αλλάζει.
+
+- **Ειδοποιήσεις (κανόνας 11):** οι μόνιμες ειδοποιήσεις «Emergency Mode is on» και η προειδοποίηση για τη ρύθμιση της 1.4 («trust every proxy») εμφανίζονται μόνο στον Πίνακα ελέγχου και στη σελίδα του ScrapeLock, όχι σε κάθε σελίδα του wp-admin.
+- **readme, External services:** για κάθε υπηρεσία (Google, Bing, Cloudflare, Bunny CDN, OpenAI, Perplexity, DB-IP) γράφονται οι ακριβείς διευθύνσεις, πότε κατεβαίνει, ποιος την παρέχει και οι σύνδεσμοι όρων χρήσης και απορρήτου. Αναφέρεται ότι ο πάροχος βλέπει την IP του server και πώς γίνονται οι αναζητήσεις reverse DNS.
+- **readme, Contributors:** `codebunnyhube`, το όνομα του λογαριασμού στο WordPress.org.
+- **Δοκιμές:** `t_admin.php` ελέγχει πού εμφανίζονται οι δύο ειδοποιήσεις.
+
+## 2.6.0 — 2026-10-19
+
+**Στις υπάρχουσες εγκαταστάσεις όλα τα νέα μένουν ανενεργά** μετά την αναβάθμιση. Οι νέες εγκαταστάσεις παίρνουν ενεργά μόνο το όριο sitemap (5 ανά λεπτό) και την «Trust Bunny CDN addresses» (χωρίς επίδραση όσο η «Real visitor IP» είναι REMOTE_ADDR). Η επαλήθευση ανθρώπου, οι χώρες και ο έλεγχος πριν από το cache είναι πάντα ανενεργά μέχρι να τα ενεργοποιήσει ο διαχειριστής.
+
+### Έλεγχος πριν από το cache (νέο, προαιρετικό)
+- **Το πρόβλημα:** cache σελίδων όπως του WP Rocket σερβίρουν τις αποθηκευμένες σελίδες πριν φορτώσει οποιοδήποτε plugin. Ένα bot που μοιάζει με browser μπορούσε να τις διαβάζει χωρίς όριο. (Τα bots της λίστας δεν παίρνουν ποτέ σελίδες από το cache του WP Rocket.)
+- **Η λύση:** με τη ρύθμιση «Pre-cache check», μία γραμμή αμέσως μετά το `<?php` του `wp-config.php` φορτώνει έναν μικρό έλεγχο (`includes/class-pncp-precheck-runtime.php`) που τρέχει πριν από το cache και πριν από το WordPress, χωρίς βάση δεδομένων.
+- **Τι ελέγχει:** πάντα αποκλεισμένες IP/CIDR (403), προσωρινούς αποκλεισμούς (403) και το «Pages per minute» ανά IP (429, `Retry-After: 60`). Μετρά μόνο GET/HEAD σελίδων. Αφήνει στον κανονικό έλεγχο: συνδεδεμένους χρήστες, φόρμες, prefetch, wp-admin, wp-login, cron, REST, XML-RPC, wc-ajax και την παγίδα.
+- **Πραγματική IP:** η ίδια λογική με την «Real visitor IP» (Trusted Proxy, Cloudflare, Bunny, ιδιωτικό δίκτυο). Μια διεύθυνση CDN δεν περιορίζεται ποτέ (θα σήμαινε πολλούς επισκέπτες μαζί). Ο ίδιος ο server και οι «Πάντα επιτρεπτές IP» δεν περιορίζονται.
+- **Μηχανές αναζήτησης:** Google και Bing επαληθεύονται με τις επίσημες λίστες και δεν μετρούν. Ψεύτικο Googlebot μετρά όπως όλοι. Applebot και YandexBot (χωρίς επίσημη λίστα) αφήνονται στον κανονικό έλεγχο με DNS, και όσο ο έλεγχος είναι ενεργός το WP Rocket δεν τους δίνει σελίδες από το cache.
+- **Παραβάσεις και αποκλεισμοί:** όπως στον κανονικό έλεγχο (`ban_strikes` μέσα σε 10 λεπτά, `ban_minutes`). Οι αποκλεισμοί του κανονικού ελέγχου ισχύουν και πριν από το cache, και η άρση από τη σελίδα ισχύει και εκεί.
+- **Καταγραφή:** τα συμβάντα γράφονται στο `wp-content/scrapelock-precheck/events.php` (ξεκινά με `<?php exit;`, δεν φαίνεται από το web, όριο 2 MB) και μπαίνουν στο αρχείο καταγραφής κάθε ώρα και όταν ανοίγει η καρτέλα Log. Οι αποκλεισμοί του φαίνονται στα «Temporarily blocked IPs».
+- **Μετρητές:** στο APCu αν υπάρχει, αλλιώς μικρά αρχεία ανά λεπτό, με κλείδωμα. Τα παλιά σβήνονται κάθε λεπτό.
+- **Ασφάλεια για το site:** κάθε σφάλμα αφήνει το αίτημα να περάσει. Το `wp-config.php` διαβάζεται ξανά μετά την εγγραφή, και αν δεν είναι ακριβώς όπως πρέπει, γράφεται πίσω το αρχικό. Δεν κρατιέται αντίγραφο του `wp-config.php` πουθενά (έχει τον κωδικό της βάσης). Το `run.php` δεν κάνει τίποτα όταν ανοίγεται από το web.
+- **Αν το `wp-config.php` δεν γράφεται,** η ρύθμιση δείχνει τις γραμμές για προσθήκη με το χέρι, με κουμπί αντιγραφής.
+- Αφαιρείται (γραμμή και αρχεία) όταν κλείνει η ρύθμιση ή η προστασία, με την απενεργοποίηση και με τη διαγραφή του plugin. Δεν υπάρχει σε multisite (κοινό `wp-config.php`).
+- **Όρια:** δεν εφαρμόζει τα αυστηρότερα όρια (επαλήθευση ανθρώπου, χώρες) ούτε το Emergency Mode, που χρειάζονται το WordPress. Αυτά ισχύουν για τις σελίδες που δεν έρχονται από το cache.
+
+### Bunny CDN (νέο)
+- **Πραγματική IP:** νέα επιλογή «Trust Bunny CDN addresses». Το plugin κατεβάζει κάθε μέρα την επίσημη λίστα των edge servers του Bunny (IPv4 και IPv6, `bunnycdn.com/api/system/edgeserverlist`) και διαβάζει το `X-Real-IP` / `X-Forwarded-For` μόνο από αυτούς. Η λίστα (περίπου 1.000 διευθύνσεις) ελέγχεται με πίνακα αναζήτησης, όχι μία-μία.
+- **Αναγνώριση:** από τις κεφαλίδες `CDN-ServerId` και `Via: BunnyCDN`. Αν όλοι οι επισκέπτες εμφανίζονται με διεύθυνση του Bunny, εμφανίζεται προειδοποίηση με κουμπί που βάζει X-Real-IP και κατεβάζει τη λίστα. Αν ο server έχει ήδη αντικαταστήσει την IP (π.χ. `real_ip_header` στο Nginx), εμφανίζεται ότι το REMOTE_ADDR είναι σωστό.
+- **Χώρα:** από το `CDN-RequestCountryCode`, μόνο όταν το αίτημα έρχεται από edge server του Bunny και η επιλογή είναι ενεργή. Αλλιώς Cloudflare ή DB-IP, όπως πριν.
+- Το CF-Connecting-IP εξακολουθεί να γίνεται δεκτό μόνο από την Cloudflare.
+- Η λίστα φαίνεται στις «Official IP lists», δηλώνεται στο readme (External services) και σβήνεται με τη διαγραφή του plugin. Οι κανόνες Nginx αναφέρουν και το Bunny.
+
+### Επαλήθευση ανθρώπου (νέο, προαιρετικό)
+- **Πώς δουλεύει:** ένα μικρό script (`assets/js/human.js`, χωρίς εξωτερικούς πόρους) περιμένει την πρώτη πραγματική αλληλεπίδραση: scroll, άγγιγμα, πλήκτρο ή τρεις κινήσεις του ποντικιού. Τότε ζητά «πρόβλημα» από το `admin-ajax.php` και λύνει ένα ελαφρύ proof of work με SHA-256 (περίπου 4.000 δοκιμές, σε δοκιμή με Chromium 0,25 δευτερόλεπτα). Παίρνει cookie `pncp_hv` για 7 ημέρες, υπογεγραμμένο και δεμένο στο δίκτυο της IP (IPv6: /64) και στον browser.
+- **Χωρίς cookie:** ισχύει νέο, αυστηρότερο όριο σελίδων (προεπιλογή 20/λεπτό, νέα αιτία `rate_unverified`).
+- **Δεν επηρεάζονται:** επαληθευμένες μηχανές αναζήτησης και AI bots, οι ρόλοι που εξαιρούνται, οι «Πάντα επιτρεπτές IP».
+- Δεν χρησιμοποιεί nonce, οπότε δουλεύει με page cache (WP Rocket κ.λπ.). Δεν εμφανίζει captcha.
+- Αν ο browser δεν έχει `fetch` ή Web Crypto, το script δεν κάνει τίποτα και ισχύει απλώς το αυστηρότερο όριο.
+- Ένας αποφασισμένος scraper μπορεί να επαναλάβει τα βήματα, αλλά κάθε IP του πρέπει να κάνει τη δουλειά.
+- Το Emergency Mode την ενεργοποιεί, με όριο το πολύ 10.
+
+### Όριο sitemap (νέο)
+- Αιτήματα ανά λεπτό για τα sitemap του WordPress, του Rank Math, του Yoast και παρόμοιων plugins (`wp-sitemap*.xml`, `sitemap.xml`, `sitemap_index.xml`, `*-sitemap.xml`, `?sitemap=`). Ελέγχονται στο `init`, γιατί κάποια SEO plugins τυπώνουν το sitemap πριν από το `template_redirect`.
+- Οι επαληθευμένες μηχανές αναζήτησης δεν περιορίζονται ποτέ. Νέα αιτία `rate_sitemap`.
+- Με όριο 0 (ανενεργό) η συμπεριφορά μένει όπως πριν: τα sitemap του WordPress μετρούν στο όριο σελίδων. Το Emergency Mode βάζει όριο το πολύ 5.
+
+### Χώρες (νέο, προαιρετικό)
+- **Αποκλεισμένες χώρες:** 403, αιτία `country`.
+- **Χώρες με αυστηρότερο όριο σελίδων:** προεπιλογή 10/λεπτό, αιτία `rate_country`.
+- Οι κωδικοί χωρών καθαρίζονται (δύο γράμματα, χωρίς διπλά). Οι μηχανές αναζήτησης, τα επαληθευμένα AI bots και η λίστα «Πάντα επιτρεπτά» δεν μπλοκάρονται ποτέ λόγω χώρας.
+- **Πηγή της χώρας:** το `CF-IPCountry`, μόνο όταν το αίτημα έρχεται από διεύθυνση της Cloudflare. Αλλιώς η δωρεάν βάση **DB-IP Lite** (CC BY 4.0), με την επιλογή «Download the free country database».
+- **Η βάση:** κατεβαίνει μία φορά τον μήνα (ή με «Download now») και μετατρέπεται σε δύο μικρά ταξινομημένα αρχεία στο `uploads/scrapelock-geo`. Η αναζήτηση είναι δυαδική, περίπου 20 αναγνώσεις, χωρίς πίνακες στη βάση δεδομένων.
+- Μια χαλασμένη ή μικρή λήψη δεν αντικαθιστά την προηγούμενη βάση. Χωρίς χώρα δεν γίνεται τίποτα.
+- Η πηγή δηλώνεται στο readme (External services) και στη σελίδα ρυθμίσεων («IP geolocation by DB-IP»). Τα αρχεία σβήνονται με τη διαγραφή του plugin.
+
+### Αναφορά «τι προσπαθούν να αντιγράψουν» (νέο)
+- Στην καρτέλα Log: οι διαδρομές που μπλοκαρίστηκαν περισσότερο, τις τελευταίες 24 ώρες και 7 ημέρες, με αιτήματα και αριθμό διαφορετικών IP.
+- Χωρίζονται σε «Pages» (περιεχόμενο, sitemap, REST) και «Files and admin paths» (scanners που ψάχνουν κωδικούς, backups, wp-admin).
+
+### Σελίδα ρυθμίσεων
+- **Νέα εμφάνιση:**
+  - κάρτα κατάστασης πάνω πάνω (Protection, Early check, Human check, AI bots verified, Headless browsers, Countries, Emergency Mode)·
+  - πιο μοντέρνες καρτέλες·
+  - κάθε ομάδα ρυθμίσεων σε κάρτα·
+  - διακόπτες (toggles) αντί για κουτάκια, που παραμένουν κανονικά checkbox για πληκτρολόγιο και αναγνώστες οθόνης·
+  - οι μεγάλες λίστες διπλωμένες, με τον αριθμό των γραμμών·
+  - κουμπί αποθήκευσης που μένει ορατό·
+  - σωστή εμφάνιση σε κινητό.
+- **Bots and limits:** χωρίστηκε σε ενότητες (Bots, AI, Always allowed, Always blocked, Limits, Human check, Countries, Temporary block, Real visitor IP, IP lists) με γρήγορους συνδέσμους.
+- Τα ονόματα των πεδίων δεν άλλαξαν.
+
+### Κείμενα
+- **Headless browsers:** το readme και η σελίδα ρυθμίσεων λένε πλέον ακριβώς τι πιάνει η ανίχνευση (ενδείξεις στα headers και φτηνούς scrapers) και τι όχι (έναν προσεκτικά κρυμμένο αυτοματοποιημένο browser, που τον πιάνουν τα όρια, η επαλήθευση ανθρώπου και η παγίδα).
+
+### Δοκιμές
+- **Νέο `t_precheck.php`**, με ψεύτικο cache σελίδων όπως του WP Rocket (`advanced-cache.php`):
+  - χωρίς τον έλεγχο η σελίδα από το cache δεν έχει όριο· με τον έλεγχο 429 πάνω από το όριο, χωρίς WordPress, και με HEAD·
+  - τι δεν μετρά: συνδεδεμένοι, prefetch, REST, wp-login, POST, ο server·
+  - Googlebot από την επίσημη λίστα και ψεύτικο Googlebot· Applebot και WP Rocket·
+  - πάντα επιτρεπτές / αποκλεισμένες IP και CIDR· αποκλεισμοί και άρση από τις δύο πλευρές· εισαγωγή στο Log χωρίς διπλά·
+  - `run.php` και `events.php` από το web· ψεύτικο X-Forwarded-For· φάκελος που δεν γράφεται·
+  - απενεργοποίηση που αφήνει το `wp-config.php` ακριβώς όπως ήταν· απενεργοποίηση και επανενεργοποίηση του plugin· έγκυρη PHP στον loader.
+- **Bunny** (`t_http.php`, `t_admin.php`): λίστα σε JSON / XML, κενή λίστα, autoload, X-Real-IP / X-Forwarded-For από Bunny και από ξένη IP, χωρίς εμπιστοσύνη, CF-Connecting-IP από Bunny, χώρα, αναγνώριση, προειδοποίηση και σημείωση στη σελίδα, ένα κλικ με λάθος και σωστό nonce.
+- `t_http.php`:
+  - όριο sitemap (WordPress, Rank Math / Yoast, Googlebot χωρίς όριο, συμπεριφορά με όριο 0)·
+  - επαλήθευση ανθρώπου: script στη σελίδα, όριο χωρίς cookie, challenge, λάθος απάντηση, απάντηση από άλλη IP, σωστή απάντηση με cookie, cookie από άλλη IP ή άλλον browser, πλαστό challenge, Googlebot, ανενεργή·
+  - χώρες: εισαγωγή CSV, ένωση διαστημάτων, IPv4 / IPv6 / IPv4 σε μορφή IPv6, αποκλεισμός, preview, πλαστό και πραγματικό CF-IPCountry, αυστηρότερο όριο, χαλασμένη λήψη·
+  - αναφορά, αναβάθμιση από 2.5.0, νέα εγκατάσταση, Emergency Mode.
+- `t_admin.php`: ενότητες, διακόπτες, διπλωμένη λίστα, κατάσταση, κουμπί λήψης βάσης, αποθήκευση χωρών, αναφορά στο Log, όλες οι καρτέλες χωρίς PHP warnings.
+- **Νέο `tests/browser/human.mjs`:** σε πραγματικό Chromium, μετά από scroll ο browser παίρνει το cookie και δεν ισχύει το αυστηρό όριο· χωρίς αλληλεπίδραση δεν δίνεται cookie.
+
+## 2.5.0 — 2026-10-18
+
+**Στις υπάρχουσες εγκαταστάσεις οι νέες επιλογές μένουν ανενεργές** μετά την αναβάθμιση. Στις νέες εγκαταστάσεις η επαλήθευση AI bots είναι ενεργή (λειτουργεί μόνο όταν επιτρέπεται η AI αναζήτηση) και η ανίχνευση headless browsers ανενεργή.
+
+### Bots
+- **Επαλήθευση AI bots αναζήτησης με τις επίσημες λίστες IP:** OAI-SearchBot και ChatGPT-User (OpenAI), PerplexityBot και Perplexity-User (Perplexity). Με ενεργό το «Allow AI search»:
+  - τα **πραγματικά** δεν παίρνουν ποτέ όριο ή αποκλεισμό, ούτε από την παγίδα (όπως το επαληθευμένο Googlebot)·
+  - όσα **απλώς φορούν το όνομά τους** παίρνουν 403 με νέα αιτία «Fake AI search bot», που μετρά ως παράβαση για τον προσωρινό αποκλεισμό.
+
+  Στο log του pharmacyneeds.gr φάνηκε ότι οι scanners ήδη φορούν «ChatGPT-User» και «OAI-SearchBot».
+- Κάθε User-Agent ελέγχεται μόνο με τη **δική του** λίστα. Ένα «ChatGPT-User» από διεύθυνση του OAI-SearchBot δεν γίνεται δεκτό.
+- Οι λίστες κατεβαίνουν μία φορά τη μέρα και **μόνο** όταν επιτρέπεται η AI αναζήτηση και είναι ενεργή η επαλήθευση. Μέχρι να κατέβει μια λίστα, το αντίστοιχο bot αντιμετωπίζεται όπως πριν. Αν αποτύχει μια λήψη, κρατιέται η προηγούμενη λίστα.
+- Η κατάσταση των λιστών φαίνεται στο «Official IP lists» (καρτέλα «Bots and limits»). Οι λίστες σβήνονται με τη διαγραφή του plugin.
+- Το readme δηλώνει τις νέες εξωτερικές πηγές (openai.com, www.perplexity.com).
+
+- **Headless και ψεύτικοι browsers (προαιρετικό, ανενεργό από προεπιλογή):** νέα επιλογή «Block headless and fake browsers». Ελέγχει μόνο σελίδες και αναζήτηση:
+  - Chrome χωρίς παράθυρο (Puppeteer, Playwright, Selenium) που δηλώνει `HeadlessChrome` στο `Sec-CH-UA` παίρνει 403 «Headless browser», ακόμη και με κανονικό User-Agent·
+  - σε HTTPS, «Chrome / Edge / Opera» από την έκδοση 90 χωρίς `Sec-Fetch-Mode` και χωρίς `Sec-CH-UA`, ή «Firefox» από την έκδοση 90 χωρίς `Sec-Fetch-Mode`, παίρνει 403 «Fake browser». Αυτά τα headers τα στέλνει πάντα κάθε σύγχρονος browser, ενώ ένα script που αντιγράφει μόνο το User-Agent όχι.
+  - Δεν ελέγχονται: HTTP, Android WebView (in-app browsers), Safari, όσοι δηλώνουν μηχανή αναζήτησης, η λίστα «Πάντα επιτρεπτά», η AI αναζήτηση, το wc-ajax. Το Emergency Mode την ενεργοποιεί.
+- **Λίστα Cloudflare:** όταν η «Real visitor IP» δεν τη χρειάζεται (π.χ. REMOTE_ADDR), η σελίδα γράφει «not used with the current “Real visitor IP” setting» αντί για «not downloaded yet», που μπέρδευε.
+
+### Αναβάθμιση
+- Οι νέες ρυθμίσεις μπαίνουν σωρευτικά: ένα site που περνά κατευθείαν από 2.3 σε 2.5 παίρνει ανενεργά και τα νέα της 2.4 και της 2.5.
+
+### Δοκιμές
+- `t_http.php`:
+  - πραγματικό OAI-SearchBot χωρίς όριο, και από αποκλεισμένη IP·
+  - πραγματικό ChatGPT-User από IPv6·
+  - ψεύτικα που παίρνουν 403 και παράβαση·
+  - λάθος λίστα για λάθος User-Agent·
+  - παγίδα χωρίς αποκλεισμό για τα πραγματικά·
+  - χωρίς λίστα, όπως πριν·
+  - επαλήθευση ή AI αναζήτηση ανενεργή, όπως πριν·
+  - GPTBot πάντα 403·
+  - ποιες λίστες κατεβαίνουν·
+  - αναβάθμιση από 2.4.0 και από 2.3.0, νέα εγκατάσταση·
+  - headless Chrome με κανονικό User-Agent, «Chrome» και «Firefox» χωρίς headers σε HTTPS (403), και πραγματικοί browsers, HTTP, Android WebView, παλιό Safari, Chrome 80, preview, πραγματικό Googlebot που περνούν (200).
+
+## 2.4.1 — 2026-10-18
+
+### Διόρθωση
+- **Fatal error με WP Rocket μετά την αναβάθμιση:** η αναβάθμιση τρέχει στο `plugins_loaded`, πριν φορτώσουν όλα τα plugins. Όταν η 2.4.0 πρόσθετε τις νέες ρυθμίσεις (αναβάθμιση από 2.3.x), το καθάρισμα της cache ζητούσε από το WP Rocket να ξαναγράψει τη ρύθμισή του πριν φορτώσει ολόκληρο. Αποτέλεσμα: «Call to undefined function get_rocket_cache_reject_uri()» και «critical error» στο πρώτο αίτημα. Βρέθηκε στο pharmacyneeds.gr. Τώρα το καθάρισμα της cache πριν από το `init` περιμένει το `init`.
+
+### Δοκιμές
+- `t_http.php`: αναβάθμιση από 2.3.0 στο πρώτο αίτημα με προσομοίωση WP Rocket, του οποίου μέρος των συναρτήσεων φορτώνει αργότερα. Ο κώδικας της 2.4.0 δίνει 500, ο νέος 200, και η cache καθαρίζεται στο `init`.
+
+## 2.4.0 — 2026-10-18
+
+Όλα τα νέα είναι στη δωρεάν έκδοση. **Στις υπάρχουσες εγκαταστάσεις όλα τα νέα μένουν ανενεργά** μετά την αναβάθμιση (τα ενεργοποιεί ο διαχειριστής). Οι νέες εγκαταστάσεις παίρνουν ενεργά το όριο 404 (30/λεπτό), την απόκρυψη ονομάτων χρηστών, τη γραμμή πηγής στο RSS και τα Content Signals· ο πρώιμος έλεγχος είναι πάντα ανενεργός μέχρι να τον ανοίξετε.
+
+### Cloudflare
+- **Καμία cache στο edge για αποκλεισμούς:** με το plugin της Cloudflare (APO), τα 403 / 429, η παγίδα και τα feeds με token δεν μπαίνουν στην cache της Cloudflare (φίλτρο `cloudflare_use_cache` και header `cf-edge-cache: no-cache`). Αλλιώς ένα 403 για bot μπορούσε να σερβιριστεί αργότερα σε επισκέπτες.
+- **Καθαρισμός της cache της Cloudflare** όταν αλλάζουν οι ρυθμίσεις του ScrapeLock, μέσω του plugin της Cloudflare (αν είναι ενεργό). Το ScrapeLock δεν κρατά κανένα κλειδί της Cloudflare.
+- **Εντοπισμός Cloudflare:** αν όλοι οι επισκέπτες φαίνονται με διεύθυνση Cloudflare, η καρτέλα «Bots και όρια» δείχνει προειδοποίηση και κουμπί «Χρήση CF-Connecting-IP», που ορίζει το header και την εμπιστοσύνη μόνο στις διευθύνσεις της Cloudflare. Αν το REMOTE_ADDR έχει ήδη την IP του επισκέπτη, ενημερωτικό μήνυμα ότι η ρύθμιση είναι σωστή.
+- **Σημείωση για APO** στην καρτέλα «Κανόνες server», όταν εντοπίζεται Cloudflare.
+
+### Bots και όρια
+- **Όριο «η σελίδα δεν βρέθηκε» (404) ανά λεπτό:** για scrapers που μαντεύουν διευθύνσεις. Εικόνες, CSS, scripts, favicon, apple-touch-icon και `/.well-known/` που λείπουν δεν μετρούν. Μετρά ως παράβαση για τον προσωρινό αποκλεισμό. Νέο φίλτρο `pncp_404_exempt`, νέα αιτία στο αρχείο `rate_404`. Το Emergency Mode το κατεβάζει στο πολύ 10.
+- **Πάντα αποκλεισμένες IP / CIDR** (403, αιτία `blocked_ip`) και **domains παραπομπής** (403, αιτία `blocked_ref`, κάθε γραμμή καλύπτει και τα subdomains). Οι «Πάντα επιτρεπτές IP» έχουν προτεραιότητα.
+- **Απόκρυψη ονομάτων χρηστών από επισκέπτες:** `?author=N` δίνει 404 αντί για ανακατεύθυνση στο `/author/όνομα/`, το REST `/wp/v2/users` δίνει 401, και ο χάρτης χρηστών του sitemap αφαιρείται. Οι συνδεδεμένοι χρήστες βλέπουν τα πάντα. Το Emergency Mode την ενεργοποιεί.
+- **Πρώιμος έλεγχος (προαιρετικός):** το ScrapeLock γράφει το `wp-content/mu-plugins/scrapelock-early.php`, που σταματά αποκλεισμένες IP και referrers, προσωρινά αποκλεισμένες IP, κενό User-Agent και User-Agents της λίστας bots πριν φορτώσουν το θέμα και τα άλλα plugins. Μηχανές αναζήτησης (επαλήθευση με DNS), συνδεδεμένοι χρήστες, POST, wp-admin, AJAX, cron, wp-login, η παγίδα και τα ιδιωτικά feeds μένουν στον κανονικό έλεγχο. Γράφεται μόνο με απευθείας πρόσβαση σε αρχεία (ποτέ δεν ζητά FTP), ποτέ δεν αντικαθιστά ξένο αρχείο με το ίδιο όνομα, και αφαιρείται όταν κλείνει η ρύθμιση, με την απενεργοποίηση και με τη διαγραφή του plugin.
+- **Content Signals στο robots.txt:** `Content-Signal: search=yes, ai-input=…, ai-train=no` (contentsignals.org). Το `ai-input` είναι `yes` μόνο όταν επιτρέπεται η AI αναζήτηση.
+
+### Feeds
+- **Γραμμή πηγής στο πλήρες RSS:** «Το άρθρο … δημοσιεύτηκε πρώτα στο …» με συνδέσμους στο άρθρο και στο site, ώστε όσοι αναδημοσιεύουν αυτόματα το feed να δίνουν σύνδεσμο στο πρωτότυπο.
+
+### Στοιχεία
+- Νέα κείμενα στο `.pot` / `.po` (27, μεταφρασμένα στα ελληνικά), readme, οδηγός χρήσης.
+
+### Δοκιμές
+- `t_http.php`: όριο 404 και εξαιρέσεις, `?author=`, REST users (και `?rest_route=`), sitemap, πάντα αποκλεισμένες IP / IPv6 / referrers, Content Signals, γραμμή πηγής RSS, `cf-edge-cache`, πρώιμος έλεγχος (μπλοκάρει πριν από το `muplugins_loaded`, αφήνει Googlebot / POST / συνδεδεμένους / feeds / wp-login, δεν αποφασίζει με IP της Cloudflare, δεν αγγίζει ξένο αρχείο), αναβάθμιση από 2.3.0 (τα νέα μένουν ανενεργά) και νέα εγκατάσταση.
+- `t_admin.php`: νέα πεδία, αποθήκευση καρτέλας χωρίς να αλλάζει άλλη, προειδοποίηση και κουμπί Cloudflare (με λάθος / σωστό nonce), σημείωση APO.
+
+## 2.3.0 — 2026-10-17
+
+### Προεπιλογές νέων εγκαταστάσεων
+- **Όρια ενεργά από την αρχή:** σελίδες 60, αναζήτηση 20, REST / GraphQL 60 ανά λεπτό (όσα και το προφίλ «Ισορροπημένο»). Πριν ήταν 0 (ανενεργά), οπότε ένας scraper με User-Agent browser δεν είχε κανένα όριο. **Οι υπάρχουσες εγκαταστάσεις κρατούν τις τιμές τους.**
+- **Μπλοκάρισμα συντομεύσεων DevTools ανενεργό από προεπιλογή:** δεν σταματά κανένα bot και ενοχλεί πραγματικούς χρήστες. Ενεργοποιείται στα προφίλ «Αυστηρό» και «Μέγιστο». Το «Ισορροπημένο» δεν το αλλάζει πλέον. Οι υπάρχουσες εγκαταστάσεις κρατούν τη ρύθμισή τους.
+
+### Ασφάλεια
+- **«Πάντα επιτρεπτοί» δεμένοι σε IP:** μια γραμμή της λίστας μπορεί να γραφτεί `Skroutz@203.0.113.0/24, 198.51.100.7`. Τότε γίνεται δεκτή μόνο από αυτές τις IP, και μόνο όταν η IP δεν πλαστογραφείται (όχι «εμπιστοσύνη σε κάθε proxy»). Έτσι όποιος γράψει «Skroutz» στο User-Agent του δεν παρακάμπτει πια τον έλεγχο. Οι γραμμές χωρίς `@` λειτουργούν όπως πριν. Γραμμή με `@` χωρίς έγκυρη IP δεν γίνεται ποτέ δεκτή. Στους κανόνες Nginx / Apache / Cloudflare οι γραμμές με `@` δεν μπαίνουν στη λίστα επιτρεπτών (τις ελέγχει το WordPress). Νέο κείμενο βοήθειας στη σελίδα ρυθμίσεων (`.pot` / `.po`).
+
+### Δοκιμές
+- `t_http.php`: προεπιλογές νέας εγκατάστασης, προφίλ, γραμμή με `@` από σωστή IP / CIDR / λάθος IP, γραμμή χωρίς `@`, γραμμή με άκυρη IP, κανόνες server.
+
+## 2.2.4 — 2026-10-17
+
+### Κατάλογος WordPress.org
+- **readme.txt:** `Contributors: codebunnyhub`, το πραγματικό username στο WordPress.org (ήταν `codebunnyhube`).
+
+## 2.2.3 — 2026-10-17
+
+### Κατάλογος WordPress.org
+- **Παγίδα για bots χωρίς inline style:** ο κρυφός σύνδεσμος δεν έχει πλέον `style="…"`. Κρύβεται με την κλάση `pncp-hp` και CSS που φορτώνεται με `wp_add_inline_style()` (χωρίς επιπλέον αρχείο), μόνο όταν η παγίδα είναι ενεργή. Ίδια εμφάνιση και συμπεριφορά.
+
+## 2.2.2 — 2026-10-16
+
+### Διανομή
+- **Release στο GitHub:** νέο `.github/workflows/release.yml`. Με κάθε tag έκδοσης (π.χ. `v2.2.2`) ελέγχει ότι το tag ταιριάζει με `Version`, `PNCP_VERSION` και `Stable tag`, φτιάχνει το `scrapelock.zip` (φάκελος `scrapelock/`, έτοιμο για «Μεταφόρτωση πρόσθετου») και το δημοσιεύει ως Release, δωρεάν για κατέβασμα.
+
+### Ασφάλεια
+- **IPv6: όριο ανά δίκτυο /64.** Τα όρια σελίδων, αναζήτησης και REST / GraphQL και οι παραβάσεις μετρούσαν ανά διεύθυνση. Μια σύνδεση IPv6 όμως έχει συνήθως ολόκληρο /64, οπότε ένας scraper άλλαζε διεύθυνση σε κάθε αίτημα και δεν έφτανε ποτέ στο όριο. Τώρα μετρούν ανά /64. Μια διεύθυνση IPv4 σε μορφή IPv6 (`::ffff:203.0.113.5`) μετρά ως η IPv4. Οι αποκλεισμοί μένουν ανά διεύθυνση. Νέο φίλτρο: `pncp_ipv6_prefix` (48–128, 128 = ανά διεύθυνση, όπως πριν).
+- **Applebot / YandexBot:** όταν εξαντλούνταν οι 20 έλεγχοι DNS του λεπτού (αρκούν 20 ψεύτικα «Applebot» από άλλες IP), ο πραγματικός crawler έπαιρνε 403 **και** παράβαση, άρα μπορούσε να αποκλειστεί. Τώρα, όταν ο έλεγχος δεν βγάζει απάντηση (εξαντλημένο όριο DNS ή αποτυχημένο reverse DNS), το αίτημα παίρνει 403 χωρίς παράβαση και χωρίς αποκλεισμό από την παγίδα. Το αποτυχημένο reverse DNS ξαναδοκιμάζεται σε 5 λεπτά (πριν: 1 ώρα). Ψεύτικο rDNS μπλοκάρεται και αποκλείεται όπως πριν.
+
+### Δοκιμές
+- `t_http.php`: IPv6 με αλλαγή διεύθυνσης μέσα στο ίδιο /64 (429), άλλο /64 (200), Applebot με εξαντλημένο DNS και χωρίς reverse DNS (403 χωρίς αποκλεισμό), πραγματικό και ψεύτικο Applebot.
+
+### Στοιχεία
+- **Μετάφραση:** στο `translations/scrapelock-el.po` το παράδειγμα Nginx έλεγε ακόμη `content-protect.conf` αντί για `scrapelock.conf`.
+- **Header του token: `X-ScrapeLock-Token`** αντί για `X-Content-Protect-Token`, στη σελίδα ρυθμίσεων, στους κανόνες Nginx / Apache και στον οδηγό. Το plugin δέχεται **και** το παλιό header, οπότε τα ERP που το στέλνουν ήδη συνεχίζουν να δουλεύουν. Μόνο για feeds που είναι στατικά αρχεία και προστατεύονται από τους κανόνες server: αν ξαναεπικολλήσετε τους νέους κανόνες, το ERP πρέπει να στέλνει το νέο header (ή `cp_token` στο URL). Η παράμετρος `cp_token` μένει ίδια, γιατί υπάρχει ήδη στα URL των Skroutz / BestPrice.
+- **Μηνύματα διαχείρισης:** «ScrapeLock enabled.» / «ScrapeLock disabled. The site is not protected.» αντί για «Content protection …» (και στο `.pot` / `.po`).
+- **Author:** «CodeBunny» αντί για «The-Greek», ως προετοιμασία για τον κατάλογο του WordPress.org.
+- **Όνομα:** «ScrapeLock – Content & AI Bot Protection» αντί για «Content Protect».
+- **Φάκελος και αρχείο:** `scrapelock/scrapelock.php` αντί για `content-protect/content-protect.php`, για το slug `scrapelock` του WordPress.org. Σε υπάρχον site: απενεργοποίηση του παλιού, ενεργοποίηση του ScrapeLock. Ρυθμίσεις (`pncp_settings`), tokens και αρχείο μένουν. Αν μείνουν ενεργά και τα δύο, φορτώνεται μόνο το πρώτο (`PNCP_VERSION`).
+- **Text domain:** `scrapelock` αντί για `content-protect`.
+- **Κείμενα στα αγγλικά:** όλα τα κείμενα του plugin, η περιγραφή και τα σχόλια των κανόνων Nginx / Apache είναι πλέον στα αγγλικά. Τα ελληνικά έρχονται από `languages/scrapelock-el.po` / `.mo` (314 κείμενα), μαζί με `scrapelock.pot` για άλλες γλώσσες. Στους κανόνες server το `ΤΟ_TOKEN_ΣΑΣ` έγινε `YOUR_TOKEN`. Η καρτέλα «Αρχείο» λέγεται στα αγγλικά «Log».
+- **WP Rocket:** η εξαίρεση του `protect.js` βγαίνει από τον πραγματικό φάκελο του plugin και όχι από σταθερό `content-protect/`.
+- **readme.txt** για τον κατάλογο του WordPress.org (Contributors: codebunnyhub), με την ενότητα «External services» για τις λίστες IP της Google, της Bing και του Cloudflare.
+- **Plugin Check (κανόνες του WordPress.org):** 0 errors. Οι λίστες IP του Cloudflare έρχονται πλέον από το `api.cloudflare.com/client/v4/ips` (JSON), γιατί οι διευθύνσεις `www.cloudflare.com` έμοιαζαν με CDN. Στη λίστα hotlink το `googleusercontent.com` έγινε `googleusercontent.` (ίδιο ταίριασμα).
+- **Εξωτερικές κλήσεις (οδηγία 7):** οι λίστες Google / Bing κατεβαίνουν μόνο όταν η προστασία είναι ενεργή. Η λίστα του Cloudflare κατεβαίνει μόνο όταν η πραγματική IP διαβάζεται από `CF-Connecting-IP` ή `X-Forwarded-For` με εμπιστοσύνη στο Cloudflare. Το User-Agent των αιτημάτων δεν περιέχει πλέον τη διεύθυνση του site. Όλα περιγράφονται στο «External services» του `readme.txt`.
+- **Σχόλια κώδικα στα αγγλικά**, και των μεταφραστών (`translators:`). Ο κώδικας δεν άλλαξε.
+- **Πακέτο:** ο ελληνικός οδηγός χρήσης μεταφέρθηκε στο `docs/user-guide-el.md` και δεν μπαίνει στο zip. Τα tests ήταν ήδη έξω από το πακέτο.
+- **Μόνο αγγλικά στο πακέτο:** η ελληνική μετάφραση (`.po` / `.mo`) και το `load_plugin_textdomain()` βγήκαν από το plugin. Το `.po` φυλάγεται στο `translations/scrapelock-el.po`, για υποβολή στο translate.wordpress.org.
+- **Παντού ScrapeLock:** τίτλος σελίδας ρυθμίσεων, μενού (Settings → ScrapeLock), widget, κείμενο πολιτικής απορρήτου, σχόλια των κανόνων Nginx / robots.txt και `@package`. Η σελίδα ρυθμίσεων είναι πλέον `options-general.php?page=scrapelock`. Οι δείκτες Apache έγιναν `# BEGIN ScrapeLock` / `# END ScrapeLock`: όποιος είχε επικολλήσει το παλιό μπλοκ «Content Protect» το αντικαθιστά με το νέο. Το αρχείο Nginx στο παράδειγμα λέγεται `scrapelock.conf`.
+- **Αποθετήριο:** το plugin μένει στη ρίζα· το κύριο αρχείο είναι το `scrapelock.php` (από `content-protect.php`). Νέοι φάκελοι εκτός πακέτου: `docs/`, `translations/`, `wporg-assets/`, και CI στο `.github/workflows/ci.yml` (zip ως artifact για 3 ημέρες).
+- Μένουν ίδια για συμβατότητα: prefix `pncp_`, option `pncp_settings`, header `X-Content-Protect-Token` και παράμετρος `cp_token` (τα χρησιμοποιούν ERP και πλατφόρμες τιμών).
+
+## 2.2.1 — 2026-10-16
+
+### Ασφάλεια
+- **Token της 1.x:** στη μετάβαση από την 1.x το token γινόταν hash, αλλά ένα αντίγραφο σε καθαρή μορφή έμενε στο option `pncp_legacy_token_notice`, μέχρι να ανοίξει ο διαχειριστής τη σελίδα του plugin. Τώρα δεν φυλάγεται καθόλου. Το παλιό token ισχύει κανονικά, και ο διαχειριστής βλέπει μία φορά: «Το παλιό token εξακολουθεί να ισχύει αλλά δεν μπορεί πλέον να εμφανιστεί. Αν δεν το έχετε αποθηκευμένο, δημιουργήστε νέο token.» Σε εγκαταστάσεις 2.1 / 2.2.0 όπου το αντίγραφο υπάρχει ακόμη, η αναβάθμιση το σβήνει. Από εδώ και πέρα κανένα token feed δεν αποθηκεύεται σε καθαρή μορφή, χωρίς εξαιρέσεις.
+
+### Έλεγχος
+- **AI αναζήτηση χωριστά από την εκπαίδευση:** νέα επιλογή στην καρτέλα «Bots και όρια»: «Επιτρέπονται οι AI μηχανές αναζήτησης και βοηθοί». Αφορά τα OAI-SearchBot, ChatGPT-User, Claude-SearchBot, Claude-User, PerplexityBot, Perplexity-User, DuckAssistBot και MistralAI-User. Όταν είναι ενεργή, αυτά περνούν και βγαίνουν από το Disallow του robots.txt, από τους κανόνες Nginx / Apache / Cloudflare και από τη λίστα του WP Rocket. Οι crawlers εκπαίδευσης (GPTBot, ClaudeBot, CCBot, Google-Extended, Applebot-Extended, Bytespider κ.ά.) μένουν μπλοκαρισμένοι. Από προεπιλογή η επιλογή είναι **ανενεργή**, άρα η συμπεριφορά μένει όπως στην 2.2.0. Το όριο σελίδων ισχύει κανονικά και για αυτά τα bots, γιατί το User-Agent πλαστογραφείται. Νέο φίλτρο: `pncp_ai_search_agents`.
+
+### Δοκιμές
+- `t_admin.php`: μετάβαση 1.x χωρίς token σε καθαρή μορφή πουθενά στη βάση, αναβάθμιση από 2.2.0 που σβήνει το παλιό αντίγραφο, μήνυμα χωρίς token, κανόνες Nginx / Apache / WP Rocket με την επιλογή AI αναζήτησης.
+- `t_http.php`: OAI-SearchBot 403 από προεπιλογή, 200 με την επιλογή ενεργή, GPTBot πάντα 403, robots.txt ανάλογα.
+
+## 2.2.0 — 2026-10-16
+
+Έκδοση δοκιμών και ενίσχυσης, χωρίς νέες λειτουργίες. Όλα δοκιμάστηκαν σε πραγματική στοίβα: Nginx + PHP-FPM, Apache + mod_php, MariaDB 10.11, Redis, WooCommerce 11.2.1, WPGraphQL 2.6.0, WP Super Cache 3.1.1. Κάθε διόρθωση παρακάτω προέκυψε από αποτυχημένη δοκιμή.
+
+### Ασφάλεια
+- **WooCommerce `wc-ajax`:** το WooCommerce δηλώνει `DOING_AJAX`, και το plugin άφηνε κάθε τέτοιο αίτημα να περάσει. Ένα bot μπορούσε να καλεί `?wc-ajax=add_to_cart` χωρίς έλεγχο. Τώρα τα bots παίρνουν 403.
+- **Αποκλεισμοί υπό επίθεση:** με 1500 ταυτόχρονους αποκλεισμούς, κρατιόνταν μόνο ~150, γιατί ήταν ένα option που ξαναγραφόταν ολόκληρο. Τώρα υπάρχει πίνακας `{prefix}pncp_bans` με ατομικό `INSERT … ON DUPLICATE KEY UPDATE`, και δεν χάνεται κανένας αποκλεισμός. Οι αποκλεισμοί της 2.1 μεταφέρονται αυτόματα.
+- **Όριο σελίδων χωρίς object cache:** με 200 ταυτόχρονα αιτήματα και όριο 50, περνούσαν έως 65. Τώρα ο μετρητής είναι ατομικός μέσα στη MySQL (`LAST_INSERT_ID`): περνούν ακριβώς 50. Με Redis / Memcached χρησιμοποιείται το `wp_cache_incr`, όπως πριν.
+- **Page cache:** οι απαντήσεις 403 / 429, η παγίδα και τα προστατευμένα feeds ορίζουν `DONOTCACHEPAGE` και `X-LiteSpeed-Cache-Control: no-cache`. Έτσι δεν μπαίνουν ποτέ στην cache κανενός plugin.
+
+### Συμβατότητα
+- **WooCommerce:** καλάθι, ταμείο, «Ευχαριστούμε» και «Ο λογαριασμός μου» δεν μετρούν στο όριο σελίδων, γιατί μια αγορά είναι 4–5 σελίδες σε ένα λεπτό. Bots και αποκλεισμοί ελέγχονται κανονικά. Μια πλήρης αγορά (Store API checkout) ολοκληρώνεται ακόμη και με όριο 3 σελίδες/λεπτό και σε Emergency Mode.
+- **Κανόνες Nginx:** το `valid_referers` έγραφε το domain και ως `server_names` και ρητά, κι έτσι το `nginx -t` αποτύγχανε σε πραγματικό site. Τώρα το domain γράφεται ως regex. Οι κανόνες χωρίστηκαν σε δύο μέρη (`http { }` και `server { }`).
+- **Κανόνες Nginx / Apache για feeds:** μπλόκαραν και τα feeds που φτιάχνει η PHP. Έτσι ένα ERP με `Authorization: Bearer` ή με επιτρεπόμενη IP έπαιρνε 403 από τον server. Τώρα οι κανόνες ισχύουν μόνο για στατικά αρχεία, και τα υπόλοιπα τα ελέγχει το WordPress.
+- **Καθάρισμα cache μετά από αλλαγή ρυθμίσεων:** και για WP Super Cache, W3 Total Cache, LiteSpeed Cache, WP Fastest Cache και SiteGround Optimizer.
+- **Καθάρισμα κάθε ώρα** (όχι κάθε μέρα) για αρχείο, αποκλεισμούς που έληξαν και μετρητές ορίων. Σε επίθεση από χιλιάδες IP, ο πίνακας `wp_options` δεν μεγαλώνει για 24 ώρες.
+
+### Ανεξάρτητος έλεγχος κώδικα της 2.2 (9 ευρήματα, όλα διορθωμένα)
+- **Παράκαμψη ορίου με `?orders=1`:** οι μεταβλητές endpoint του WooCommerce (`?orders=1`, `?downloads=1`) έκαναν οποιοδήποτε URL να μη μετρά στο όριο. Τώρα εξαιρούνται μόνο καλάθι, ταμείο και «Ο λογαριασμός μου».
+- **Κανόνας Nginx για feeds:** το «if is evil» του Nginx έδινε 404 σε feed της PHP με token. Τώρα ο έλεγχος γίνεται με `map` και named location, και μέσα στα `if` υπάρχει μόνο `return`. Δοκιμάστηκε με token στο URL και με `Authorization: Bearer`.
+- **Μετρητής ορίου:** η νέα τιμή διαβάζεται από τη σύνδεση εγγραφής (`insert_id`) και όχι με ξεχωριστό SELECT. Έτσι λειτουργεί και με HyperDB / LudicrousDB / read-write split.
+- **REST:** οι απαντήσεις 403 / 429 δηλώνουν no-cache και στο LiteSpeed Cache.
+- **Αναβάθμιση:**
+  - η μετάβαση των αποκλεισμών γίνεται μόνο αν ο πίνακας δημιουργήθηκε πράγματι;
+  - κλείδωμα, ώστε τα ταυτόχρονα αιτήματα να μην την τρέχουν όλα μαζί;
+  - το καθάρισμα της cache γίνεται στο `init`.
+- **Επανάληψη αποκλεισμού που είχε λήξει:** σωστή ημερομηνία «από».
+- **Multisite:** το WP Super Cache αδειάζει μόνο για το site που άλλαξε.
+- **`wc-ajax`:** δεν εφαρμόζεται το «Μόνο browsers», γιατί κάποιες πύλες πληρωμών τα καλούν από server.
+
+### Δοκιμές (νέες)
+- `t_woocommerce.php`: πραγματική αγορά με τις αυστηρότερες ρυθμίσεις, Store API, `wc-ajax`, webhooks πληρωμών, εικόνες προϊόντων.
+- `t_graphql_rest.php`: WPGraphQL (GET/POST, application passwords), REST (`_method`, `X-HTTP-Method-Override`, `?rest_route=`, HEAD), RSS / Atom.
+- `t_server_rules.php`: οι κανόνες περνούν από `nginx -t` και εφαρμόζονται σε πραγματικό Nginx και Apache (bots, hotlink, φάκελος πρωτοτύπων, στατικά / PHP feeds, Bearer), και οι εκφράσεις Cloudflare ελέγχονται συντακτικά.
+- `t_cache.php`: WP Super Cache. Οι κανόνες server μπλοκάρουν bots ακόμη και σε σελίδες από την cache. Τα 403 και τα feeds δεν μπαίνουν στην cache, και η cache αδειάζει μετά από αλλαγή ρυθμίσεων.
+- `t_security.php`: CSRF σε κάθε ενέργεια, δικαιώματα συνδρομητή, open redirect, XSS / SQL injection μέσω User-Agent και ρυθμίσεων, header injection, 9 μορφές παράκαμψης των feeds, άμεση πρόσβαση στα αρχεία του plugin.
+- `t_load.php`: επιβάρυνση ανά αίτημα, ακρίβεια ορίου υπό ταυτόχρονα αιτήματα, πλημμύρα 3000 αιτημάτων από bot, 1500 ταυτόχρονοι αποκλεισμοί, με και χωρίς Redis.
+
+### Γνωστά όρια
+- Ένα plugin page cache που σερβίρει σελίδες πριν φορτωθεί το WordPress (WP Super Cache, WP Rocket, LiteSpeed) τις δίνει και σε bots. Τα «Rejected User Agents» του WP Super Cache σταματούν μόνο τη δημιουργία νέας cache, όχι το σερβίρισμα. Γι' αυτό τα bots τα σταματούν μόνο οι κανόνες server ή Cloudflare (δοκιμάστηκαν).
+- Elementor Pro, Bricks και Divi δεν δοκιμάστηκαν σε πραγματική εγκατάσταση, γιατί είναι εμπορικά. Δοκιμάστηκαν οι παράμετροι προεπισκόπησής τους και ο έλεγχος δικαιώματος επεξεργασίας.
+
+## 2.1.1 — 2026-10-16
+
+### Ασφάλεια
+- Page builders: το `?elementor-preview=1` (και `fl_builder`, `et_fb`, `preview_id`, `bricks`, `ct_builder`, SiteOrigin) έκλεινε την προστασία στη σελίδα για οποιονδήποτε επισκέπτη. Τώρα ισχύει μόνο για συνδεδεμένο χρήστη που μπορεί να επεξεργαστεί τη σελίδα.
+- Ο έλεγχος στον server (bots, ψεύτικοι crawlers, όρια, αποκλεισμοί, παγίδα) παρακαμπτόταν από κάθε συνδεδεμένο χρήστη, και ένας λογαριασμός πελάτη στο WooCommerce φτιάχνεται από τον καθένα. Τώρα εξαιρούνται μόνο οι ρόλοι της ρύθμισης «Ποιοι εξαιρούνται». Στο REST / GraphQL εξαιρούνται και όσοι γράφουν περιεχόμενο, για τον block editor.
+- `wc-ajax`: δεν παρακάμπτει πια κανέναν έλεγχο. Οι ενέργειες που έχει δηλώσει το WooCommerce (`wc_ajax_{ενέργεια}`) απλώς δεν μετρούν στο όριο σελίδων. Bots και αποκλεισμοί ελέγχονται κανονικά, και μια άγνωστη τιμή μετρά όπως κάθε σελίδα.
+- Προστατευμένα feeds: προστέθηκαν τα `Referrer-Policy: no-referrer` (το token στο URL δεν διαρρέει) και `X-Content-Type-Options: nosniff`.
+
+## 2.1.0 — 2026-10-15
+
+Ξαναγράφτηκε από την 1.4.0. Περιλαμβάνει ό,τι είχε η 2.0.0 (που δεν εγκαταστάθηκε ποτέ) και τις βελτιώσεις της 2.1. Η αναβάθμιση από την 1.4 κρατά όλες τις ρυθμίσεις και ενεργοποιεί τις νέες προστασίες.
+
+### Νέα
+- Ψεύτικα Googlebot / Bingbot / Applebot / Yandex: 403. Επαλήθευση με τις επίσημες λίστες IP της Google και της Bing (κάθε μέρα) και με reverse + forward DNS.
+- Παγίδα για bots: όποιος ανοίγει τον αόρατο σύνδεσμο αποκλείεται. Ένα ξένο site δεν μπορεί να παγιδεύσει τους επισκέπτες σας (Sec-Fetch-Site / Sec-Fetch-Dest, prefetch).
+- Όρια ανά IP για σελίδες, αναζήτηση και REST / GraphQL, προσωρινός αποκλεισμός μετά από N παραβάσεις σε 10 λεπτά, «Μόνο browsers».
+- Αρχείο αποκλεισμών (πίνακας `{prefix}pncp_log`) με διατήρηση 1/7/30 ημέρες, σύνοψη 24ώρου, άρση ενός ή όλων. Πρόταση κειμένου για την Πολιτική απορρήτου.
+- Trusted Proxy: το header της πραγματικής IP διαβάζεται μόνο από τον server, ιδιωτικά δίκτυα, το Cloudflare (επίσημη λίστα) ή τους proxies που δηλώνετε.
+- Έτοιμα προφίλ Ισορροπημένο / Αυστηρό / Μέγιστο, Emergency Mode με λήξη.
+- Feeds: token σε header (`X-Content-Protect-Token`, `Authorization: Bearer`) ή URL, μόνο hash στη βάση, εμφάνιση μία φορά, εναλλαγή με περίοδο χάριτος, στατιστικά ανά feed.
+- WPGraphQL: χωρίς κείμενο για επισκέπτες, έλεγχος bots και όριο.
+- Iframe: X-Frame-Options και CSP frame-ancestors (εκτός από τα embeds). TDM: header, meta, `/.well-known/tdmrep.json`, `noai`.
+- Υδατογράφημα: θέσεις (4 γωνίες, κέντρο, διαγώνια επανάληψη), μέγεθος, πλήρες μέγεθος με καθαρό αντίγραφο, εργαλείο εφαρμογής/αφαίρεσης σε παρτίδες που συνεχίζει μετά από διακοπή.
+- Γεννήτρια κανόνων Nginx, Apache και Cloudflare για το site.
+- Το script φορτώνεται στο `<head>` πριν από τα άλλα, με listeners σε φάση capture στο window. Μπλοκάρει και το σύρσιμο κειμένου και την «Αποθήκευση εικόνας» στο iOS. Προαιρετικό θόλωμα σε screenshot.
+- 47 νέα AI bots και εργαλεία scraping στη λίστα. Λίστα «Πάντα επιτρεπτά» για previews και monitoring.
+
+### Διορθώσεις από την 1.4
+- Η επιβεβαίωση «Να απενεργοποιηθεί η προστασία;» δεν εμφανιζόταν ποτέ (λάθος escaping στο onclick), οπότε ένα κλικ στη μπάρα απενεργοποιούσε τα πάντα. Τώρα η απενεργοποίηση γίνεται μόνο από σελίδα επιβεβαίωσης, με POST.
+- Ο έλεγχος bots δεν ίσχυε στο REST API.
+- Το φίλτρο υδατογραφήματος ξανάβαζε υδατογράφημα σε όλα τα μεγέθη όταν το WordPress συμπλήρωνε μεγέθη που έλειπαν (`wp_update_image_subsizes`) ή όταν ξαναφτιάχνονταν τα thumbnails.
+- Το εικονίδιο site και το λογότυπο έπαιρναν υδατογράφημα.
+- Το README που ανέφερε το plugin έλειπε.
+- Notice «_load_textdomain_just_in_time» στο WordPress 6.7+.
+
+### Ανεξάρτητος έλεγχος κώδικα (15 ευρήματα, όλα διορθωμένα πριν την παράδοση)
+- Υδατογράφημα: το αντίγραφο ασφαλείας επαναφέρεται μόνο αν το αρχείο είναι ακόμη αυτό που γράψαμε (hash). Έτσι μια εικόνα που αντικαταστάθηκε (π.χ. Enable Media Replace) δεν χάνεται. Αν ένα μέγεθος δεν ξαναφτιαχτεί από καθαρή πηγή, δεν παίρνει δεύτερο υδατογράφημα. Το αντίγραφο δεν σβήνεται ποτέ όταν λείπει το αρχείο (offload). Ο επεξεργαστής εικόνων ξεκινά από το καθαρό αντίγραφο.
+- Ο έλεγχος bots ισχύει και για POST σελίδων. Το `?wc-ajax` δεν παρακάμπτει τίποτα χωρίς WooCommerce. Στο REST ελέγχεται η πραγματική μέθοδος, και τα webhooks πληρωμών (POST) δεν αγγίζονται.
+- Πλαστογράφηση IP: κάθε header γίνεται δεκτό μόνο από τον σωστό proxy. Το `CF-Connecting-IP` μόνο από το Cloudflare, το `X-Real-IP` όχι από το Cloudflare. Με τη συμπεριφορά της 1.4 η IP δεν ανοίγει επιτρεπόμενες IP και feeds. Οι IP της Google και της Bing δεν αποκλείονται ποτέ, και η επαλήθευση crawler γίνεται πριν από τον έλεγχο αποκλεισμού.
+- Παγίδα: χωρίς αποκλεισμό για κλικ ανθρώπου, για μηχανές αναζήτησης χωρίς επαλήθευση (DuckDuckBot κ.ά.), για IP που ίσως είναι πλαστογραφημένη, και για παλιούς browsers την πρώτη φορά. Με «0 παραβάσεις» γίνεται μόνο καταγραφή.
+- Όρια: το Store API του WooCommerce και το prefetch δεν μετράνε. Μέγιστο / Emergency: αποκλεισμός μετά από 2 παραβάσεις (όχι 1).
+- Κανόνες Cloudflare / Nginx: το όριο μετρά μόνο σελίδες, όχι CSS, JS, εικόνες ή καλάθι. Η λίστα «Πάντα επιτρεπτά» ισχύει και εκεί.
+- Iframe: δεν αντικαθίστανται headers ασφαλείας άλλων plugins. Ταμείο και σελίδα παραγγελίας εξαιρούνται (iframe τραπεζών).
+- Φορτίο: οι αποκλεισμοί και το Emergency Mode διαβάζονται από autoload, χωρίς ερώτημα ανά σελίδα. Το DNS έχει όριο 20 ελέγχων το λεπτό. Οι αρνήσεις στα feeds γράφονται το πολύ μία φορά το λεπτό.
+- Feeds: η διαδρομή ταιριάζει με και χωρίς `/` στο τέλος.
+- Η αναβάθμιση τρέχει στο πρώτο αίτημα, όχι στην πρώτη επίσκεψη διαχειριστή. Μια λίστα bots που είχατε αδειάσει μένει άδεια.
+- JavaScript: τα draggable widgets (ταξινόμηση) και τα πεδία μέσα σε web components δουλεύουν κανονικά.
+
+### Συμβατότητα
+- Απαιτεί WordPress 6.2+ (ήταν 6.0).
+- Το token των feeds της 1.4 συνεχίζει να ισχύει. Εμφανίζεται μία τελευταία φορά στη σελίδα ρυθμίσεων και μετά υπάρχει μόνο ως hash.
+- Όποιος είχε `X-Forwarded-For` / `X-Real-IP` / `True-Client-IP` κρατά τη συμπεριφορά της 1.4, με προειδοποίηση, μέχρι να δηλώσει τους proxies του.
+
+## 1.4.0
+Η αρχική έκδοση που εισήχθη στο αποθετήριο.

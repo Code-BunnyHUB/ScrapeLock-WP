@@ -1,0 +1,978 @@
+<?php
+/**
+ * Plugin Name:       ScrapeLock – Content & AI Bot Protection
+ * Description:       Protects your content: makes copying text and images harder, hides the text in the REST API, GraphQL and RSS, blocks scrapers, AI bots and fake Googlebots, temporarily blocks persistent IPs, protects XML feeds with a token and adds an optional watermark. Lockdown freezes every change to the site until it is unlocked with an authenticator app. Forms, cart, checkout and search engines are not affected.
+ * Version:           3.13.0
+ * Requires at least: 6.2
+ * Requires PHP:      7.4
+ * Author:            CodeBunny
+ * License:           GPL-2.0-or-later
+ * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain:       scrapelock
+ * Domain Path:       /languages
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+// If another copy is already loaded (e.g. the old version in another folder), do not load again.
+if ( defined( 'PNCP_VERSION' ) ) {
+	return;
+}
+
+define( 'PNCP_VERSION', '3.13.0' );
+define( 'PNCP_FILE', __FILE__ );
+define( 'PNCP_DIR', plugin_dir_path( __FILE__ ) );
+define( 'PNCP_URL', plugin_dir_url( __FILE__ ) );
+defined( 'PNCP_OPTION' ) || define( 'PNCP_OPTION', 'pncp_settings' ); // Also defined by the early check (mu-plugin).
+
+// 3.6: each class is loaded when it is first used (PNCP_Foo_Bar → includes/class-pncp-foo-bar.php). A page for a
+// visitor no longer reads the code it never runs (the server rules, settings import and export, Site Health, the
+// "Check a request" card, the file check unless the site is locked).
+spl_autoload_register(
+	static function ( $class ) {
+		if ( 0 !== strpos( $class, 'PNCP_' ) ) {
+			return;
+		}
+		$file = PNCP_DIR . 'includes/class-' . str_replace( '_', '-', strtolower( $class ) ) . '.php';
+		// 3.12.9: a class opcache already holds is loaded without asking the disk first.
+		if ( ( function_exists( 'opcache_is_script_cached' ) && @opcache_is_script_cached( $file ) ) || is_readable( $file ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- opcache.restrict_api may refuse it: then the disk is asked.
+			require_once $file;
+		}
+	}
+);
+
+if ( is_admin() ) {
+	require_once PNCP_DIR . 'includes/class-pncp-admin.php';
+	PNCP_Admin::init();
+	PNCP_Rules_State::init(); // 3.12.3: the notice when the server rules on the server are out of date.
+}
+
+// 3.12.9: queues in the object cache or APCu, written by a scheduled event (first: it also answers ScrapeLock's
+// options from APCu where there is no object cache).
+PNCP_Defer::init();
+// 3.12.6: a verification file (/builtwith.txt, /google….html…) is answered before every check of the plugin.
+PNCP_Verify_Files::maybe_serve();
+PNCP_Verify_Files::init();
+PNCP_Ip::init();
+PNCP_Log::init();
+PNCP_Frontend::init();
+PNCP_Rest::init();
+PNCP_Graphql::init();
+PNCP_Feed::init();
+PNCP_Bots::init();
+PNCP_Edge::init();
+PNCP_Bunny::init(); // 3.8: Bunny CDN logs and Edge Rules.
+PNCP_Origin::init();
+PNCP_Watermark::init();
+PNCP_Private_Urls::init();
+PNCP_Status::init();
+PNCP_Surge::init();
+PNCP_Human::init();
+PNCP_Geo::init();
+PNCP_Precheck::init();
+PNCP_Lockdown::init();
+PNCP_Seal::init();
+PNCP_Surface::init();
+// 3.8: both must run at plugin load (before plugins_loaded and init).
+PNCP_Stealth::init(); // Neutral asset addresses, REST prefix, sitemap (off by default).
+PNCP_Login::init(); // Failed sign-ins, generic errors, custom sign-in address.
+// 3.6: what only wp-admin, admin-ajax, scheduled events, WP-CLI or the REST API use is loaded there only.
+$pncp_backend = is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI );
+if ( $pncp_backend ) {
+	PNCP_Integrity::init();
+	PNCP_Health::init();
+	PNCP_Wizard::watch(); // 3.12.6: "For my site" notes the settings chosen against its proposals.
+	PNCP_Breaker_Status::init(); // 3.12.9: the circuit breaker's notice, "Resume counting" and hourly tidy-up.
+} else {
+	// The file check's hourly event is kept scheduled while the site is locked (PNCP_Integrity::ensure_cron()).
+	add_action(
+		'init',
+		static function () {
+			if ( PNCP_Lockdown::is_locked() ) {
+				PNCP_Integrity::ensure_cron();
+			}
+		}
+	);
+	// Site Health's tests also run through the REST API (wp-site-health/v1).
+	add_action( 'rest_api_init', array( 'PNCP_Health', 'init' ) );
+}
+unset( $pncp_backend );
+if ( function_exists( 'wp_register_ability' ) ) {
+	add_action( 'wp_abilities_api_categories_init', array( 'PNCP_Abilities', 'category' ) );
+	add_action( 'wp_abilities_api_init', array( 'PNCP_Abilities', 'register' ) );
+}
+// "Check a request": its admin-ajax action, and the admin bar entry for signed-in staff.
+add_action(
+	'init',
+	static function () {
+		if ( is_admin() || is_user_logged_in() ) {
+			PNCP_Tester::init();
+		}
+	},
+	0
+);
+PNCP_Mark::init();
+PNCP_Accounts::init();
+PNCP_Trace::init();
+// 3.7.
+PNCP_Reputation::init();
+PNCP_Crowdsec::init();
+PNCP_Ai_Referrals::init();
+// 3.8.
+PNCP_Attacks::init(); // Where bots and attackers hit the site.
+PNCP_Attack_Report::init(); // The Attacks tab, the weekly email and the dashboard widget.
+PNCP_Hardening::init(); // Vulnerable points.
+PNCP_Plugin_Bots::init(); // 3.10: the service bots of active plugins (WP Rocket and others) are allowed.
+PNCP_Server_Ips::init(); // 3.11: the server's own addresses (the site's requests to itself through the CDN).
+PNCP_Self_Check::init(); // 3.12.2: diagnostics of the site's requests to itself, the way straight to the server.
+PNCP_Bot_Match::init(); // 3.11: the Log names the bot list entry that matched, "Allow this service".
+PNCP_Ai_Search_List::init(); // 3.11: "Remove from the list" for allowed AI search bots still in the bot list.
+PNCP_Site_Files::init(); // 3.10.1: apple-touch-icon.png and OneSignalSDKWorker.js in Site Health, Wordfence's address check.
+PNCP_Fluent_Community::init(); // 3.11: FluentCommunity's portal in the content addresses, its members' REST reads off the REST limit.
+PNCP_Traffic::init(); // 3.12: every request from the CDN logs, the access log and WordPress (off until turned on).
+PNCP_Signin_Hint::init(); // 3.12.5: the cookie that tells the page's script the browser is signed in (screenshot blur).
+// 3.11: the translations shipped in languages/ (Greek). WordPress 6.7+ finds them through "Domain Path" on its own
+// (not for a network-activated plugin); 6.2 to 6.6 need this. A language pack in wp-content/languages/plugins/ is
+// still read first.
+add_action( 'init', 'pncp_load_textdomain', 0 );
+
+if ( defined( 'WP_CLI' ) && WP_CLI ) {
+	require_once PNCP_DIR . 'includes/class-pncp-cli.php';
+	PNCP_Cli::init();
+}
+
+/**
+ * Loads the plugin's own translations (languages/), after a language pack in wp-content/languages/plugins/.
+ *
+ * 3.12.13: what load_plugin_textdomain() did, without calling it. On every version the folder is given to
+ * WordPress's just-in-time loading, which reads a language pack first; WordPress 6.7+ does that itself from
+ * "Domain Path" for a plugin activated on the site, but not for one activated on the whole network. WordPress
+ * 6.2 to 6.6 also loaded the file at once, so here too: the language pack, else the plugin's own file.
+ */
+function pncp_load_textdomain() {
+	global $wp_textdomain_registry, $l10n;
+	$dir = PNCP_DIR . 'languages';
+	if ( $wp_textdomain_registry instanceof WP_Textdomain_Registry ) {
+		$wp_textdomain_registry->set_custom_path( 'scrapelock', $dir );
+	}
+	// If just-in-time loading was tried before (nothing found), it may try again.
+	if ( isset( $l10n['scrapelock'] ) && $l10n['scrapelock'] instanceof NOOP_Translations ) {
+		unset( $l10n['scrapelock'] );
+	}
+	if ( version_compare( (string) get_bloginfo( 'version' ), '6.7', '<' ) ) {
+		$locale = determine_locale();
+		$mofile = 'scrapelock-' . $locale . '.mo';
+		if ( ! load_textdomain( 'scrapelock', WP_LANG_DIR . '/plugins/' . $mofile, $locale ) ) {
+			load_textdomain( 'scrapelock', $dir . '/' . $mofile, $locale );
+		}
+	}
+}
+
+/**
+ * Activation: defaults (without touching existing settings), log table, cron.
+ *
+ * @param bool $network_wide Activation across the whole network (multisite).
+ */
+function pncp_activate( $network_wide = false ) {
+	if ( is_multisite() && $network_wide ) {
+		foreach ( get_sites(
+			array(
+				'fields' => 'ids',
+				'number' => 0,
+			)
+		) as $pncp_site_id ) {
+			switch_to_blog( $pncp_site_id );
+			pncp_upgrade();
+			restore_current_blog();
+		}
+		return;
+	}
+	pncp_upgrade();
+	PNCP_Stealth::plugin_activated(); // 3.8: re-tests Stealth in 30 s when it is on (it cannot test during activation).
+}
+register_activation_hook( PNCP_FILE, 'pncp_activate' );
+register_deactivation_hook( PNCP_FILE, 'pncp_deactivate' );
+
+/**
+ * Deactivation: cron jobs stop, the bot list is removed from WP Rocket and the cache is cleared.
+ * Settings, log and clean originals remain (they are removed only when the plugin is deleted).
+ * Network deactivation (multisite) cleans up every site, as network activation set up every site.
+ *
+ * @param bool $network_wide Deactivation across the whole network (multisite).
+ */
+function pncp_deactivate( $network_wide = false ) {
+	// 3.4.1: while Lockdown keeps the site locked, the deactivation is refused (the list of active plugins keeps
+	// ScrapeLock, see PNCP_Lockdown::keep_option()), but WordPress runs this hook before it tries to save that
+	// list, and WP-CLI does not stop at the rights wp-admin checks. Nothing is cleaned up then: the guard, the
+	// counters' copy, the early check, the pre-cache check and the scheduled events all stay, or the site could
+	// be opened afterwards by deleting the Lockdown data in the database.
+	if ( class_exists( 'PNCP_Lockdown' ) && PNCP_Lockdown::is_locked() ) {
+		return;
+	}
+	if ( is_multisite() && $network_wide ) {
+		foreach ( get_sites(
+			array(
+				'fields' => 'ids',
+				'number' => 0,
+			)
+		) as $pncp_site_id ) {
+			switch_to_blog( $pncp_site_id );
+			PNCP_Options::flush();
+			PNCP_Ip::reset();
+			pncp_deactivate_site();
+			restore_current_blog();
+		}
+		PNCP_Options::flush();
+	} else {
+		pncp_deactivate_site();
+	}
+	// Shared by all sites: the Lockdown guard keeps ScrapeLock active while locked, so it goes with the plugin.
+	PNCP_Seal::remove_guard();
+	remove_filter( 'rocket_cache_reject_ua', array( 'PNCP_Bots', 'rocket_reject_ua' ) );
+	// The early check goes away with the plugin. On multisite the file is shared: it stays (unless the plugin is
+	// deactivated for the whole network), and does nothing on sites where ScrapeLock is not active.
+	if ( ! is_multisite() || $network_wide ) {
+		PNCP_Early::remove();
+	}
+	// The pre-cache check: its line in wp-config.php and its files go away with the plugin.
+	PNCP_Precheck::remove();
+}
+
+/**
+ * Deactivation of one site: its scheduled events, its blocks at the CDN, its uploads rule and its page cache.
+ */
+function pncp_deactivate_site() {
+	// wp_unschedule_hook() removes every event of a hook, whatever its arguments: some carry some (the missing
+	// IP lists, the image to clean up, the numbers in the surge email), which wp_clear_scheduled_hook() would
+	// only remove when given the same ones.
+	foreach ( array( PNCP_Ip::CRON, PNCP_Log::CRON, PNCP_Log::CRON . '_more', PNCP_Integrity::OFFICIAL, PNCP_Integrity::RESUME, PNCP_Surge::MAIL, PNCP_Surge::MAIL_ALERT, PNCP_Defer::CRON, PNCP_Watermark::CRON_UNMARK, 'pncp_background_purge', 'pncp_upgrade_files', PNCP_Crowdsec::CRON, PNCP_Bunny::CRON, 'pncp_attack_report_weekly', PNCP_Traffic::CRON ) as $pncp_hook ) {
+		wp_unschedule_hook( $pncp_hook );
+	}
+	// The blocks ScrapeLock made at the CDN go away with it (the bans themselves end with the plugin).
+	PNCP_Edge::remove_all();
+	PNCP_Bunny::deactivate(); // 3.8: ScrapeLock's Edge Rules at Bunny (15 s at most) and the cron event.
+	PNCP_Rules::sync_uploads_htaccess( false );
+	// 3.8: the "ScrapeLock Hardening" and Stealth blocks of the site's .htaccess, Stealth's events and rules.
+	PNCP_Hardening::deactivate();
+	PNCP_Stealth::plugin_deactivated();
+	PNCP_Attack_Report::deactivate();
+	// 3.12.2: the way straight to the server for the site's requests to itself (asked again after a reactivation).
+	delete_transient( PNCP_Self_Check::ROUTE );
+	// 3.12.6: the verification files are temporary: without the plugin nothing would remove them on time (a copy
+	// in the root folder would stay served for good), so they go now, with their event.
+	PNCP_Verify_Files::remove_all();
+	pncp_purge_page_cache();
+}
+
+/**
+ * Installation and upgrade. Runs on activation and once after every new zip
+ * (the activation hook does not run when the plugin is replaced).
+ */
+function pncp_upgrade() {
+	$from   = (string) get_option( 'pncp_version', '' );
+	$stored = get_option( PNCP_OPTION );
+	// The version option is missing but the settings exist (a database cleanup, a partial migration, a staging
+	// copy that imported only the settings): 1.x is told apart by the shape of its settings, never by the missing
+	// version alone. Otherwise the 1.x migration would turn "trust every proxy" back on (IP spoofing).
+	$from_settings = $from;
+	if ( '' === $from && is_array( $stored ) && ! pncp_settings_look_1x( $stored ) ) {
+		$from_settings = '2.0.0'; // Only fills in missing settings, with the new protections off.
+	}
+
+	if ( ! is_array( $stored ) ) {
+		// A new install starts in "Monitor only" for its first week (3.4): it logs what it would block and
+		// blocks nothing, then starts blocking on its own. Existing sites never get it (their settings exist).
+		add_option( PNCP_OPTION, array_merge( PNCP_Options::defaults(), PNCP_Options::new_install() ) );
+	} elseif ( '' === $from_settings || version_compare( $from_settings, '2.0.0', '<' ) ) {
+		update_option( PNCP_OPTION, pncp_migrate_from_1x( $stored ), true );
+	} else {
+		// 2.4 and later: the new protections stay off on existing sites (the defaults are for new installs).
+		$added = array();
+		if ( version_compare( $from_settings, '2.4.0', '<' ) ) {
+			$added += PNCP_Options::new_in_240();
+		}
+		if ( version_compare( $from_settings, '2.5.0', '<' ) ) {
+			$added += PNCP_Options::new_in_250();
+		}
+		if ( version_compare( $from_settings, '2.6.0', '<' ) ) {
+			$added += PNCP_Options::new_in_260();
+		}
+		if ( version_compare( $from_settings, '2.9.0', '<' ) ) {
+			$added += PNCP_Options::new_in_290();
+		}
+		if ( version_compare( $from_settings, '3.0.0', '<' ) ) {
+			$added += PNCP_Options::new_in_300();
+		}
+		// 3.8: the attack record, the sign-in protection and the rest of 3.8 (Stealth, Bunny logs, the weekly
+		// email stay off). Stored now, so an export or a settings list shows them.
+		if ( version_compare( $from_settings, '3.8.0', '<' ) ) {
+			$added += PNCP_Options::new_in_380();
+		}
+		// 3.9: "Send temporary blocks to the CDN" is a switch of its own. A site with a saved CDN connection kept
+		// sending them, as up to 3.8, and is told about the new switch once (PNCP_Edge::render_upgrade_notice()).
+		if ( version_compare( $from_settings, '3.9.0', '<' ) && ! isset( $stored['edge_send_blocks'] ) ) {
+			$added += PNCP_Options::new_in_390();
+			if ( ! empty( $added['edge_send_blocks'] ) ) {
+				update_option( PNCP_Edge::NOTICE, 1, false );
+			}
+		}
+		// 3.12: Traffic and its alerts, off (PNCP_Traffic, PNCP_Traffic_Alerts). Stored now, so an export or a
+		// settings list shows them.
+		if ( version_compare( $from_settings, '3.12.0', '<' ) ) {
+			$added += PNCP_Options::new_in_3120();
+		}
+		// 3.12.5: the screenshot blur keeps applying to everyone ("all"), as before. Stored now, so an export or a
+		// settings list shows it.
+		if ( version_compare( $from_settings, '3.12.5', '<' ) ) {
+			$added += PNCP_Options::new_in_3125();
+		}
+		// 3.12.6: "Block technology profilers" starts off, as on new installs. Stored now, so an export or a
+		// settings list shows it.
+		if ( version_compare( $from_settings, '3.12.6', '<' ) ) {
+			$added += PNCP_Options::new_in_3126();
+		}
+		// 3.13.0: "Hide the author archives too" and "refuse full-size originals without a Referer" start off on
+		// existing sites (new installs: install_values_31214()). Stored now, so an export or a settings list shows them.
+		if ( version_compare( $from_settings, '3.13.0', '<' ) ) {
+			$added += PNCP_Options::new_in_31214();
+		}
+		$added = array_diff_key( $added, $stored );
+		// 3.4: the automatic Emergency Mode only tells the administrator on new installs; a site that had it on
+		// keeps starting it on its own, as before.
+		if ( version_compare( $from_settings, '3.4.0', '<' ) && ! isset( $stored['auto_emergency_mode'] ) ) {
+			$added += array_diff_key( PNCP_Options::new_in_340( $stored ), $stored );
+		}
+		// 3.4: text selection is no longer blocked by default on new installs. Settings that somehow lack the key
+		// (a partial copy) keep the old default, so nothing changes on an existing site.
+		if ( version_compare( $from_settings, '3.4.0', '<' ) && ! isset( $stored['block_selection'] ) ) {
+			$added['block_selection'] = 1;
+		}
+		// 2.8.3: the HTTP libraries that passed the bot list are added to it. Your own entries stay; a list
+		// emptied on purpose stays empty.
+		if ( version_compare( $from_settings, '2.8.3', '<' ) && isset( $stored['bot_list'] ) ) {
+			$list = PNCP_Options::parse_list( (string) $stored['bot_list'] );
+			if ( $list ) {
+				$lower = array_map( 'strtolower', $list );
+				foreach ( PNCP_Options::new_bots_in_283() as $entry ) {
+					if ( ! in_array( strtolower( $entry ), $lower, true ) ) {
+						$list[] = $entry;
+					}
+				}
+				$added['bot_list'] = implode( "\n", array_slice( $list, 0, 200 ) );
+			}
+		}
+		if ( $added ) {
+			update_option( PNCP_OPTION, array_merge( $stored, $added ), true );
+		}
+	}
+
+	// 3.3.2: the default visitor message was stored already translated (or in English, when the install ran before
+	// translations were loaded): stored as "default" now, so it is shown in the site's language.
+	if ( '' !== $from && version_compare( $from, '3.3.2', '<' ) ) {
+		$current = get_option( PNCP_OPTION );
+		if ( is_array( $current ) && isset( $current['message'] ) && 'The content of this page is protected.' === trim( (string) $current['message'] ) ) {
+			// English only: translations are not loaded yet here (plugins_loaded). A translated default that was
+			// stored is replaced the next time the settings are saved (PNCP_Options::sanitize()).
+			$current['message'] = '';
+			update_option( PNCP_OPTION, $current, true );
+		}
+	}
+
+	// Up to 2.2.0 the 1.x token was kept in plain form until the admin saw it: it is deleted.
+	if ( false !== get_option( 'pncp_legacy_token_notice', false ) ) {
+		delete_option( 'pncp_legacy_token_notice' );
+		update_option( 'pncp_legacy_token_migrated', 1, false );
+	}
+
+	PNCP_Log::install();
+	PNCP_Traffic::maybe_install(); // 3.12: the Traffic tables, only where collection is on (or an older schema is stored).
+	// 3.10: rows that counted /llms.txt, /.well-known/* and other site-metadata files as scanner probes (once).
+	PNCP_Attacks::purge_site_metadata();
+	// 3.10: the Vulnerable points live results cached by 3.9 read the first answer of the home page (often a
+	// redirect): checked again with the public home page at the next visit of the tab.
+	if ( '' !== $from && version_compare( $from, '3.10.0', '<' ) ) {
+		delete_transient( PNCP_Hardening::LIVE );
+	}
+	// 3.11: with "Allow AI search" on, its bots are removed from the stored bot list (once; a saved version is kept
+	// under "Earlier versions"). The training crawlers stay; sites with the option off keep their list.
+	if ( '' !== $from && version_compare( $from, '3.11.0', '<' ) ) {
+		PNCP_Ai_Search_List::migrate_311();
+	}
+	// Autoload: read on every request, without a separate query.
+	add_option( PNCP_Options::EMERGENCY_OPTION, 0, '', true );
+	// 3.8: the state of the vulnerable points is read on every request; a missing option would be a query each time.
+	add_option(
+		PNCP_Hardening::OPTION,
+		array(
+			'points'         => array(),
+			'edge'           => array(),
+			'xmlrpc_jetpack' => 0,
+			'htaccess'       => 0,
+		),
+		'',
+		true
+	);
+	if ( ! wp_next_scheduled( PNCP_Ip::CRON ) ) {
+		wp_schedule_event( time() + 60, 'daily', PNCP_Ip::CRON );
+	}
+	// Hourly (since 2.2): deletes expired log entries, blocks and counters.
+	$event = function_exists( 'wp_get_scheduled_event' ) ? wp_get_scheduled_event( PNCP_Log::CRON ) : false;
+	if ( $event && 'hourly' !== $event->schedule ) {
+		wp_clear_scheduled_hook( PNCP_Log::CRON );
+	}
+	if ( ! wp_next_scheduled( PNCP_Log::CRON ) ) {
+		wp_schedule_event( time() + 5 * MINUTE_IN_SECONDS, 'hourly', PNCP_Log::CRON );
+	}
+	// 3.3: Lockdown data stored before signatures existed is signed now (while pncp_version still says older).
+	if ( '' !== $from && version_compare( $from, '3.3.0', '<' ) ) {
+		PNCP_Lockdown::upgrade_seal( $from );
+	}
+	// 3.4: Lockdown data signed by 3.3 gets generations (in the guard file too), so an older copy of it put back
+	// in the database is no longer accepted. Only genuine data; nothing that was changed is signed.
+	if ( '' !== $from && version_compare( $from, '3.4.0', '<' ) ) {
+		PNCP_Lockdown::upgrade_generation();
+	}
+	// 3.4: the removal queue of the CDN blocks no longer holds a copy of a token set in wp-config.php; blocks a
+	// deactivation could not remove in time are removed now.
+	PNCP_Edge::resume();
+	// 3.4: the country database state is autoloaded, and a database left behind while "Download the country
+	// database" is off is deleted (it used to be used anyway, and never refreshed).
+	PNCP_Geo::upgrade();
+	// 3.6.1: options that are read rarely but were autoloaded (or that older versions stored autoloaded) are not.
+	pncp_upgrade_autoload();
+	// 3.13.0: server addresses learned from the old self-signature (X-ScrapeLock-Self, replayable) are checked
+	// again once (PNCP_Server_Ips::purge_legacy()).
+	PNCP_Server_Ips::purge_legacy();
+	update_option( 'pncp_version', PNCP_VERSION, true ); // Autoloaded: read on every request by pncp_maybe_upgrade().
+	PNCP_Options::flush();
+	// The rest touches files (mu-plugins, wp-config.php, uploads/.htaccess), downloads lists and empties the
+	// page cache. On activation, in wp-admin, from cron or WP-CLI it runs now. After an update it would
+	// otherwise run inside the first request that arrives, usually a visitor or a bot, where a slow or failed
+	// step would go unseen: there it is handed to a background request, and to the next wp-admin page load
+	// in case that does not run.
+	if ( is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+		pncp_upgrade_files();
+		return;
+	}
+	update_option( 'pncp_upgrade_files', 1, false );
+	if ( ! wp_next_scheduled( 'pncp_upgrade_files' ) ) {
+		wp_schedule_single_event( time(), 'pncp_upgrade_files' );
+	}
+	if ( did_action( 'init' ) ) {
+		pncp_spawn_cron();
+	} else {
+		add_action( 'init', 'pncp_spawn_cron', 99 );
+	}
+}
+
+/**
+ * 3.6.1: autoload hygiene, once per upgrade. Every autoloaded option is read (and, with a persistent object
+ * cache, kept in the one "alloptions" entry) on every request; an option that changes often also rewrites that
+ * entry each time. Only what is needed on (nearly) every request stays autoloaded: the settings, the version
+ * numbers, Emergency Mode, the latest ban expiry, the CDN address lists and the data center index.
+ *
+ * - The surge state is written once a minute and read once a minute: not autoloaded (PNCP_Surge::save()).
+ * - The downloaded crawler, AI and data center lists, their dates and the data center groups are written with
+ *   autoload off, but WordPress changes the autoload flag of an existing option only when its value changes:
+ *   a list stored autoloaded by an older version, that has not changed since, stayed autoloaded.
+ * - The one-option copy of the lists of very old versions ("pncp_ip_lists") is read by nothing: deleted.
+ *
+ * Needs WordPress 6.4 (wp_set_options_autoload()); on older versions the flags change with the next write.
+ */
+function pncp_upgrade_autoload() {
+	if ( false !== get_option( PNCP_Ip::LISTS_OPTION, false ) ) {
+		delete_option( PNCP_Ip::LISTS_OPTION );
+	}
+	if ( ! function_exists( 'wp_set_options_autoload' ) ) {
+		return;
+	}
+	$off = array( PNCP_Surge::STATE, PNCP_Ip::LISTS_OPTION . '_updated' );
+	foreach ( array_keys( PNCP_Ip::sources() ) as $name ) {
+		if ( ! in_array( $name, array( 'cloudflare', 'bunny' ), true ) ) {
+			$off[] = PNCP_Ip::LISTS_OPTION . '_' . $name;
+		}
+	}
+	$groups = get_option( 'pncp_dc_groups', array() );
+	if ( is_array( $groups ) ) {
+		foreach ( isset( $groups[0] ) ? $groups : array_keys( $groups ) as $group ) {
+			if ( is_string( $group ) && 0 === strpos( $group, 'pncp_dc_' ) ) {
+				$off[] = $group;
+			}
+		}
+	}
+	// Only the options that exist are changed (wp_set_options_autoload() leaves out the others).
+	wp_set_options_autoload( $off, false );
+}
+
+/**
+ * 3.4.3: starts due scheduled events in a background request (a loopback to wp-cron.php, or the redirect of
+ * ALTERNATE_WP_CRON), as WordPress does on each request, and like WordPress not where DISABLE_WP_CRON is set:
+ * there the owner's real cron runs them. spawn_cron() itself runs every due event, not only ours.
+ */
+function pncp_spawn_cron() {
+	if ( ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) || ! function_exists( 'spawn_cron' ) ) {
+		return;
+	}
+	spawn_cron();
+}
+
+/**
+ * The file and network part of the upgrade: the early check (mu-plugin), the pre-cache check, the uploads rule,
+ * lists that are new in this version, and the page cache.
+ */
+function pncp_upgrade_files() {
+	delete_option( 'pncp_upgrade_files' );
+	PNCP_Options::flush();
+	// The early check (mu-plugin): written again if the plugin folder changed, removed if it is off.
+	PNCP_Early::sync();
+	// The pre-cache check: the loader is written again (new version, new plugin folder) or removed.
+	PNCP_Precheck::sync();
+	PNCP_Rules::sync_uploads_htaccess();
+	// 3.4.1: the 3.4.0 copy of the wrong-code counters (a .json file the web server shows) is moved now, and a
+	// site locked without the guard file gets the signed lock file (PNCP_Lockdown::maintain_files()).
+	PNCP_Lockdown::maintain_files();
+	// A list that is new in this version (e.g. Anthropic in 2.6.2) is downloaded now, not with the daily refresh.
+	PNCP_Ip::forget_missing_try();
+	PNCP_Ip::fetch_missing();
+	// 3.12.8: an update can change the Stealth rules with the same address map (the rules for sibling folders):
+	// where ScrapeLock wrote them into .htaccess they are written and tested again; on Nginx a map waiting for
+	// its rules is taken up once the server serves them (PNCP_Stealth::refresh()).
+	if ( class_exists( 'PNCP_Stealth' ) ) {
+		PNCP_Stealth::schedule_refresh();
+	}
+	// Cache plugins (e.g. LiteSpeed, WP Rocket) finish loading later: before init the purge waits for init.
+	pncp_purge_page_cache();
+}
+add_action( 'pncp_upgrade_files', 'pncp_upgrade_files' );
+
+/**
+ * The file part of an upgrade that started on the front end and has not run yet: on the next wp-admin page.
+ */
+function pncp_upgrade_files_pending() {
+	if ( get_option( 'pncp_upgrade_files' ) ) {
+		pncp_upgrade_files();
+	}
+}
+add_action( 'admin_init', 'pncp_upgrade_files_pending', 1 );
+
+/**
+ * Do stored settings come from 1.x? 1.x kept the feed token in plain form and had no proxy settings, which
+ * every later version stores.
+ *
+ * @param array<string, mixed> $stored Stored settings.
+ * @return bool
+ */
+function pncp_settings_look_1x( $stored ) {
+	return ! empty( $stored['private_token'] ) || ( ! array_key_exists( 'trusted_proxies', $stored ) && ! array_key_exists( 'trust_any_proxy', $stored ) );
+}
+
+/**
+ * Settings from 1.x to 2.x.
+ *
+ * - New fields get their defaults (the new protections are enabled).
+ * - The bot list: if it was the 1.4 default, it becomes the new one; if you had changed it, your
+ *   changes are kept and only the new bots are added.
+ * - The feeds token was stored in plain form: it is hashed and stays valid, but it is not
+ *   stored or shown again. The admin is told to create a new one if they have not kept it.
+ * - Real-IP header without Cloudflare: keeps the 1.4 behaviour (trust every proxy)
+ *   until the proxies are set, so the page limit does not break. With a warning.
+ *
+ * @param array<string, mixed> $old Settings of 1.x.
+ * @return array<string, mixed>
+ */
+function pncp_migrate_from_1x( $old ) {
+	// The 2.4, 2.5, 2.6, 2.9 and 3.0 additions stay off, as on every existing site; 3.4 keeps the old defaults.
+	$new = array_merge( PNCP_Options::defaults(), PNCP_Options::new_in_240(), PNCP_Options::new_in_250(), PNCP_Options::new_in_260(), PNCP_Options::new_in_290(), PNCP_Options::new_in_300(), PNCP_Options::new_in_340( $old ), $old );
+
+	$list   = isset( $old['bot_list'] ) ? PNCP_Options::parse_list( (string) $old['bot_list'] ) : array();
+	$legacy = array_map( 'strtolower', PNCP_Options::legacy_bot_list() );
+	$lower  = array_map( 'strtolower', $list );
+	sort( $legacy );
+	sort( $lower );
+	if ( isset( $old['bot_list'] ) && ! $list ) {
+		$new['bot_list'] = ''; // You had emptied it on purpose: it stays empty.
+	} elseif ( ! $list || $lower === $legacy ) {
+		// The 1.4 default blocked curl, Wget and the Python / Go libraries: since 3.4 they are no longer in the
+		// default list, so they are kept here (with the rest of the libraries, as every 2.x/3.x site has them)
+		// and nothing that was blocked before starts passing.
+		$new['bot_list'] = implode( "\n", array_slice( PNCP_Options::parse_list( implode( "\n", array_merge( PNCP_Options::default_bot_entries(), PNCP_Options::http_library_agents() ) ) ), 0, 200 ) );
+	} else {
+		foreach ( PNCP_Options::default_bot_entries() as $entry ) {
+			if ( ! in_array( strtolower( $entry ), array_map( 'strtolower', $list ), true ) && ! in_array( strtolower( $entry ), $legacy, true ) ) {
+				$list[] = $entry;
+			}
+		}
+		$new['bot_list'] = implode( "\n", array_slice( $list, 0, 200 ) );
+	}
+
+	if ( ! empty( $old['private_token'] ) ) {
+		PNCP_Private_Urls::import_plain( (string) $old['private_token'] );
+		// Only a flag, never the token itself: no plain copy is kept, not even temporarily.
+		if ( '' !== trim( (string) ( isset( $old['private_paths'] ) ? $old['private_paths'] : '' ) ) ) {
+			update_option( 'pncp_legacy_token_migrated', 1, false );
+		}
+	}
+	unset( $new['private_token'] );
+
+	$header = isset( $old['ip_header'] ) ? (string) $old['ip_header'] : 'remote_addr';
+	if ( ! in_array( $header, array( 'remote_addr', 'cf_connecting_ip' ), true ) ) {
+		$new['trust_any_proxy'] = 1;
+	}
+
+	return $new;
+}
+
+/**
+ * After a plugin update (new zip or auto-update) the upgrade runs once, on the first
+ * request, before any check: not on the first admin visit, because until then half the settings would apply.
+ */
+function pncp_maybe_upgrade() {
+	if ( get_option( 'pncp_version' ) === PNCP_VERSION ) {
+		return;
+	}
+	// One request runs the upgrade; concurrent ones do not rerun it (60 s lock; the version is read again once the lock is won).
+	$lock = (int) get_option( 'pncp_upgrade_lock', 0 );
+	if ( $lock > time() - MINUTE_IN_SECONDS ) {
+		return;
+	}
+	$mine = pncp_upgrade_lock();
+	if ( false === $mine ) {
+		return;
+	}
+	// This request's autoloaded options may predate another request's finished upgrade: read the version again.
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- The value as it is now in the database, not the cached one.
+	if ( PNCP_VERSION === $wpdb->get_var( $wpdb->prepare( 'SELECT option_value FROM %i WHERE option_name = %s', $wpdb->options, 'pncp_version' ) ) ) {
+		pncp_upgrade_unlock( $mine );
+		wp_cache_delete( 'alloptions', 'options' );
+		return;
+	}
+	pncp_upgrade();
+	pncp_upgrade_unlock( $mine );
+}
+
+/**
+ * 3.6.1: takes the upgrade lock in one atomic step. Before, a stale lock (an upgrade that died holding it) was
+ * deleted and added again: two requests that both read it stale could each delete the other's new lock and both
+ * win add_option() (which WordPress writes with ON DUPLICATE KEY UPDATE, so it is no lock either), and both ran
+ * the upgrade. Now the row is created with INSERT IGNORE, and taken with one compare-and-set UPDATE (as
+ * PNCP_Edge::lock()): of any number of requests, only one changes it.
+ *
+ * @return string|false The value written (to release it with), or false when another request holds the lock.
+ */
+function pncp_upgrade_lock() {
+	global $wpdb;
+	$now   = time();
+	$value = (string) $now;
+	$suppress = $wpdb->suppress_errors( true );
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Creates the lock row if missing; never overwrites one.
+	$made = $wpdb->query( $wpdb->prepare( "INSERT IGNORE INTO %i (option_name, option_value, autoload) VALUES ('pncp_upgrade_lock', '0', 'off')", $wpdb->options ) );
+	$wpdb->suppress_errors( $suppress );
+	if ( false === $made ) {
+		// A database without INSERT IGNORE (e.g. SQLite): the lock as before.
+		delete_option( 'pncp_upgrade_lock' );
+		return add_option( 'pncp_upgrade_lock', $value, '', false ) ? $value : false;
+	}
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Atomic compare-and-set on our own row.
+	$rows = $wpdb->query( $wpdb->prepare( "UPDATE %i SET option_value = %s WHERE option_name = 'pncp_upgrade_lock' AND option_value + 0 < %d", $wpdb->options, $value, $now - MINUTE_IN_SECONDS ) );
+	wp_cache_delete( 'pncp_upgrade_lock', 'options' );
+	wp_cache_delete( 'notoptions', 'options' );
+	return 1 === (int) $rows ? $value : false;
+}
+
+/**
+ * 3.6.1: releases the upgrade lock, if this request still holds it.
+ *
+ * @param string $value The value pncp_upgrade_lock() wrote.
+ */
+function pncp_upgrade_unlock( $value ) {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Releases our own lock only.
+	$wpdb->query( $wpdb->prepare( "UPDATE %i SET option_value = '0' WHERE option_name = 'pncp_upgrade_lock' AND option_value = %s", $wpdb->options, (string) $value ) );
+	wp_cache_delete( 'pncp_upgrade_lock', 'options' );
+}
+add_action( 'plugins_loaded', 'pncp_maybe_upgrade', -100 );
+
+/**
+ * Clears the page cache so visitors see the new settings immediately.
+ * Covers WP Rocket, WP Super Cache, W3 Total Cache, LiteSpeed Cache, Cache Enabler, WP Fastest Cache, SiteGround Optimizer,
+ * Nginx Helper (FastCGI cache) and the Cloudflare plugin, whichever are present, and (3.12.7) the Nginx fastcgi
+ * cache folder itself when it is known (PNCP_Fastcgi_Cache::purge_known()).
+ * 3.12.8: the cache plugins first (pncp_purge_plugin_caches()), then the fastcgi folder, then the Cloudflare plugin,
+ * so a cache further out never stores a page again from a cache that still held the old one. Returns what ran.
+ *
+ * @return array<int, array{name:string, kind:string, status:string}> One row per cache (see
+ *         pncp_purge_plugin_caches()); empty when the purge waits for init.
+ */
+function pncp_purge_page_cache() {
+	// Before init (the upgrade runs on plugins_loaded) the cache plugins have not finished loading: WP Rocket
+	// crashed when asked to rebuild its config that early. The purge then runs once, on init.
+	if ( ! did_action( 'init' ) ) {
+		if ( ! has_action( 'init', 'pncp_purge_page_cache' ) ) {
+			add_action( 'init', 'pncp_purge_page_cache', 99 );
+		}
+		return array();
+	}
+	// WP Rocket rewrites its config so the bot list takes effect (rocket_cache_reject_ua).
+	if ( function_exists( 'rocket_generate_config_file' ) ) {
+		rocket_generate_config_file();
+	}
+	if ( function_exists( 'flush_rocket_htaccess' ) ) {
+		flush_rocket_htaccess();
+	}
+	$rows = pncp_purge_plugin_caches();
+	// 3.12.7: this site's pages in the Nginx fastcgi cache, when its folder is known (SCRAPELOCK_FASTCGI_CACHE_PATH
+	// or Nginx Helper's): Nginx Helper's own purge above does nothing when its method or folder is not the server's.
+	if ( class_exists( 'PNCP_Fastcgi_Cache' ) ) {
+		$rows[] = array(
+			'name'   => 'Nginx fastcgi cache',
+			'kind'   => 'page',
+			'status' => PNCP_Fastcgi_Cache::purge_known() ? 'cleaned' : 'inactive',
+		);
+	}
+	// Cloudflare plugin: purges the edge cache when its APO or HTML caching is on (otherwise it does nothing).
+	if ( isset( $GLOBALS['cloudflareHooks'] ) && is_object( $GLOBALS['cloudflareHooks'] ) && method_exists( $GLOBALS['cloudflareHooks'], 'purgeCacheEverything' ) ) {
+		$status = 'cleaned';
+		try {
+			$GLOBALS['cloudflareHooks']->purgeCacheEverything();
+		} catch ( Throwable $e ) {
+			unset( $e ); // A Cloudflare API error must not break saving the settings.
+			$status = 'failed';
+		}
+		$rows[] = array(
+			'name'   => 'Cloudflare plugin',
+			'kind'   => 'page',
+			'status' => $status,
+		);
+	}
+	return $rows;
+}
+
+/**
+ * 3.12.8: the WordPress cache plugins pncp_purge_plugin_caches() knows, and whether each is active here (its
+ * functions or hooks exist: they do once the plugins are loaded, as in WP-CLI).
+ *
+ * @return array<string, bool> Name => active.
+ */
+function pncp_cache_plugins() {
+	// phpcs:disable WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Hooks of other plugins.
+	return array(
+		'WP Rocket'            => function_exists( 'rocket_clean_domain' ),
+		'LiteSpeed Cache'      => (bool) has_action( 'litespeed_purge_all' ) || (bool) has_action( 'litespeed_purge_url' ),
+		'W3 Total Cache'       => function_exists( 'w3tc_flush_all' ) || function_exists( 'w3tc_flush_url' ),
+		'WP Super Cache'       => function_exists( 'wp_cache_clear_cache' ),
+		'WP Fastest Cache'     => function_exists( 'wpfc_clear_all_cache' ),
+		'Nginx Helper'         => (bool) has_action( 'rt_nginx_helper_purge_all' ) || ( isset( $GLOBALS['nginx_purger'] ) && is_object( $GLOBALS['nginx_purger'] ) ),
+		'Cache Enabler'        => (bool) has_action( 'cache_enabler_clear_complete_cache' ) || (bool) has_action( 'cache_enabler_clear_page_cache_by_url' ),
+		'SiteGround Optimizer' => function_exists( 'sg_cachepress_purge_cache' ),
+	);
+	// phpcs:enable
+}
+
+/**
+ * 3.12.8: empties the page caches of the WordPress cache plugins that are active (pncp_cache_plugins()), and
+ * says which. Used by pncp_purge_page_cache() and by "wp scrapelock cdn purge" (which empties these first, then
+ * the fastcgi cache, then the CDN). Each plugin's own functions and hooks, only when they exist.
+ *
+ * WP Rocket's minified and combined CSS / JS (wp-content/cache/min, and its cache-busting copies) are kept unless
+ * $minify: rebuilding them costs every first visit, and the pages that are not rebuilt still link them. With
+ * $minify they go first, then the pages (as WP Rocket's own "Clear cache" does), and Autoptimize's cache too.
+ *
+ * @param string[]|null $urls   Full addresses of this site, or null for every page.
+ * @param bool          $minify Also the minified CSS / JS files (only with $urls null).
+ * @return array<int, array{name:string, kind:string, status:string}> kind: page or minify. status: cleaned,
+ *         inactive (not installed or not active), skipped (it cannot empty single addresses), kept (no $minify).
+ */
+function pncp_purge_plugin_caches( $urls = null, $minify = false ) {
+	$all    = null === $urls;
+	$urls   = $all ? array() : array_values( array_map( 'strval', (array) $urls ) );
+	$active = pncp_cache_plugins();
+	$rows   = array();
+	$add    = static function ( $name, $status, $kind = 'page' ) use ( &$rows ) {
+		$rows[] = array(
+			'name'   => $name,
+			'kind'   => $kind,
+			'status' => $status,
+		);
+	};
+	// phpcs:disable WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Hooks of other plugins.
+	foreach ( $active as $name => $on ) {
+		if ( ! $on ) {
+			$add( $name, 'inactive' );
+			continue;
+		}
+		$done = true;
+		switch ( $name ) {
+			case 'WP Rocket':
+				if ( $all && $minify && function_exists( 'rocket_clean_minify' ) ) {
+					rocket_clean_minify();
+					if ( function_exists( 'rocket_clean_cache_busting' ) ) {
+						rocket_clean_cache_busting();
+					}
+					$add( 'WP Rocket minified CSS/JS', 'cleaned', 'minify' );
+				}
+				if ( $all && function_exists( 'rocket_clean_domain' ) ) {
+					rocket_clean_domain();
+				} elseif ( function_exists( 'rocket_clean_files' ) ) {
+					rocket_clean_files( $urls );
+				} else {
+					$done = false;
+				}
+				break;
+			case 'LiteSpeed Cache':
+				if ( $all ) {
+					do_action( 'litespeed_purge_all' );
+				} elseif ( has_action( 'litespeed_purge_url' ) ) {
+					foreach ( $urls as $url ) {
+						do_action( 'litespeed_purge_url', $url );
+					}
+				} else {
+					$done = false;
+				}
+				break;
+			case 'W3 Total Cache':
+				if ( $all && function_exists( 'w3tc_flush_all' ) ) {
+					w3tc_flush_all();
+				} elseif ( ! $all && function_exists( 'w3tc_flush_url' ) ) {
+					foreach ( $urls as $url ) {
+						w3tc_flush_url( $url );
+					}
+				} else {
+					$done = false;
+				}
+				break;
+			case 'WP Super Cache':
+				if ( $all && function_exists( 'wp_cache_clear_cache' ) ) {
+					wp_cache_clear_cache( is_multisite() ? get_current_blog_id() : 0 ); // On multisite, only this site.
+				} elseif ( function_exists( 'wpsc_delete_url_cache' ) ) {
+					foreach ( $urls as $url ) {
+						wpsc_delete_url_cache( $url );
+					}
+				} else {
+					$done = false;
+				}
+				break;
+			case 'WP Fastest Cache':
+				if ( $all && function_exists( 'wpfc_clear_all_cache' ) ) {
+					wpfc_clear_all_cache( true );
+				} else {
+					$done = false;
+				}
+				break;
+			case 'Nginx Helper':
+				$purger = isset( $GLOBALS['nginx_purger'] ) && is_object( $GLOBALS['nginx_purger'] ) && method_exists( $GLOBALS['nginx_purger'], 'purge_url' ) ? $GLOBALS['nginx_purger'] : null;
+				if ( $all ) {
+					do_action( 'rt_nginx_helper_purge_all' );
+				} elseif ( $purger ) {
+					foreach ( $urls as $url ) {
+						$purger->purge_url( $url );
+					}
+				} else {
+					$done = false;
+				}
+				break;
+			case 'Cache Enabler':
+				if ( $all ) {
+					do_action( 'cache_enabler_clear_complete_cache' );
+				} elseif ( has_action( 'cache_enabler_clear_page_cache_by_url' ) ) {
+					foreach ( $urls as $url ) {
+						do_action( 'cache_enabler_clear_page_cache_by_url', $url );
+					}
+				} else {
+					$done = false;
+				}
+				break;
+			case 'SiteGround Optimizer':
+				if ( $all && function_exists( 'sg_cachepress_purge_cache' ) ) {
+					sg_cachepress_purge_cache();
+				} else {
+					$done = false;
+				}
+				break;
+		}
+		$add( $name, $done ? 'cleaned' : 'skipped' );
+		if ( 'WP Rocket' === $name && $all && ! $minify && function_exists( 'rocket_clean_minify' ) ) {
+			$add( 'WP Rocket minified CSS/JS', 'kept', 'minify' );
+		}
+	}
+	// phpcs:enable
+	// Autoptimize: its minified files only when asked (they are not a page cache).
+	if ( $all && $minify ) {
+		$ao = is_callable( array( 'autoptimizeCache', 'clearall' ) );
+		if ( $ao ) {
+			call_user_func( array( 'autoptimizeCache', 'clearall' ) );
+		}
+		$add( 'Autoptimize minified CSS/JS', $ao ? 'cleaned' : 'inactive', 'minify' );
+	}
+	return $rows;
+}
+
+/**
+ * After the settings are saved, the page cache is emptied only when a setting that cached pages depend on
+ * changed (PNCP_Options::cache_keys(), e.g. "Block text selection", the bot list, the feeds). Saving the log
+ * retention, a country list or the watermark opacity leaves the cache, and Cloudflare's, alone: emptying it
+ * sends every visitor to PHP and the database until it fills again.
+ *
+ * @param mixed $old_value Settings before.
+ * @param mixed $value     Settings after.
+ */
+function pncp_settings_purge( $old_value, $value ) {
+	if ( PNCP_Options::cache_keys_changed( is_array( $old_value ) ? $old_value : array(), is_array( $value ) ? $value : array() ) ) {
+		pncp_purge_page_cache();
+	}
+}
+add_action( 'update_option_' . PNCP_OPTION, 'pncp_settings_purge', 10, 2 );
+
+/**
+ * Empties the page cache in a background request (a scheduled event started right away with a loopback to
+ * wp-cron.php that this request does not wait for), e.g. after Emergency Mode starts or ends. Several calls
+ * before it runs empty the cache once.
+ * 3.4.3: where DISABLE_WP_CRON is set it is only scheduled, and runs with the site's real cron.
+ */
+function pncp_schedule_purge() {
+	if ( ! wp_next_scheduled( 'pncp_background_purge' ) ) {
+		wp_schedule_single_event( time(), 'pncp_background_purge' );
+	}
+	pncp_spawn_cron(); // 3.4.3: not where DISABLE_WP_CRON is set.
+}
+add_action( 'pncp_background_purge', 'pncp_purge_page_cache' );
+
+/**
+ * After a settings change the per-request caches are forgotten.
+ */
+function pncp_settings_changed() {
+	PNCP_Options::flush();
+	PNCP_Ip::reset();
+	PNCP_Watermark::reset();
+	// New watermark settings: the image tool starts over.
+	delete_option( 'pncp_wm_cursor_apply' );
+	delete_option( 'pncp_wm_cursor_remove' );
+}
+add_action( 'update_option_' . PNCP_OPTION, 'pncp_settings_changed', 0 );
+add_action( 'update_option_' . PNCP_OPTION, array( 'PNCP_Early', 'sync' ) );
+add_action( 'update_option_' . PNCP_OPTION, array( 'PNCP_Precheck', 'sync' ) );
+add_action( 'update_option_' . PNCP_OPTION, array( 'PNCP_Rules', 'settings_saved' ) );
+// 3.12.3: a setting that changes the server rules marks the installed ones out of date at once.
+add_action( 'update_option_' . PNCP_OPTION, array( 'PNCP_Rules_State', 'settings_changed' ), 20 );
+// The first-week "Monitor only" of a new install ends on its own: hourly, and on the next wp-admin page load.
+add_action( PNCP_Log::CRON, array( 'PNCP_Options', 'end_monitor_trial' ) );
+add_action( 'admin_init', array( 'PNCP_Options', 'end_monitor_trial' ) );
+// Settings are first read before the translations load: they are read again afterwards.
+add_action( 'after_setup_theme', array( 'PNCP_Options', 'flush' ), 0 );
+
+/**
+ * WP Rocket (Delay JS / Defer JS) must not delay the protection until the visitor's first
+ * interaction, otherwise the first right-click gets through.
+ *
+ * @param string[] $exclusions Patterns to exclude.
+ * @return string[]
+ */
+function pncp_rocket_delay_exclusions( $exclusions ) {
+	$exclusions   = (array) $exclusions;
+	$exclusions[] = dirname( plugin_basename( PNCP_FILE ) ) . '/assets/js/protect.js';
+	$exclusions[] = 'pncpConfig';
+	return $exclusions;
+}
+add_filter( 'rocket_delay_js_exclusions', 'pncp_rocket_delay_exclusions' );
+add_filter( 'rocket_exclude_defer_js', 'pncp_rocket_delay_exclusions' );
+add_filter( 'rocket_exclude_js', 'pncp_rocket_delay_exclusions' );

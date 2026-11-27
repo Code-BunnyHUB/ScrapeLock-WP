@@ -1,0 +1,524 @@
+<?php
+/**
+ * Frontend: decides whether the current page is protected, loads JS/CSS before any other script,
+ * sends the anti-iframe headers and the AI-training opt-out declaration (TDM).
+ *
+ * @package ScrapeLock
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Protection on the public site.
+ */
+final class PNCP_Frontend {
+
+	/**
+	 * Cache of the decision for the current request.
+	 *
+	 * @var bool|null
+	 */
+	private static $protect = null;
+
+	/**
+	 * Registers the hooks.
+	 */
+	public static function init() {
+		add_action( 'wp_enqueue_scripts', array( __CLASS__, 'register' ), 0 );
+		// Right after wp_enqueue_scripts (priority 1) and before the other scripts are printed (priority 9).
+		add_action( 'wp_head', array( __CLASS__, 'print_early' ), 2 );
+		add_action( 'wp_head', array( __CLASS__, 'tdm_meta' ), 1 );
+		add_filter( 'body_class', array( __CLASS__, 'body_class' ) );
+		add_action( 'template_redirect', array( __CLASS__, 'send_headers' ), 1 );
+		add_filter( 'wp_robots', array( __CLASS__, 'robots_meta' ) );
+		add_filter( 'wp_script_attributes', array( __CLASS__, 'script_attributes' ) );
+		add_filter( 'wp_inline_script_attributes', array( __CLASS__, 'script_attributes' ) );
+		add_action( 'init', array( __CLASS__, 'tdmrep_json' ), 1 );
+		add_filter( 'do_parse_request', array( __CLASS__, 'drop_array_vars' ), 1 );
+		add_filter( 'request', array( __CLASS__, 'scalar_query_vars' ), 1 );
+	}
+
+	/**
+	 * 3.4.3: a single-value query variable sent as an array was found in this request.
+	 *
+	 * @var bool
+	 */
+	private static $array_vars = false;
+
+	/**
+	 * 3.4.3: before WordPress reads the request (some of its own steps there, e.g. for ?year[]=1, already stop
+	 * with a fatal error), the single-value query variables sent as arrays are taken out of it. The request
+	 * then gets "not found" (scalar_query_vars()).
+	 *
+	 * @param bool $parse Whether WordPress parses the request (passed on unchanged).
+	 * @return bool
+	 */
+	public static function drop_array_vars( $parse ) {
+		// phpcs:disable WordPress.Security.NonceVerification -- Only removes malformed values, reads nothing.
+		foreach ( self::SCALAR_VARS as $key ) {
+			if ( ( isset( $_GET[ $key ] ) && ! is_scalar( $_GET[ $key ] ) ) || ( isset( $_POST[ $key ] ) && ! is_scalar( $_POST[ $key ] ) ) ) {
+				unset( $_GET[ $key ], $_POST[ $key ], $_REQUEST[ $key ] );
+				self::$array_vars = true;
+			}
+		}
+		// phpcs:enable
+		return $parse;
+	}
+
+	/**
+	 * 3.4.3: the public query variables WordPress reads as a single value. Given as an array (?feed[]=x,
+	 * ?year[]=1, ?author_name[]=x), WordPress itself stops with a fatal error (a 500) in WP_Query: scanners
+	 * use that to fill the error log, and a cached 500 can reach visitors.
+	 *
+	 * @var string[]
+	 */
+	const SCALAR_VARS = array( 'feed', 'author_name', 'category_name', 'tag', 'year', 'monthnum', 'day', 'w', 'm', 'hour', 'minute', 'second', 'name', 'pagename', 'page_id', 'p', 'page', 'paged', 'cpage', 'attachment', 'attachment_id', 'subpost', 'subpost_id', 'static', 'embed', 'preview', 'sentence', 'exact', 'error', 'withcomments', 'withoutcomments', 'more', 'rest_route', 'robots', 'favicon', 'sitemap', 'sitemap-subtype', 'sitemap-stylesheet' );
+
+	/**
+	 * 3.4.3: such a request gets a plain "not found" instead of WordPress's fatal error.
+	 *
+	 * @param array<string, mixed> $vars Query variables of the request.
+	 * @return array<string, mixed>
+	 */
+	public static function scalar_query_vars( $vars ) {
+		if ( ! is_array( $vars ) ) {
+			return $vars;
+		}
+		$bad = self::$array_vars;
+		foreach ( self::SCALAR_VARS as $key ) {
+			if ( isset( $vars[ $key ] ) && ! is_scalar( $vars[ $key ] ) ) {
+				unset( $vars[ $key ] );
+				$bad = true;
+			}
+		}
+		if ( $bad ) {
+			$vars['error'] = '404';
+		}
+		return $vars;
+	}
+
+	/**
+	 * Is the current page protected?
+	 *
+	 * @return bool
+	 */
+	public static function should_protect() {
+		if ( null !== self::$protect ) {
+			return self::$protect;
+		}
+
+		self::$protect = (bool) apply_filters( 'pncp_should_protect', self::decide(), PNCP_Options::get() );
+		return self::$protect;
+	}
+
+	/**
+	 * Forgets the decision (for tests).
+	 */
+	public static function reset() {
+		self::$protect = null;
+	}
+
+	/**
+	 * The decision logic, without the filter.
+	 *
+	 * @return bool
+	 */
+	private static function decide() {
+		$s = PNCP_Options::get();
+
+		if ( empty( $s['enabled'] ) || is_admin() || is_feed() || is_preview() || is_customize_preview() || is_embed() ) {
+			return false;
+		}
+
+		if ( wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
+		}
+
+		// Page builders in edit mode. Only for a user who can actually edit: otherwise
+		// an ?elementor-preview=1 in the URL would turn protection off for any visitor.
+		if ( self::is_builder_request() ) {
+			return false;
+		}
+
+		if ( PNCP_Options::user_is_exempt( $s ) ) {
+			return false;
+		}
+
+		$queried = get_queried_object_id();
+		if ( ! $queried && function_exists( 'is_shop' ) && is_shop() ) {
+			// The Shop page is an archive, so the queried object has no page ID.
+			$queried = wc_get_page_id( 'shop' );
+		}
+		if ( $queried && in_array( (int) $queried, PNCP_Options::excluded_ids( $s ), true ) ) {
+			return false;
+		}
+
+		// Cart, checkout and account: the customer must be able to copy order numbers, coupon codes etc.
+		if ( ! empty( $s['skip_woo_pages'] ) && function_exists( 'is_woocommerce' ) ) {
+			if ( is_cart() || is_checkout() || is_account_page() ) {
+				return false;
+			}
+		}
+
+		if ( function_exists( 'is_product' ) && is_product() ) {
+			return ! empty( $s['scope_products'] );
+		}
+
+		if ( is_singular( 'post' ) ) {
+			return ! empty( $s['scope_posts'] );
+		}
+
+		if ( is_page() && ! is_front_page() ) {
+			return ! empty( $s['scope_pages'] );
+		}
+
+		if ( is_front_page() || is_home() || is_archive() || is_search() || is_404() ) {
+			return ! empty( $s['scope_home'] );
+		}
+
+		// Other singulars (custom post types): follow the posts setting.
+		if ( is_singular() ) {
+			return ! empty( $s['scope_posts'] );
+		}
+
+		return false;
+	}
+
+	/**
+	 * Page builder (Elementor, Beaver, Divi, SiteOrigin, Bricks, Oxygen) or preview request, from a
+	 * logged-in user who can edit the page.
+	 *
+	 * @return bool
+	 */
+	public static function is_builder_request() {
+		$found = false;
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- Existence check only; the capability is checked below.
+		foreach ( array( 'elementor-preview', 'fl_builder', 'et_fb', 'siteorigin_panels_live_editor', 'preview_id', 'bricks', 'ct_builder' ) as $flag ) {
+			if ( isset( $_GET[ $flag ] ) ) {
+				$found = true;
+				break;
+			}
+		}
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+		if ( ! $found || ! is_user_logged_in() ) {
+			return false;
+		}
+		$id = get_queried_object_id();
+		return $id ? PNCP_Lockdown::can( 'edit_post', $id ) : PNCP_Lockdown::can( 'edit_posts' );
+	}
+
+	/**
+	 * Registers the files and the script settings.
+	 */
+	public static function register() {
+		if ( ! self::should_protect() ) {
+			return;
+		}
+
+		$s = PNCP_Options::get();
+
+		// Minified and printed inline in <head>: no extra request that would hold back the first paint of every
+		// protected page (about 6 KB together). With SCRIPT_DEBUG the readable files are loaded instead.
+		$debug = defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG;
+		$css   = $debug ? '' : self::asset( 'assets/css/protect.min.css' );
+		$js    = $debug ? '' : self::asset( 'assets/js/protect.min.js' );
+		if ( '' !== $css ) {
+			wp_register_style( 'pncp-protect', false, array(), PNCP_VERSION );
+			wp_enqueue_style( 'pncp-protect' );
+			wp_add_inline_style( 'pncp-protect', $css );
+		} else {
+			wp_enqueue_style( 'pncp-protect', PNCP_URL . 'assets/css/protect.css', array(), PNCP_VERSION );
+		}
+		if ( '' !== $js ) {
+			wp_register_script( 'pncp-protect', false, array(), PNCP_VERSION, false );
+			wp_add_inline_script( 'pncp-protect', $js, 'after' );
+		} else {
+			wp_register_script( 'pncp-protect', PNCP_URL . 'assets/js/protect.js', array(), PNCP_VERSION, false );
+		}
+
+		$title = is_singular() ? get_the_title() : wp_get_document_title();
+
+		$config = array(
+			'selection'     => (bool) $s['block_selection'],
+			'contextMenu'   => (bool) $s['block_context_menu'],
+			'shortcuts'     => (bool) $s['block_shortcuts'],
+			'devtools'      => (bool) $s['block_devtools'],
+			'imageDrag'     => (bool) $s['block_image_drag'],
+			'textDrag'      => (bool) $s['block_text_drag'],
+			'blur'          => (bool) $s['blur_on_capture'],
+			// 3.12.5: "guests" = no blur in a signed-in browser. Decided by protect.js (the hint cookie of
+			// PNCP_Signin_Hint, or WordPress's logged-in body class), never here: the same HTML may be cached.
+			'blurScope'     => 'guests' === $s['blur_on_capture_scope'] ? 'guests' : 'all',
+			/**
+			 * Filters whether links keep the browser's right-click menu ("Open in new tab", "Copy link address")
+			 * while right-click is blocked. Off by default: the menu is blocked on links and buttons
+			 * too, and only form fields, contenteditable and .pncp-allow keep it. Return true for the old behaviour.
+			 *
+			 * @param bool $allow Allow the menu on links.
+			 */
+			'allowLinkMenu' => (bool) apply_filters( 'pncp_protect_allow_link_menu', false ),
+			'blurTimeouts'  => self::blur_timeouts(),
+			'copyMode'      => $s['copy_mode'],
+			'minChars'      => (int) $s['attribution_min_chars'],
+			'printMode'     => $s['print_mode'],
+			'showMessage'   => (bool) $s['show_message'],
+			'message'       => PNCP_Options::message( $s ),
+			'sourceTitle'   => wp_strip_all_tags( html_entity_decode( $title, ENT_QUOTES, get_bloginfo( 'charset' ) ) ),
+			'sourceUrl'     => esc_url_raw( self::current_url() ),
+			'siteName'      => wp_strip_all_tags( get_bloginfo( 'name' ) ),
+			'i18n'          => array(
+				'source'     => __( 'Source', 'scrapelock' ),
+				'printBlock' => __( 'Printing this page is not allowed.', 'scrapelock' ),
+			),
+		);
+
+		wp_add_inline_script( 'pncp-protect', 'window.pncpConfig = ' . wp_json_encode( $config ) . ';', 'before' );
+	}
+
+	/**
+	 * How long the screenshot blur lasts, in milliseconds: 'shot' after a screenshot shortcut (or until the visitor
+	 * clicks or types), 'away' while another window (snipping tool, screenshot app) has the focus (or until the
+	 * focus comes back). Both are capped, so the page is never left blurred.
+	 *
+	 * @return array{shot: int, away: int}
+	 */
+	private static function blur_timeouts() {
+		/**
+		 * Filters the screenshot blur durations (milliseconds, 500 to 60000).
+		 *
+		 * @param array{shot: int, away: int} $timeouts Durations.
+		 */
+		$t   = (array) apply_filters(
+			'pncp_blur_timeouts',
+			array(
+				'shot' => 5000,
+				'away' => 10000,
+			)
+		);
+		$out = array();
+		foreach ( array(
+			'shot' => 5000,
+			'away' => 10000,
+		) as $key => $default ) {
+			$out[ $key ] = isset( $t[ $key ] ) ? max( 500, min( 60000, (int) $t[ $key ] ) ) : $default;
+		}
+		return $out;
+	}
+
+	/**
+	 * The contents of one of the plugin's own minified files ('' if it cannot be read or is not the build of the current source).
+	 *
+	 * @param string $rel Path inside the plugin.
+	 * @return string
+	 */
+	private static function asset( $rel ) {
+		// 3.12.9: where a persistent object cache or APCu exists, read from the disk once an hour (per version), not
+		// on every page: a request must not wait for a disk that stalls.
+		$key = 'pncp_asset_' . md5( PNCP_VERSION . '|' . PNCP_DIR . $rel );
+		if ( '' !== PNCP_Defer::store() ) {
+			$kept = PNCP_Defer::get( $key );
+			if ( is_string( $kept ) ) {
+				return $kept;
+			}
+		}
+		$text = self::read_asset( $rel );
+		if ( '' !== PNCP_Defer::store() ) {
+			PNCP_Defer::set( $key, $text, HOUR_IN_SECONDS );
+		}
+		return $text;
+	}
+
+	/**
+	 * The contents of one of the plugin's own minified files, from the disk (see asset()).
+	 *
+	 * @param string $rel Path inside the plugin.
+	 * @return string
+	 */
+	private static function read_asset( $rel ) {
+		$file = PNCP_DIR . $rel;
+		if ( ! is_readable( $file ) ) {
+			return '';
+		}
+		$min = (string) file_get_contents( $file ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- The plugin's own file.
+		// The build (bin/build-min.sh) stamps every minified file with the SHA-1 of the readable source it was
+		// made from. The minified file is used only while that stamp matches the source, so an edit to the source
+		// without a rebuild can never ship an old build: the readable file is loaded instead ('' here). File times
+		// are not used: zip extraction, rsync and git give both files arbitrary, often equal, times.
+		$source = PNCP_DIR . str_replace( '.min.', '.', $rel );
+		if ( $source !== $file && is_readable( $source ) ) {
+			if ( ! preg_match( '#^/\*!\s*src-sha1:([0-9a-f]{40})\s*\*/#', $min, $m ) ) {
+				return '';
+			}
+			$text = (string) file_get_contents( $source ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- The plugin's own file.
+			if ( ! hash_equals( $m[1], sha1( str_replace( "\r", '', $text ) ) ) ) {
+				return '';
+			}
+		}
+		return trim( $min );
+	}
+
+	/**
+	 * Prints the script in <head>, before the scripts of the theme and other plugins. Its listeners
+	 * are added first on window (capture), so no other script can bypass them.
+	 */
+	public static function print_early() {
+		if ( wp_script_is( 'pncp-protect', 'registered' ) && ! wp_script_is( 'pncp-protect', 'done' ) ) {
+			wp_print_scripts( array( 'pncp-protect' ) );
+		}
+	}
+
+	/**
+	 * Optimization tools (Cloudflare Rocket Loader, LiteSpeed, Autoptimize, WP Rocket) must not
+	 * delay or combine the protection script.
+	 *
+	 * @param array<string, string> $attributes Attributes.
+	 * @return array<string, string>
+	 */
+	public static function script_attributes( $attributes ) {
+		if ( isset( $attributes['id'] ) && in_array( $attributes['id'], array( 'pncp-protect-js', 'pncp-protect-js-before', 'pncp-protect-js-after', 'pncp-mark-js', 'pncp-mark-js-before', 'pncp-mark-js-after' ), true ) ) {
+			$attributes['data-cfasync']            = 'false';
+			$attributes['data-no-optimize']        = '1';
+			$attributes['data-no-defer']           = '1';
+			$attributes['data-no-minify']          = '1';
+			$attributes['data-pagespeed-no-defer'] = '';
+		}
+		return $attributes;
+	}
+
+	/**
+	 * Headers: the page does not open inside another site's iframe, plus the TDM declaration.
+	 */
+	public static function send_headers() {
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || headers_sent() || is_admin() ) {
+			return;
+		}
+		// Excluded: embed pages (oEmbed), which exist to be placed in iframes, and the checkout / order
+		// page, which some banks open inside their own iframe.
+		$checkout = function_exists( 'is_checkout' ) && ( is_checkout() || ( function_exists( 'is_wc_endpoint_url' ) && is_wc_endpoint_url( 'order-received' ) ) );
+		// Not in the Customizer / Site Editor preview, which shows the site inside wp-admin's own iframe.
+		if ( ! empty( $s['block_framing'] ) && ! is_embed() && ! $checkout && ! is_customize_preview() && apply_filters( 'pncp_block_framing', true ) ) {
+			$sent = strtolower( implode( "\n", headers_list() ) );
+			// wp-admin on another address than the site (domain mapping on multisite, a separate admin host):
+			// it must still be able to show the site in its previews, so it is allowed by name.
+			$home  = (string) wp_parse_url( home_url(), PHP_URL_HOST );
+			$admin = (string) wp_parse_url( admin_url(), PHP_URL_HOST );
+			$other = '' !== $admin && strtolower( $admin ) !== strtolower( $home );
+			// We do not replace security headers set by another plugin or the server (e.g. X-Frame-Options: DENY).
+			// With a separate admin address only the CSP is sent: X-Frame-Options cannot name another address.
+			if ( ! $other && false === strpos( $sent, 'x-frame-options:' ) ) {
+				header( 'X-Frame-Options: SAMEORIGIN' );
+			}
+			if ( false === strpos( $sent, 'frame-ancestors' ) ) {
+				$origin = $other ? ' ' . (string) wp_parse_url( admin_url(), PHP_URL_SCHEME ) . '://' . $admin : '';
+				// Second CSP header (replace = false): browsers apply both, the existing one stays.
+				header( "Content-Security-Policy: frame-ancestors 'self'" . $origin, false );
+			}
+		}
+		if ( ! empty( $s['tdm_reservation'] ) ) {
+			header( 'tdm-reservation: 1' );
+			if ( '' !== $s['tdm_policy_url'] ) {
+				header( 'tdm-policy: ' . esc_url_raw( $s['tdm_policy_url'] ) );
+			}
+		}
+	}
+
+	/**
+	 * TDM meta tags (Text and Data Mining, EU Directive 2019/790 Article 4 and the W3C TDMRep standard).
+	 */
+	public static function tdm_meta() {
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || empty( $s['tdm_reservation'] ) ) {
+			return;
+		}
+		echo '<meta name="tdm-reservation" content="1">' . "\n";
+		if ( '' !== $s['tdm_policy_url'] ) {
+			echo '<meta name="tdm-policy" content="' . esc_url( $s['tdm_policy_url'] ) . '">' . "\n";
+		}
+	}
+
+	/**
+	 * noai / noimageai directives in the robots meta (read by several AI tools; search engines ignore them).
+	 *
+	 * @param array<string, bool|string> $robots Directives.
+	 * @return array<string, bool|string>
+	 */
+	public static function robots_meta( $robots ) {
+		$s = PNCP_Options::get();
+		if ( ! empty( $s['enabled'] ) && ! empty( $s['tdm_reservation'] ) ) {
+			$robots['noai']      = true;
+			$robots['noimageai'] = true;
+		}
+		return $robots;
+	}
+
+	/**
+	 * /.well-known/tdmrep.json (TDMRep). Works when the web server passes the request to WordPress
+	 * (there is no physical file with that name).
+	 */
+	public static function tdmrep_json() {
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || empty( $s['tdm_reservation'] ) ) {
+			return;
+		}
+		$uri  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '';
+		$path = (string) wp_parse_url( $uri, PHP_URL_PATH );
+		if ( '/.well-known/tdmrep.json' !== $path ) {
+			return;
+		}
+		$rule = array(
+			'location'        => '/*',
+			'tdm-reservation' => 1,
+		);
+		if ( '' !== $s['tdm_policy_url'] ) {
+			$rule['tdm-policy'] = esc_url_raw( $s['tdm_policy_url'] );
+		}
+		status_header( 200 );
+		header( 'Content-Type: application/json; charset=utf-8' );
+		header( 'Cache-Control: public, max-age=86400' );
+		echo wp_json_encode( array( $rule ) );
+		exit;
+	}
+
+	/**
+	 * The page URL, without query string (for a clean source reference).
+	 *
+	 * @return string
+	 */
+	private static function current_url() {
+		if ( is_singular() ) {
+			return (string) get_permalink();
+		}
+		global $wp;
+		return home_url( isset( $wp->request ) ? user_trailingslashit( $wp->request ) : '/' );
+	}
+
+	/**
+	 * Body classes that enable the CSS.
+	 *
+	 * @param string[] $classes Classes.
+	 * @return string[]
+	 */
+	public static function body_class( $classes ) {
+		if ( ! self::should_protect() ) {
+			return $classes;
+		}
+
+		$s         = PNCP_Options::get();
+		$classes[] = 'pncp-protected';
+
+		if ( ! empty( $s['block_selection'] ) ) {
+			$classes[] = 'pncp-no-select';
+		}
+		if ( ! empty( $s['block_image_drag'] ) ) {
+			$classes[] = 'pncp-no-img-save';
+		}
+		if ( 'block' === $s['print_mode'] ) {
+			$classes[] = 'pncp-print-block';
+		} elseif ( 'source' === $s['print_mode'] ) {
+			$classes[] = 'pncp-print-source';
+		}
+
+		return $classes;
+	}
+}

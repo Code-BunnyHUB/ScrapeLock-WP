@@ -1,0 +1,2297 @@
+<?php
+/**
+ * Block log (table {prefix}pncp_log) and temporary IP bans.
+ *
+ * The log stores IP and User-Agent, i.e. personal data: it is deleted automatically after 1, 7 or 30 days.
+ *
+ * @package ScrapeLock
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Logging and bans.
+ */
+final class PNCP_Log {
+
+	/**
+	 * Table schema version. 3 (3.4.0): index (created, reason) for the summaries of the Log tab. 4 (3.6.1): the
+	 * table of short-lived values (kv_table()). 5 (3.7.0): the CrowdSec blocklist (PNCP_Crowdsec::table()) and the
+	 * visits from AI assistants (PNCP_Ai_Referrals::table()). 6 (3.8.0): the attack record (PNCP_Attacks::table()).
+	 */
+	const DB_VERSION = '7'; // 3.12.1: the log's account column (account_column()).
+
+	/**
+	 * 3.6.1: the lowest schema version that has the table of short-lived values (kv_table()).
+	 */
+	const KV_VERSION = 4;
+
+	/**
+	 * The lowest schema version whose tables can be used as they are: 2 has both tables and every column the
+	 * code writes. A site that runs the new code before its tables were upgraded (the upgrade runs on the next
+	 * request, or on the next admin page) keeps logging and blocking meanwhile.
+	 */
+	const DB_USABLE = 2;
+
+	/**
+	 * How many old log rows one DELETE removes. A single DELETE of a few million rows locks the table for
+	 * minutes; batches keep every lock short.
+	 */
+	const DELETE_BATCH = 5000;
+
+	/**
+	 * Option with the time of the last log cleanup (autoloaded, read on admin pages).
+	 */
+	const CLEANED_OPTION = 'pncp_log_cleaned';
+
+	/**
+	 * Option with the latest expiry of any ban ever stored, as a 10-digit number (autoloaded). When it lies in
+	 * the past no ban can be in effect, and is_banned() answers without a database query.
+	 */
+	const BANS_UNTIL_OPTION = 'pncp_bans_until';
+
+	/**
+	 * 3.4.3: stamp of the last ban change made outside the web server (see bans_changed_elsewhere()).
+	 */
+	const BANS_STAMP_OPTION = 'pncp_bans_stamp';
+
+	/**
+	 * How long the summaries of the Log tab and the Dashboard widget are kept before they are counted again.
+	 */
+	const AGGREGATE_TTL = 300;
+
+	/**
+	 * Option where 2.1 kept the bans (moved to the table on upgrade).
+	 */
+	const BANS_OPTION = 'pncp_bans';
+
+	/**
+	 * How many bans are shown on the settings page (the table keeps all of them).
+	 */
+	const MAX_BANS = 500;
+
+	/**
+	 * 3.12.9: at most this many bans are kept in the store for visitors' requests (keep_bans()).
+	 */
+	const LOAD_BANS = 20000;
+
+	/**
+	 * The status code stored for a "would block" entry of "Monitor only" (PNCP_Options::monitoring()): the
+	 * request was let through. A real block always has 403 or 429, so no new column is needed.
+	 */
+	const MONITOR_CODE = 0;
+
+	/**
+	 * 3.6.1: at most this many new transients a minute from the cache_*() functions, when neither an object cache,
+	 * APCu nor the plugin's table can be used (filter `pncp_transient_new_per_minute`, 0 = no cap). Each one is two
+	 * rows in wp_options, and many are written by public requests (the human check's throttle, violations, the
+	 * trap's memory): a flood from many addresses grew wp_options by thousands of rows a minute.
+	 */
+	const TRANSIENT_NEW_PER_MINUTE = 2000;
+
+	/**
+	 * Whether this request already has its "would block" entry. The early check, the pre-cache check and the
+	 * normal check may all judge the same request; when they let it through, it is logged once.
+	 *
+	 * @var bool
+	 */
+	private static $monitored = false;
+
+	/**
+	 * 3.6.1: whether the table of short-lived values can be used, per site, for this request (see kv_on()).
+	 *
+	 * @var array<int, bool>
+	 */
+	private static $kv = array();
+
+	/**
+	 * 3.6.1: whether the last cache_set() / cache_add() / cache_incr() could not store its value because the
+	 * minute's allowance of new transients was used up (see transient_slot()).
+	 *
+	 * @var bool
+	 */
+	private static $unstored = false;
+
+	/**
+	 * Per-request cache of is_banned.
+	 *
+	 * @var array<string, bool>
+	 */
+	private static $banned = array();
+
+	/**
+	 * Cron hook for the cleanup.
+	 */
+	const CRON = 'pncp_log_cleanup';
+
+	/**
+	 * Attaches the hooks.
+	 */
+	public static function init() {
+		add_action( self::CRON, array( __CLASS__, 'cleanup' ) );
+		add_action( self::CRON . '_more', array( __CLASS__, 'cleanup' ) );
+		add_action( 'admin_init', array( __CLASS__, 'privacy_policy' ) );
+		add_action( 'admin_init', array( __CLASS__, 'admin_maintenance' ) );
+		// 3.12.9: what visitors' requests queued in the object cache or APCu (PNCP_Defer).
+		PNCP_Defer::handle( 'log', array( __CLASS__, 'store_deferred' ), array( __CLASS__, 'deferred_ready' ) );
+		PNCP_Defer::handle( 'ban', array( __CLASS__, 'store_deferred_bans' ) );
+		add_action( 'pncp_defer_flush', array( __CLASS__, 'keep_bans' ) );
+	}
+
+	/**
+	 * Are the tables there and usable? (Every read and write of the log and the bans checks this first.)
+	 *
+	 * @return bool
+	 */
+	public static function ready() {
+		return (int) get_option( 'pncp_db_version', 0 ) >= self::DB_USABLE;
+	}
+
+	/**
+	 * On admin pages: upgrades the tables if the plugin's upgrade has not done it yet, and deletes old log
+	 * entries when the hourly task has not run for 2 hours. WP-Cron only runs when the site has visitors (or
+	 * not at all, with DISABLE_WP_CRON and no real cron job), and log entries kept longer than the retention
+	 * period are personal data kept longer than the privacy policy says.
+	 */
+	public static function admin_maintenance() {
+		if ( wp_doing_ajax() || ! is_user_logged_in() ) {
+			return; // Not in admin-ajax: the human check of every visitor goes through it.
+		}
+		$version = (int) get_option( 'pncp_db_version', 0 );
+		if ( $version < (int) self::DB_VERSION && ! get_transient( 'pncp_db_install_tried' ) ) {
+			// At most once an hour, in case the database user cannot create or alter tables.
+			set_transient( 'pncp_db_install_tried', 1, HOUR_IN_SECONDS );
+			self::install();
+		}
+		$last = (int) get_option( self::CLEANED_OPTION, 0 );
+		if ( $last < time() - 2 * HOUR_IN_SECONDS ) {
+			// Saved first: two admin pages opened at the same moment do not both run it.
+			update_option( self::CLEANED_OPTION, time(), true );
+			self::cleanup( 5 );
+		}
+	}
+
+	/**
+	 * The table name.
+	 *
+	 * @return string
+	 */
+	public static function table() {
+		global $wpdb;
+		return $wpdb->prefix . 'pncp_log';
+	}
+
+	/**
+	 * The bans table. One row per IP, with an atomic INSERT … ON DUPLICATE KEY UPDATE: 2.1
+	 * kept them in an option that was rewritten in full, and with 1500 concurrent bans
+	 * only ~150 were kept (confirmed in a load test).
+	 *
+	 * @return string
+	 */
+	public static function bans_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'pncp_bans';
+	}
+
+	/**
+	 * 3.6.1: the table of short-lived values (per-IP per-minute counters, violations, the human check's spent
+	 * challenges, cached verdicts) on sites without a persistent object cache or APCu. Until 3.6.0 they were
+	 * transients: two rows in wp_options each (value and timeout), up to six queries for a new counter, and rows
+	 * piling up in wp_options between cleanups during an attack from many addresses. Here one row per value,
+	 * with its expiry in an indexed column, so the hourly cleanup is one cheap DELETE.
+	 *
+	 * @return string
+	 */
+	public static function kv_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'pncp_kv';
+	}
+
+	/**
+	 * Creates or updates the table.
+	 */
+	public static function install() {
+		global $wpdb;
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		$table   = self::table();
+		$charset = $wpdb->get_charset_collate();
+		dbDelta(
+			"CREATE TABLE {$table} (
+			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+			created datetime NOT NULL,
+			ip varchar(45) NOT NULL DEFAULT '',
+			reason varchar(20) NOT NULL DEFAULT '',
+			code smallint(5) unsigned NOT NULL DEFAULT 0,
+			hits int(10) unsigned NOT NULL DEFAULT 1,
+			path varchar(255) NOT NULL DEFAULT '',
+			ua varchar(255) NOT NULL DEFAULT '',
+			uas smallint(5) unsigned NOT NULL DEFAULT 1,
+			account varchar(60) NOT NULL DEFAULT '',
+			PRIMARY KEY  (id),
+			KEY created (created),
+			KEY ip (ip),
+			KEY created_reason (created,reason)
+			) {$charset};"
+		);
+		$bans = self::bans_table();
+		dbDelta(
+			"CREATE TABLE {$bans} (
+			ip varchar(45) NOT NULL,
+			until_ts int(10) unsigned NOT NULL DEFAULT 0,
+			since_ts int(10) unsigned NOT NULL DEFAULT 0,
+			reason varchar(20) NOT NULL DEFAULT '',
+			PRIMARY KEY  (ip),
+			KEY until_ts (until_ts)
+			) {$charset};"
+		);
+		// 3.6.1: short-lived values (kv_table()). The value is text, like a transient's: counters are numbers in it.
+		$kv = self::kv_table();
+		dbDelta(
+			"CREATE TABLE {$kv} (
+			k varchar(191) NOT NULL,
+			v longtext NOT NULL,
+			expires int(10) unsigned NOT NULL DEFAULT 0,
+			PRIMARY KEY  (k),
+			KEY expires (expires)
+			) {$charset};"
+		);
+		// 3.7: the CrowdSec blocklist and the visits from AI assistants. Each one fails quietly on its own (its
+		// queries suppress errors), so neither is required for the log and the bans.
+		PNCP_Crowdsec::install();
+		PNCP_Ai_Referrals::install();
+		PNCP_Attacks::install(); // 3.8.
+		// Only if the tables were actually created (e.g. the database user may lack CREATE).
+		// 3.6.1: compared without regard to case: with lower_case_table_names=1 (Windows, macOS) MySQL answers
+		// "wp_pncp_log" for a "WP_" prefix, and the log and the bans were never switched on.
+		foreach ( array( $table, $bans ) as $name ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Schema check on install.
+			if ( 0 !== strcasecmp( (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $name ) ) ), $name ) ) {
+				return;
+			}
+		}
+		// Without the table of short-lived values the log and the bans still work (version 3); the values stay
+		// transients, and the next admin page tries again (admin_maintenance()).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Schema check on install.
+		$has_kv = 0 === strcasecmp( (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $kv ) ) ), $kv );
+		update_option( 'pncp_db_version', $has_kv ? self::DB_VERSION : '3', true ); // Autoloaded: read on every request by is_banned().
+		self::$kv = array();
+		// The latest ban expiry, for the quick "no ban in effect" answer of is_banned(). Taken from the table, so
+		// bans stored before this version count too.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Once, on install / upgrade.
+		self::raise_bans_until( (int) $wpdb->get_var( $wpdb->prepare( 'SELECT MAX(until_ts) FROM %i', $bans ) ) );
+		// Since 2.6.2: the number of different User-Agents of a grouped event. Only used when the column exists
+		// (a database that could not add it keeps logging as before).
+		// A plain SELECT works on every database (SHOW COLUMNS does not, e.g. on SQLite).
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Schema check on install.
+		$has_uas = false !== $wpdb->query( $wpdb->prepare( 'SELECT uas FROM %i LIMIT 1', $table ) );
+		$wpdb->suppress_errors( $suppress );
+		update_option( 'pncp_log_uas', $has_uas ? 1 : 0, true );
+		// 3.12.1: the account name of a per-account limit (account_column()), with the same check.
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Schema check on install.
+		$has_account = false !== $wpdb->query( $wpdb->prepare( 'SELECT account FROM %i LIMIT 1', $table ) );
+		$wpdb->suppress_errors( $suppress );
+		update_option( 'pncp_log_account', $has_account ? 1 : 0, true );
+
+		// 2.1 bans (option) → table.
+		$old = get_option( self::BANS_OPTION );
+		if ( is_array( $old ) ) {
+			foreach ( $old as $ip => $ban ) {
+				if ( is_array( $ban ) && isset( $ban['until'] ) && (int) $ban['until'] > time() && filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+					self::store_ban( PNCP_Ip::limit_key( (string) $ip ), (int) $ban['until'], isset( $ban['reason'] ) ? (string) $ban['reason'] : 'ban', isset( $ban['since'] ) ? (int) $ban['since'] : time() );
+				}
+			}
+		}
+		delete_option( self::BANS_OPTION );
+	}
+
+	/**
+	 * The ban reasons with their descriptions.
+	 *
+	 * @return array<string, string>
+	 */
+	public static function reasons() {
+		return array(
+			'bot_ua'          => __( 'User-Agent in the bot list', 'scrapelock' ),
+			'empty_ua'        => __( 'No User-Agent', 'scrapelock' ),
+			'fake_crawler'    => __( 'Fake search engine', 'scrapelock' ),
+			'fake_ai_bot'     => __( 'Fake AI search bot', 'scrapelock' ),
+			'no_browser'      => __( 'No browser headers', 'scrapelock' ),
+			'headless'        => __( 'Headless browser', 'scrapelock' ),
+			'fake_browser'    => __( 'Fake browser', 'scrapelock' ),
+			// The limits are named after their settings ("Pages per minute", "Searches per minute"…).
+			'rate_page'       => __( 'Pages per minute', 'scrapelock' ),
+			'rate_prefetch'   => __( 'Prefetches per minute', 'scrapelock' ),
+			'rate_media'      => __( 'Media files per minute (images, video, fonts, CSS, JS)', 'scrapelock' ), // 3.11.
+			'rate_page56'     => __( 'Pages per minute for the IPv6 network (/56)', 'scrapelock' ),
+			'rate_net'        => __( 'Pages per minute for the network (IPv4 /24, IPv6 /48)', 'scrapelock' ), // 3.13.0.
+			'rate_mismatch'   => __( 'Pages per minute for browser headers that do not match the User-Agent', 'scrapelock' ), // 3.13.0.
+			'rate_datacenter' => __( 'Pages per minute from data centers', 'scrapelock' ),
+			'rate_search'     => __( 'Searches per minute', 'scrapelock' ),
+			'rate_rest'       => __( 'REST / GraphQL requests per minute', 'scrapelock' ),
+			'rate_sitemap'    => __( 'Sitemaps per minute', 'scrapelock' ),
+			'rate_unverified' => __( 'Pages per minute without the human check', 'scrapelock' ),
+			'country'         => __( 'Blocked country', 'scrapelock' ),
+			'rate_country'    => __( 'Pages per minute for the stricter countries', 'scrapelock' ),
+			'rate_404'        => __( '“Page not found” (404) per minute', 'scrapelock' ),
+			'rate_cart'       => __( 'WooCommerce cart / checkout actions per minute', 'scrapelock' ),
+			'rate_coupon'     => __( 'WooCommerce coupon attempts per minute', 'scrapelock' ),
+			'rate_account'    => __( 'Pages per minute per signed-in account', 'scrapelock' ), // 3.6.
+			'rate_member'     => __( 'FluentCommunity REST reads per minute per member', 'scrapelock' ), // 3.12.1.
+			'blocked_ip'      => __( 'IP in the always-blocked list', 'scrapelock' ),
+			'blocked_ref'     => __( 'Referrer in the always-blocked list', 'scrapelock' ),
+			'trap'            => __( 'Bot trap', 'scrapelock' ),
+			'probe'           => __( 'Scanner probe (.env, .git, backups…)', 'scrapelock' ), // 3.5: "Ban scanners on their first probe".
+			'ban'             => __( 'New temporary block', 'scrapelock' ),
+			'manual'          => __( 'Blocked by hand', 'scrapelock' ),
+			'banned'          => __( 'Request from a blocked IP', 'scrapelock' ),
+			'feed_denied'     => __( 'Private URL without token', 'scrapelock' ),
+			'not_via_cdn'     => __( 'Not through the CDN (straight to the server)', 'scrapelock' ),
+			// 3.7.
+			'bad_ua'          => __( 'Attack in the User-Agent (tags, Shellshock, Log4Shell, SQL)', 'scrapelock' ),
+			'host_ip'         => __( 'Site opened by IP address instead of its name', 'scrapelock' ),
+			'rate_lowrep'     => __( 'Pages per minute for IPs with a bad reputation', 'scrapelock' ),
+			'rate_apionly'    => __( 'API / feed / sitemap requests per minute without ever opening a page', 'scrapelock' ),
+			'crowdsec'        => __( 'IP in the CrowdSec blocklist', 'scrapelock' ),
+			'rate_crowdsec'   => __( 'Pages per minute for IPs in the CrowdSec blocklist', 'scrapelock' ),
+			// 3.8: sign-in protection (PNCP_Login).
+			'login'           => __( 'Too many failed sign-ins (temporary block)', 'scrapelock' ),
+			'login_user'      => __( 'Sign-in to a paused username', 'scrapelock' ),
+			'login_hidden'    => __( 'wp-login.php or wp-admin while the sign-in page is moved', 'scrapelock' ),
+			// 3.8: vulnerable points (PNCP_Hardening).
+			'harden_xmlrpc'   => __( 'XML-RPC is locked (Vulnerable points)', 'scrapelock' ),
+			'harden_admin'    => __( 'wp-admin hidden from visitors (Vulnerable points)', 'scrapelock' ),
+			'harden_author'   => __( 'Author archives are locked (Vulnerable points)', 'scrapelock' ),
+			// 3.8: Bunny CDN logs (PNCP_Bunny).
+			'edge_rate'       => __( 'Too fast at Bunny CDN (seen in its logs)', 'scrapelock' ),
+			// 3.13.0: the login lock at Bunny, applied by WordPress too (PNCP_Bunny::origin_login_gate()).
+			'edge_login'      => __( 'wp-login.php is locked at Bunny CDN for this IP', 'scrapelock' ),
+		);
+	}
+
+	/**
+	 * 3.12.1: the label of a reason for people (reasons()); never the internal key, also for a reason stored by
+	 * another version (a generic label then).
+	 *
+	 * @param string $reason Reason key.
+	 * @return string
+	 */
+	public static function reason_label( $reason ) {
+		static $labels = null;
+		if ( null === $labels ) {
+			$labels = self::reasons();
+		}
+		return isset( $labels[ (string) $reason ] ) ? $labels[ (string) $reason ] : __( 'Another check of ScrapeLock', 'scrapelock' );
+	}
+
+	/**
+	 * The request URI as the browser sent it, percent-encoded, as the pre-cache check also logs it.
+	 * sanitize_text_field() is not used: it removes "%ce%ac" and the like, so a Greek address such as
+	 * /άρθρο-8/ was logged as /-8/ (2.8.2 and earlier). Any byte outside printable ASCII is encoded.
+	 *
+	 * @return string
+	 */
+	public static function request_uri() {
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Every byte outside printable ASCII is percent-encoded below; the value is escaped on output.
+		$uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+		return (string) preg_replace_callback(
+			'/[^\x21-\x7E]/',
+			static function ( $m ) {
+				return rawurlencode( $m[0] );
+			},
+			$uri
+		);
+	}
+
+	/**
+	 * A logged path, readable: /%ce%ac%cf%81… is shown as /άρ…. Invalid UTF-8 stays encoded.
+	 *
+	 * @param string $path Logged path.
+	 * @return string
+	 */
+	public static function display_path( $path ) {
+		$decoded = rawurldecode( (string) $path );
+		return wp_check_invalid_utf8( $decoded ) === $decoded && ! preg_match( '/[\x00-\x1F\x7F]/', $decoded ) ? $decoded : (string) $path;
+	}
+
+	/**
+	 * Logs an event. Same IP and reason within the same minute become one row with a counter,
+	 * so that a persistent bot does not fill up the database.
+	 *
+	 * A "would block" entry of "Monitor only" has the code MONITOR_CODE, and is written once per request (the
+	 * pre-cache check marks the requests it has already logged).
+	 *
+	 * An attack from thousands of addresses would still add one row per address, reason and minute. So each
+	 * minute only a limited number of new rows is written (filter `pncp_log_rows_per_minute`, default 300);
+	 * beyond that the events of that minute are added up in one row per reason, with no IP ("Many IPs").
+	 * New temporary blocks are always logged on their own: the list of persistent IPs counts them.
+	 *
+	 * 3.12.1: a per-account limit (rate_account, rate_member) also keeps the account's username, in a row of its
+	 * own per account; every other row has none.
+	 *
+	 * @param string $reason  Reason (key of reasons()).
+	 * @param int    $code    HTTP status code (MONITOR_CODE = would have been blocked, let through).
+	 * @param string $ip      IP.
+	 * @param string $account Username of a per-account limit ('' = none).
+	 */
+	public static function add( $reason, $code, $ip, $account = '' ) {
+		global $wpdb;
+		// 3.12.2: a refusal of this request: the header "X-ScrapeLock: refused" and the diagnostics of the site's own
+		// requests (only a 403 / 429 of a web request).
+		if ( class_exists( 'PNCP_Self_Check' ) ) {
+			PNCP_Self_Check::refused( (string) $reason, (int) $code );
+		}
+		if ( ! self::ready() ) {
+			return;
+		}
+		// 3.8: the attack record sees every refusal (also the "would block" ones). It only keeps a note in
+		// memory; the row is written once, at the end of the request.
+		if ( class_exists( 'PNCP_Attacks' ) ) {
+			PNCP_Attacks::on_blocked( $reason, (int) $code, $ip );
+		}
+		if ( self::MONITOR_CODE === (int) $code ) {
+			if ( self::$monitored || ( class_exists( 'PNCP_Precheck_Runtime', false ) && property_exists( 'PNCP_Precheck_Runtime', 'monitored' ) && PNCP_Precheck_Runtime::$monitored ) ) {
+				return;
+			}
+			self::$monitored = true;
+		}
+
+		if ( PNCP_Defer::active() ) {
+			self::add_deferred( (string) $reason, (int) $code, (string) $ip, (string) $account );
+			return;
+		}
+
+		// The code is part of the key: a "would block" entry and a real block are never counted in the same row.
+		$minute = (int) floor( time() / MINUTE_IN_SECONDS );
+		$account = self::account_column() ? mb_substr( (string) $account, 0, 60 ) : '';
+		$key     = 'pncp_lg_' . md5( $ip . '|' . $reason . '|' . (int) $code . '|' . $minute . ( '' !== $account ? '|' . $account : '' ) );
+		$orig   = $key;
+		$id     = self::row_id( $key );
+		$ua     = PNCP_Bots::user_agent();
+		if ( $id > 0 ) {
+			// The row keeps the first User-Agent and counts how many different ones there were (bots that rotate it).
+			$seen = self::uas_column() ? self::cache_get( $key . '_u' ) : false;
+			if ( is_array( $seen ) && count( $seen ) < 50 && ! in_array( md5( $ua ), $seen, true ) ) {
+				$seen[] = md5( $ua );
+				self::cache_set( $key . '_u', $seen, 2 * MINUTE_IN_SECONDS );
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Counter, no cache.
+				$done = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET hits = hits + 1, uas = uas + 1 WHERE id = %d', self::table(), $id ) );
+			} else {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Counter, no cache.
+				$done = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET hits = hits + 1 WHERE id = %d', self::table(), $id ) );
+			}
+			// 3.4.3: 0 rows changed means the cached row no longer exists (the "Clear log" button, within the
+			// 2 minutes the id is cached): the event goes on as a new one instead of being lost.
+			if ( 0 !== $done ) {
+				return;
+			}
+		}
+		if ( 'ban' !== $reason && 'manual' !== $reason && self::rows_this_minute( $minute ) >= self::rows_per_minute() ) {
+			// Over the budget: this minute's row of the reason (and code) for "Many IPs".
+			$ip      = '';
+			$ua      = '';
+			$account = '';
+			$key     = 'pncp_lo_' . md5( $reason . '|' . (int) $code . '|' . $minute );
+			$id  = self::row_id( $key );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Counter, no cache.
+			if ( $id > 0 && 0 !== $wpdb->query( $wpdb->prepare( 'UPDATE %i SET hits = hits + 1 WHERE id = %d', self::table(), $id ) ) ) {
+				// 3.6.1: this IP's own key (claimed by row_id() above) points to the "Many IPs" row from now on. Left
+				// claimed with no id, every further event of the IP that minute waited 0.2 s in row_id() for an id
+				// that never came, keeping PHP workers asleep during the very attack being logged.
+				self::cache_set( $orig, $id, 2 * MINUTE_IN_SECONDS );
+				return;
+			}
+		} else {
+			self::count_row( $minute );
+		}
+
+		$path = '' !== $ip ? (string) wp_parse_url( self::request_uri(), PHP_URL_PATH ) : '';
+
+		$data    = array(
+			'created' => gmdate( 'Y-m-d H:i:s' ),
+			'ip'      => substr( $ip, 0, 45 ),
+			'reason'  => substr( $reason, 0, 20 ),
+			'code'    => (int) $code,
+			'hits'    => 1,
+			'path'    => mb_substr( $path, 0, 255 ),
+			'ua'      => mb_substr( $ua, 0, 255 ),
+		);
+		$formats = array( '%s', '%s', '%s', '%d', '%d', '%s', '%s' );
+		if ( '' !== $account ) {
+			$data['account'] = $account; // 3.12.1: only when the column exists (account_column(), checked above).
+			$formats[]       = '%s';
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$wpdb->insert( self::table(), $data, $formats );
+		if ( ! $wpdb->insert_id ) {
+			self::cache_delete( $key . '_c' ); // The next event of the minute tries again.
+			if ( $orig !== $key ) {
+				self::cache_delete( $orig . '_c' ); // 3.6.1: this IP's own claim too (see above).
+			}
+		} else {
+			self::cache_set( $key, (int) $wpdb->insert_id, 2 * MINUTE_IN_SECONDS );
+			if ( $orig !== $key ) {
+				self::cache_set( $orig, (int) $wpdb->insert_id, 2 * MINUTE_IN_SECONDS ); // 3.6.1: see above.
+			}
+			if ( '' !== $ip && self::uas_column() ) {
+				self::cache_set( $key . '_u', array( md5( $ua ) ), 2 * MINUTE_IN_SECONDS );
+			}
+		}
+	}
+
+	/**
+	 * 3.12.9: add() in a visitor's request on a site with a persistent object cache or APCu (PNCP_Defer): the
+	 * event goes to a queue there, grouped per minute as in the table (one row per IP, reason and code, with its
+	 * hits and different User-Agents), and the scheduled event writes the rows once their minute is over
+	 * (store_deferred()). The same budget of new rows per minute applies, past it the "Many IPs" row of the reason.
+	 * No database query, no wait (add() without a store waited up to 0.2 s for another request's row id).
+	 *
+	 * @param string $reason  Reason.
+	 * @param int    $code    HTTP status code.
+	 * @param string $ip      IP.
+	 * @param string $account Username of a per-account limit ('' = none).
+	 */
+	private static function add_deferred( $reason, $code, $ip, $account ) {
+		$minute  = (int) floor( time() / MINUTE_IN_SECONDS );
+		$ttl     = 5 * MINUTE_IN_SECONDS;
+		$account = mb_substr( $account, 0, 60 );
+		$ua      = PNCP_Bots::user_agent();
+		$key     = 'pncp_lq_' . md5( $ip . '|' . $reason . '|' . $code . '|' . $minute . ( '' !== $account ? '|' . $account : '' ) );
+		if ( ! PNCP_Defer::add( $key, 1, $ttl ) ) {
+			// This minute's row is queued already (its own, or the "Many IPs" one it went to): one more hit.
+			$row = PNCP_Defer::get( $key );
+			if ( is_string( $row ) && 0 === strpos( $row, 'pncp_lq_' ) ) {
+				PNCP_Defer::incr( $row . '_h', 1, $ttl );
+				return;
+			}
+			PNCP_Defer::incr( $key . '_h', 1, $ttl );
+			$seen = PNCP_Defer::get( $key . '_u' );
+			if ( is_array( $seen ) && count( $seen ) < 50 && ! in_array( md5( $ua ), $seen, true ) ) {
+				$seen[] = md5( $ua );
+				PNCP_Defer::set( $key . '_u', $seen, $ttl );
+				PNCP_Defer::incr( $key . '_v', 1, $ttl );
+			}
+			return;
+		}
+		$path = '' !== $ip ? (string) wp_parse_url( self::request_uri(), PHP_URL_PATH ) : '';
+		if ( 'ban' !== $reason && 'manual' !== $reason && PNCP_Defer::incr( 'pncp_lq_rows_' . $minute, 1, $ttl ) > self::rows_per_minute() ) {
+			// Over the budget: this minute's row of the reason (and code) for "Many IPs".
+			$many = 'pncp_lq_' . md5( $reason . '|' . $code . '|' . $minute );
+			PNCP_Defer::set( $key, $many, $ttl );
+			if ( ! PNCP_Defer::add( $many, 1, $ttl ) ) {
+				PNCP_Defer::incr( $many . '_h', 1, $ttl );
+				return;
+			}
+			$key     = $many;
+			$ip      = '';
+			$ua      = '';
+			$account = '';
+			$path    = '';
+		} else {
+			PNCP_Defer::set( $key . '_u', array( md5( $ua ) ), $ttl );
+		}
+		PNCP_Defer::push(
+			'log',
+			array(
+				'k'       => $key,
+				'm'       => $minute,
+				'ip'      => substr( $ip, 0, 45 ),
+				'reason'  => substr( $reason, 0, 20 ),
+				'code'    => $code,
+				'path'    => mb_substr( $path, 0, 255 ),
+				'ua'      => mb_substr( $ua, 0, 255 ),
+				'account' => $account,
+			)
+		);
+	}
+
+	/**
+	 * 3.12.9: is a queued log row ready to be written? Only once its minute is over (and 5 seconds more): its
+	 * hits are still being counted until then.
+	 *
+	 * @param mixed $row Queued row.
+	 * @return bool
+	 */
+	public static function deferred_ready( $row ) {
+		return ! is_array( $row ) || ! isset( $row['m'] ) || time() >= ( (int) $row['m'] + 1 ) * MINUTE_IN_SECONDS + 5;
+	}
+
+	/**
+	 * 3.12.9: writes the log rows the visitors' requests queued (PNCP_Defer::flush()), with their hits.
+	 *
+	 * @param array<int, mixed> $rows Queued rows.
+	 */
+	public static function store_deferred( $rows ) {
+		global $wpdb;
+		if ( ! self::ready() ) {
+			return;
+		}
+		$uas     = self::uas_column();
+		$account = self::account_column();
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) || ! isset( $row['k'], $row['m'], $row['reason'], $row['code'] ) ) {
+				continue;
+			}
+			$data    = array(
+				'created' => gmdate( 'Y-m-d H:i:s', (int) $row['m'] * MINUTE_IN_SECONDS ),
+				'ip'      => (string) $row['ip'],
+				'reason'  => (string) $row['reason'],
+				'code'    => (int) $row['code'],
+				'hits'    => 1 + (int) PNCP_Defer::get( $row['k'] . '_h' ),
+				'path'    => (string) $row['path'],
+				'ua'      => (string) $row['ua'],
+			);
+			$formats = array( '%s', '%s', '%s', '%d', '%d', '%s', '%s' );
+			if ( $uas ) {
+				$data['uas'] = max( 1, min( 65535, 1 + (int) PNCP_Defer::get( $row['k'] . '_v' ) ) );
+				$formats[]   = '%d';
+			}
+			if ( $account && '' !== (string) $row['account'] ) {
+				$data['account'] = (string) $row['account'];
+				$formats[]       = '%s';
+			}
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+			$wpdb->insert( self::table(), $data, $formats );
+		}
+	}
+
+	/**
+	 * 3.4.3: the cached id of this minute's row, or 0 when this request is the one to write it. Read-then-insert
+	 * was not atomic: under PHP-FPM, 50 parallel hits of the same IP wrote 2-3 rows of the same minute. The
+	 * first request claims the key (an atomic add); the others wait up to 0.2 s for its id and count in its
+	 * row. Without APCu or an object cache (transients) there is no atomic add, and nothing changes.
+	 *
+	 * @param string $key Cache key of the row id.
+	 * @return int
+	 */
+	private static function row_id( $key ) {
+		$id = (int) self::cache_get( $key );
+		if ( $id > 0 ) {
+			return $id;
+		}
+		if ( wp_using_ext_object_cache() ) {
+			$claimed = wp_cache_add( $key . '_c', 1, 'pncp', 5 );
+		} elseif ( self::apcu_ok() ) {
+			$claimed = apcu_add( self::apcu_key( $key . '_c' ), 1, 5 );
+		} else {
+			return 0;
+		}
+		for ( $i = 0; ! $claimed && $i < 10; $i++ ) {
+			usleep( 20000 );
+			$id = (int) self::cache_get( $key );
+			if ( $id > 0 ) {
+				return $id;
+			}
+		}
+		return 0;
+	}
+
+	/**
+	 * How many new log rows may be written per minute before events are added up per reason.
+	 *
+	 * @return int
+	 */
+	public static function rows_per_minute() {
+		return max( 10, (int) apply_filters( 'pncp_log_rows_per_minute', 300 ) );
+	}
+
+	/**
+	 * How many new rows add() wrote in this minute. Counted in the object cache or APCu where there is one;
+	 * otherwise the rows of the minute are counted in the table itself (one query on the "created" index,
+	 * with no write, so a counter does not add to the load it is meant to limit).
+	 *
+	 * @param int $minute Minute (Unix time / 60).
+	 * @return int
+	 */
+	private static function rows_this_minute( $minute ) {
+		global $wpdb;
+		$key = 'pncp_lr_' . $minute;
+		if ( wp_using_ext_object_cache() ) {
+			return (int) wp_cache_get( $key, 'pncp' );
+		}
+		if ( self::apcu_ok() ) {
+			return (int) apcu_fetch( self::apcu_key( $key ) );
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Bounded count on an index; caching it would defeat its purpose.
+		return (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE created >= %s', self::table(), gmdate( 'Y-m-d H:i:s', $minute * MINUTE_IN_SECONDS ) ) );
+	}
+
+	/**
+	 * Counts a new row of this minute (object cache or APCu; the table counts itself otherwise).
+	 *
+	 * @param int $minute Minute (Unix time / 60).
+	 */
+	private static function count_row( $minute ) {
+		$key = 'pncp_lr_' . $minute;
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_add( $key, 0, 'pncp', 2 * MINUTE_IN_SECONDS );
+			wp_cache_incr( $key, 1, 'pncp' );
+		} elseif ( self::apcu_ok() ) {
+			apcu_add( self::apcu_key( $key ), 0, 2 * MINUTE_IN_SECONDS );
+			apcu_inc( self::apcu_key( $key ) );
+		}
+	}
+
+	/**
+	 * Does the log table have the "uas" column (different User-Agents of a grouped event)?
+	 *
+	 * @return bool
+	 */
+	public static function uas_column() {
+		return 1 === (int) get_option( 'pncp_log_uas', 0 );
+	}
+
+	/**
+	 * 3.12.1: does the log table have the account column (the username of a per-account limit)? Only used when
+	 * it does: a database that could not add it keeps logging as before, without the username.
+	 *
+	 * @return bool
+	 */
+	public static function account_column() {
+		return 1 === (int) get_option( 'pncp_log_account', 0 );
+	}
+
+	/**
+	 * Stores an event that happened elsewhere (the pre-cache check), with its own time, path and User-Agent.
+	 *
+	 * @param array{time:int, code:int, reason:string, ip:string, path:string, ua:string, hits:int, uas?:int} $row Event.
+	 */
+	public static function insert( $row ) {
+		global $wpdb;
+		if ( ! self::ready() ) {
+			return;
+		}
+		$data    = array(
+			'created' => gmdate( 'Y-m-d H:i:s', (int) $row['time'] ),
+			'ip'      => substr( (string) $row['ip'], 0, 45 ),
+			'reason'  => substr( (string) $row['reason'], 0, 20 ),
+			'code'    => (int) $row['code'],
+			'hits'    => max( 1, (int) $row['hits'] ),
+			'path'    => mb_substr( (string) $row['path'], 0, 255 ),
+			'ua'      => mb_substr( (string) $row['ua'], 0, 255 ),
+		);
+		$formats = array( '%s', '%s', '%s', '%d', '%d', '%s', '%s' );
+		if ( self::uas_column() ) {
+			$data['uas'] = max( 1, min( 65535, isset( $row['uas'] ) ? (int) $row['uas'] : 1 ) );
+			$formats[]   = '%d';
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$wpdb->insert( self::table(), $data, $formats );
+	}
+
+	/**
+	 * Deletes everything older than the retention period and the expired bans.
+	 *
+	 * The old log rows go in batches of DELETE_BATCH, so the table is never locked for long, until none are
+	 * left or the time is up (what is left goes on the next run).
+	 *
+	 * @param int $seconds Time budget in seconds (default 20; the hourly task passes nothing).
+	 */
+	public static function cleanup( $seconds = 20 ) {
+		global $wpdb;
+		$days   = max( 1, (int) PNCP_Options::stored()['log_retention'] );
+		$before = gmdate( 'Y-m-d H:i:s', time() - $days * DAY_IN_SECONDS );
+		$budget = microtime( true ) + max( 1, is_numeric( $seconds ) ? (int) $seconds : 20 );
+		if ( self::ready() ) {
+			do {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table, batched delete.
+				$deleted = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE created < %s LIMIT %d', self::table(), $before, self::DELETE_BATCH ) );
+				if ( false === $deleted ) {
+					// A database without DELETE … LIMIT: one DELETE, as before 3.4.
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+					$wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE created < %s', self::table(), $before ) );
+					break;
+				}
+				// A full batch means there may be more. A database that ignores the LIMIT deletes them all at once,
+				// which is more than a batch, and the loop ends.
+			} while ( self::DELETE_BATCH === (int) $deleted && microtime( true ) < $budget );
+			if ( false !== $deleted && self::DELETE_BATCH === (int) $deleted && ! wp_next_scheduled( self::CRON . '_more' ) ) {
+				// The time ran out with old rows still there: the rest in a minute, not in an hour.
+				wp_schedule_single_event( time() + MINUTE_IN_SECONDS, self::CRON . '_more' );
+			}
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+			$wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE until_ts < %d', self::bans_table(), time() ) );
+		}
+		self::kv_cleanup( $budget );
+		self::purge_expired_transients();
+		PNCP_Crowdsec::cleanup(); // 3.7.
+		PNCP_Ai_Referrals::cleanup(); // 3.7.
+		PNCP_Attacks::cleanup(); // 3.8.
+		update_option( self::CLEANED_OPTION, time(), true );
+	}
+
+	/**
+	 * 3.6.1: deletes the expired short-lived values (kv_table()), in batches on the expiry index, until none are
+	 * left or the time is up.
+	 *
+	 * @param float $budget Time (microtime) to stop at.
+	 */
+	public static function kv_cleanup( $budget ) {
+		global $wpdb;
+		if ( ! self::kv_on() ) {
+			return;
+		}
+		$suppress = $wpdb->suppress_errors( true );
+		do {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table, batched delete on an index.
+			$deleted = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE expires < %d LIMIT %d', self::kv_table(), time(), self::DELETE_BATCH ) );
+		} while ( self::DELETE_BATCH === (int) $deleted && microtime( true ) < $budget );
+		$wpdb->suppress_errors( $suppress );
+	}
+
+	/**
+	 * Deletes the plugin's expired transients (rate-limit counters per IP and minute, violations). WordPress
+	 * deletes them once a day; an attack from thousands of IPs piles up thousands of rows, so here it runs hourly.
+	 */
+	public static function purge_expired_transients() {
+		global $wpdb;
+		if ( wp_using_ext_object_cache() ) {
+			return;
+		}
+		$suppress = $wpdb->suppress_errors( true ); // MySQL syntax; on another database it simply does nothing (WordPress does it once a day).
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- Bulk cleanup, like WordPress's delete_expired_transients().
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE a, b FROM {$wpdb->options} a, {$wpdb->options} b
+				WHERE a.option_name LIKE %s
+				AND a.option_name NOT LIKE %s
+				AND b.option_name = CONCAT( '_transient_timeout_', SUBSTRING( a.option_name, 12 ) )
+				AND b.option_value < %d",
+				$wpdb->esc_like( '_transient_pncp_' ) . '%',
+				$wpdb->esc_like( '_transient_timeout_' ) . '%',
+				time()
+			)
+		);
+		// phpcs:enable
+		$wpdb->suppress_errors( $suppress );
+	}
+
+	/**
+	 * Deletes the whole log.
+	 */
+	public static function clear() {
+		global $wpdb;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i', self::table() ) );
+		self::flush_aggregates();
+	}
+
+	/**
+	 * The latest entries.
+	 *
+	 * @param int    $limit Count.
+	 * @param string $which all | blocked | monitor (see codes()).
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function recent( $limit = 100, $which = 'all' ) {
+		global $wpdb;
+		if ( ! self::ready() ) {
+			return array();
+		}
+		list( $min, $max ) = self::codes( $which );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Admin screen.
+		$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i WHERE code >= %d AND code <= %d ORDER BY id DESC LIMIT %d', self::table(), $min, $max, max( 1, (int) $limit ) ), ARRAY_A );
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * The range of status codes for a view of the log: "blocked" (real blocks, 403 / 429 and the like),
+	 * "monitor" (the "would block" entries of "Monitor only") or "all".
+	 *
+	 * @param string $which all | blocked | monitor.
+	 * @return int[] [lowest, highest].
+	 */
+	public static function codes( $which ) {
+		if ( 'monitor' === $which ) {
+			return array( self::MONITOR_CODE, self::MONITOR_CODE );
+		}
+		return array( 'blocked' === $which ? self::MONITOR_CODE + 1 : self::MONITOR_CODE, 65535 );
+	}
+
+	/**
+	 * Is a log row a "would block" entry of "Monitor only"?
+	 *
+	 * @param array<string, mixed> $row Row.
+	 * @return bool
+	 */
+	public static function is_monitor_row( $row ) {
+		return isset( $row['code'] ) && self::MONITOR_CODE === (int) $row['code'];
+	}
+
+	/**
+	 * Summary of a period: totals per reason, top IPs and User-Agents.
+	 *
+	 * @param int    $hours Hours back.
+	 * @param string $which blocked (default: real blocks only) | monitor ("would block") | all.
+	 * @return array<string, mixed>
+	 */
+	public static function summary( $hours = 24, $which = 'blocked' ) {
+		global $wpdb;
+		$empty = array(
+			'total'      => 0,
+			'reasons'    => array(),
+			'ips'        => array(),
+			'uas'        => array(),
+			'ua_reasons' => array(),
+		);
+		if ( ! self::ready() ) {
+			return $empty;
+		}
+		$since             = gmdate( 'Y-m-d H:i:s', time() - (int) $hours * HOUR_IN_SECONDS );
+		$table             = self::table();
+		list( $min, $max ) = self::codes( $which );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- Admin screen / widget.
+		$reasons = $wpdb->get_results( $wpdb->prepare( 'SELECT reason, SUM(hits) AS n FROM %i WHERE created >= %s AND code >= %d AND code <= %d GROUP BY reason ORDER BY n DESC', $table, $since, $min, $max ), ARRAY_A );
+		$ips     = $wpdb->get_results( $wpdb->prepare( "SELECT ip, SUM(hits) AS n FROM %i WHERE created >= %s AND code >= %d AND code <= %d AND ip <> '' GROUP BY ip ORDER BY n DESC LIMIT 10", $table, $since, $min, $max ), ARRAY_A );
+		$uas     = $wpdb->get_results( $wpdb->prepare( "SELECT ua, SUM(hits) AS n FROM %i WHERE created >= %s AND code >= %d AND code <= %d AND ua <> '' GROUP BY ua ORDER BY n DESC LIMIT 10", $table, $since, $min, $max ), ARRAY_A );
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery
+
+		$out = $empty;
+		foreach ( (array) $reasons as $row ) {
+			$out['reasons'][ $row['reason'] ] = (int) $row['n'];
+			$out['total']                    += (int) $row['n'];
+		}
+		foreach ( (array) $ips as $row ) {
+			$out['ips'][ $row['ip'] ] = (int) $row['n'];
+		}
+		foreach ( (array) $uas as $row ) {
+			$out['uas'][ $row['ua'] ] = (int) $row['n'];
+		}
+		// Why each of the top User-Agents was blocked (e.g. a "Googlebot" that was a fake one).
+		if ( $out['uas'] ) {
+			$list = implode( ', ', array_fill( 0, count( $out['uas'] ), '%s' ) );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Admin screen; $list holds only %s placeholders, one per value.
+			$rows = $wpdb->get_results( $wpdb->prepare( "SELECT ua, reason, SUM(hits) AS n FROM %i WHERE created >= %s AND code >= %d AND code <= %d AND ua IN ($list) GROUP BY ua, reason ORDER BY n DESC", array_merge( array( $table, $since, $min, $max ), array_keys( $out['uas'] ) ) ), ARRAY_A );
+			foreach ( (array) $rows as $row ) {
+				$out['ua_reasons'][ $row['ua'] ][ $row['reason'] ] = (int) $row['n'];
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * The number of blocked requests of a period: one SUM, kept for 5 minutes (the Dashboard widget shows only
+	 * this, and summary() runs four grouped queries).
+	 *
+	 * @param int    $hours Hours back.
+	 * @param string $which blocked (default) | monitor | all, as in summary().
+	 * @return int
+	 */
+	public static function total( $hours = 24, $which = 'blocked' ) {
+		$hours = max( 1, (int) $hours );
+		$which = (string) $which;
+		return (int) self::aggregate(
+			'total_' . $which,
+			$hours,
+			static function () use ( $hours, $which ) {
+				global $wpdb;
+				if ( ! self::ready() ) {
+					return 0;
+				}
+				list( $min, $max ) = self::codes( $which );
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Cached by aggregate().
+				return (int) $wpdb->get_var( $wpdb->prepare( 'SELECT SUM(hits) FROM %i WHERE created >= %s AND code >= %d AND code <= %d', self::table(), gmdate( 'Y-m-d H:i:s', time() - $hours * HOUR_IN_SECONDS ), $min, $max ) );
+			}
+		)['value'];
+	}
+
+	/**
+	 * A summary of the log, counted at most once every 5 minutes. The Log tab runs several grouped queries over
+	 * up to 7 days of rows (COUNT(DISTINCT ip) among them): on a large log that is seconds of database work on
+	 * every visit. The "Refresh" button of the Log tab counts again (flush_aggregates()).
+	 *
+	 * @param string   $what  Name (summary, top_paths, repeat_offenders, total).
+	 * @param int      $hours Period in hours.
+	 * @param callable $count Counts it when there is no fresh copy.
+	 * @return array{value: mixed, time: int} The figures and when they were counted.
+	 */
+	public static function aggregate( $what, $hours, $count ) {
+		$generation = (string) self::cache_get( 'pncp_agg_gen' );
+		// The content addresses setting changes how top_paths() groups the paths: a new setting counts again.
+		$key    = 'pncp_agg_' . md5( $what . '|' . (int) $hours . '|' . $generation . '|' . PNCP_Options::stored()['content_paths'] . '|' . implode( ',', PNCP_Fluent_Community::added_paths() ) );
+		$cached = self::cache_get( $key );
+		if ( is_array( $cached ) && isset( $cached['time'] ) && array_key_exists( 'value', $cached ) && (int) $cached['time'] > time() - self::AGGREGATE_TTL ) {
+			return $cached;
+		}
+		$out = array(
+			'value' => call_user_func( $count ),
+			'time'  => time(),
+		);
+		self::cache_set( $key, $out, self::AGGREGATE_TTL );
+		return $out;
+	}
+
+	/**
+	 * Forgets the cached summaries: the next view counts them again.
+	 */
+	public static function flush_aggregates() {
+		self::cache_set( 'pncp_agg_gen', uniqid( '', true ), DAY_IN_SECONDS );
+	}
+
+	/**
+	 * The summary(), cached for 5 minutes (see aggregate()).
+	 *
+	 * @param int    $hours Hours back.
+	 * @param string $which blocked (default) | monitor | all, as in summary().
+	 * @return array{value: array<string, mixed>, time: int}
+	 */
+	public static function summary_cached( $hours = 24, $which = 'blocked' ) {
+		$hours = max( 1, (int) $hours );
+		$which = (string) $which;
+		return self::aggregate(
+			'summary_' . $which,
+			$hours,
+			static function () use ( $hours, $which ) {
+				return self::summary( $hours, $which );
+			}
+		);
+	}
+
+	/**
+	 * The top_paths(), cached for 5 minutes (see aggregate()).
+	 *
+	 * @param int    $hours Period in hours.
+	 * @param string $which blocked (default) | monitor | all, as in summary().
+	 * @return array{value: array<string, array<int, array{path:string, hits:int, ips:int}>>, time: int}
+	 */
+	public static function top_paths_cached( $hours = 24, $which = 'blocked' ) {
+		$hours = max( 1, (int) $hours );
+		$which = (string) $which;
+		return self::aggregate(
+			'top_paths_' . $which,
+			$hours,
+			static function () use ( $hours, $which ) {
+				return self::top_paths( $hours, 10, $which );
+			}
+		);
+	}
+
+	/**
+	 * The repeat_offenders() with its defaults, cached for 5 minutes (see aggregate()).
+	 *
+	 * @return array{value: array<int, array{ip:string, bans:int, total:int, last:string, reason:string}>, time: int}
+	 */
+	public static function repeat_offenders_cached() {
+		return self::aggregate(
+			'repeat_offenders',
+			168,
+			static function () {
+				return self::repeat_offenders();
+			}
+		);
+	}
+
+	/**
+	 * The paths blocked most often: what scrapers try to copy (content) and what scanners look for (files).
+	 * Three groups: "content" (addresses that exist on the site: what scrapers were after), "unknown" (addresses
+	 * that do not exist: random strings and guesses) and "probes" (files and admin paths: scanners).
+	 *
+	 * @param int    $hours Period in hours.
+	 * @param int    $limit Rows per group.
+	 * @param string $which blocked (default) | monitor | all, as in summary().
+	 * @return array{content: array<int, array{path:string, hits:int, ips:int}>, unknown: array<int, array{path:string, hits:int, ips:int}>, probes: array<int, array{path:string, hits:int, ips:int}>}
+	 */
+	public static function top_paths( $hours = 24, $limit = 10, $which = 'blocked' ) {
+		global $wpdb;
+		$out = array(
+			'content' => array(),
+			'unknown' => array(),
+			'probes'  => array(),
+		);
+		if ( ! self::ready() ) {
+			return $out;
+		}
+		$since             = gmdate( 'Y-m-d H:i:s', time() - (int) $hours * HOUR_IN_SECONDS );
+		list( $min, $max ) = self::codes( $which );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Admin screen.
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT path, SUM(hits) AS n, COUNT(DISTINCT ip) AS ips FROM %i WHERE created >= %s AND code >= %d AND code <= %d AND path <> '' GROUP BY path ORDER BY n DESC LIMIT 300", self::table(), $since, $min, $max ), ARRAY_A );
+		foreach ( (array) $rows as $row ) {
+			if ( self::is_probe_path( (string) $row['path'] ) ) {
+				$group = 'probes';
+			} else {
+				// Checked only while there is room in the groups: each check may look up the address on the site.
+				if ( count( $out['content'] ) >= $limit && count( $out['unknown'] ) >= $limit ) {
+					continue;
+				}
+				$group = self::is_site_content( (string) $row['path'] ) ? 'content' : 'unknown';
+			}
+			if ( count( $out[ $group ] ) < $limit ) {
+				$out[ $group ][] = array(
+					'path' => (string) $row['path'],
+					'hits' => (int) $row['n'],
+					'ips'  => (int) $row['ips'],
+				);
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * Persistent IPs: temporarily blocked again and again, or blocked many times without ever getting a temporary
+	 * block (e.g. a User-Agent in the bot list is refused on every request but never "violates" a limit).
+	 * Candidates for the always-blocked list.
+	 *
+	 * @param int $hours    Period in hours.
+	 * @param int $min      Minimum number of temporary blocks.
+	 * @param int $requests Minimum number of blocked requests (filter `pncp_persistent_requests`, default 100).
+	 * @param int $limit    Rows.
+	 * @return array<int, array{ip:string, bans:int, total:int, last:string, reason:string}>
+	 */
+	public static function repeat_offenders( $hours = 168, $min = 2, $requests = 0, $limit = 20 ) {
+		global $wpdb;
+		if ( ! self::ready() ) {
+			return array();
+		}
+		$requests = $requests > 0 ? (int) $requests : max( 1, (int) apply_filters( 'pncp_persistent_requests', 100 ) );
+		$since    = gmdate( 'Y-m-d H:i:s', time() - (int) $hours * HOUR_IN_SECONDS );
+		$table    = self::table();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Admin screen.
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT ip, SUM(CASE WHEN reason = 'ban' THEN hits ELSE 0 END) AS bans, SUM(hits) AS total, MAX(created) AS last FROM %i WHERE created >= %s AND code > %d AND ip <> '' GROUP BY ip HAVING SUM(CASE WHEN reason = 'ban' THEN hits ELSE 0 END) >= %d OR SUM(hits) >= %d ORDER BY total DESC LIMIT %d", $table, $since, self::MONITOR_CODE, max( 1, (int) $min ), $requests, max( 1, (int) $limit ) ), ARRAY_A );
+		$out  = array();
+		foreach ( (array) $rows as $row ) {
+			$out[ (string) $row['ip'] ] = array(
+				'ip'     => (string) $row['ip'],
+				'bans'   => (int) $row['bans'],
+				'total'  => (int) $row['total'],
+				'last'   => (string) $row['last'],
+				'reason' => '',
+			);
+		}
+		if ( $out ) {
+			// The main reason of each IP (not counting the "new temporary block" events).
+			$list = implode( ', ', array_fill( 0, count( $out ), '%s' ) );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Admin screen; $list holds only %s placeholders, one per value.
+			$reasons = $wpdb->get_results( $wpdb->prepare( "SELECT ip, reason, SUM(hits) AS n FROM %i WHERE created >= %s AND code > %d AND reason <> 'ban' AND ip IN ($list) GROUP BY ip, reason ORDER BY n DESC", array_merge( array( $table, $since, self::MONITOR_CODE ), array_keys( $out ) ) ), ARRAY_A );
+			foreach ( (array) $reasons as $row ) {
+				if ( isset( $out[ $row['ip'] ] ) && '' === $out[ $row['ip'] ]['reason'] ) {
+					$out[ $row['ip'] ]['reason'] = (string) $row['reason'];
+				}
+			}
+		}
+		return array_values( $out );
+	}
+
+	/**
+	 * A path that looks for files or admin areas (scanners), not for content.
+	 *
+	 * @param string $path Path.
+	 * @return bool
+	 */
+	public static function is_probe_path( $path ) {
+		$path = strtolower( $path );
+		// 3.10: site-metadata files (/llms.txt, /ai.txt, /.well-known/*, icons, service workers…) are not probes.
+		if ( PNCP_Paths::is_site_metadata( $path ) ) {
+			return false;
+		}
+		// 3.11: the probes of other software that "Ban scanners on their first probe" knows (PNCP_Probe::listed_paths(),
+		// filter pncp_probe_paths): /Dockerfile, /railway.toml, /www.git/config…, unless the site has a page there.
+		if ( PNCP_Probe::matches_listed( PNCP_Private_Urls::relative_path( $path ) ) ) {
+			return ! self::is_site_page( $path );
+		}
+		// 3.8: Stealth can move the REST API (another prefix) and the sitemaps (/sitemap-posts-post-1.xml).
+		if ( preg_match( '#(?:^|/)(?:wp-sitemap[a-z0-9_-]*|sitemap(?:_index)?|sitemap-[a-z0-9_-]+|[a-z0-9_-]+-sitemap[0-9]*)\.xml$#', $path ) || 0 === strpos( $path, '/wp-json/' ) || 0 === strpos( $path, '/' . rest_get_url_prefix() . '/' ) ) {
+			return false; // Sitemaps and the REST API lead to content.
+		}
+		// The site's own GraphQL endpoint (WPGraphQL) is content; any other GraphQL path is a scanner.
+		if ( preg_match( '#(?:^|/)graphql(?:/|$)#', $path ) ) {
+			return ! ( class_exists( 'WPGraphQL', false ) && '/graphql' === untrailingslashit( $path ) );
+		}
+		// Private keys, credentials and common admin / login panels of other software, unless the site has a
+		// page at that address (e.g. its own /login/ page).
+		if ( preg_match( '#(?:^|/)(?:id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|authorized_keys|known_hosts|credentials|secrets?|passwd|shadow|htpasswd|login|signin|sign-in|admin|administrator|user/login|phpmyadmin|pma|adminer|manager/html|actuator|server-status|server-info|solr|jenkins|owa|ecp|autodiscover|boaform|hnap1|telescope|_profiler|debug|console|api/v[0-9]+|v[0-9]+/api)(?:/|$)#', $path ) ) {
+			return ! self::is_site_page( $path );
+		}
+		return (bool) preg_match( '#\.(?:php\d?|env|ini|conf|cfg|config|json|ya?ml|xml|sql|bak|old|orig|swp|zip|tar|gz|rar|7z|log|txt|tfvars|map|mjs|js|asp|aspx|jsp|cgi|sh|py|rb|pl)$|/\.|/@|\.\.|^/(?:wp-admin|wp-includes|wp-content/(?:plugins|themes|uploads)|cgi-bin|vendor|node_modules|cp-[0-9a-f]{10})(?:/|$)#', $path );
+	}
+
+	/**
+	 * Does the address exist on the site? The home page, posts, pages, products and attachments, their
+	 * pagination / feeds, date archives, post type archives, category / tag / other term archives, author
+	 * archives, sitemaps and the REST API. Cached for 6 hours (admin screen only).
+	 *
+	 * @param string $path Logged path (the full request path).
+	 * @return bool
+	 */
+	public static function is_site_content( $path ) {
+		static $seen = array();
+		$path        = '/' . ltrim( (string) $path, '/' );
+		// A new prefix asks again (3.11: also one added at runtime, e.g. the FluentCommunity portal).
+		$key         = 'pncp_pc_' . md5( $path . '|' . PNCP_Options::stored()['content_paths'] . '|' . implode( ',', PNCP_Fluent_Community::added_paths() ) );
+		if ( isset( $seen[ $key ] ) ) {
+			return $seen[ $key ];
+		}
+		$cached = get_transient( $key );
+		if ( false !== $cached ) {
+			$seen[ $key ] = 'yes' === $cached;
+			return $seen[ $key ];
+		}
+		$found        = self::find_site_content( $path );
+		$seen[ $key ] = $found;
+		set_transient( $key, $found ? 'yes' : 'no', 6 * HOUR_IN_SECONDS );
+		return $found;
+	}
+
+	/**
+	 * The actual check of is_site_content().
+	 *
+	 * @param string $path Path.
+	 * @return bool
+	 */
+	private static function find_site_content( $path ) {
+		$lower = strtolower( $path );
+		if ( preg_match( '#(?:^|/)(?:wp-sitemap[a-z0-9_-]*|sitemap(?:_index)?|sitemap-[a-z0-9_-]+|[a-z0-9_-]+-sitemap[0-9]*)\.xml$#', $lower ) || false !== strpos( $lower, '/wp-json/' ) || false !== strpos( $lower, '/' . rest_get_url_prefix() . '/' ) ) {
+			return true;
+		}
+		$rel = PNCP_Private_Urls::relative_path( $path );
+		// Pagination, feeds, AMP and embeds of an address count as the address itself.
+		$rel = (string) preg_replace( '#/(?:page/[0-9]+|feed(?:/(?:rss2?|atom|rdf))?|amp|embed|comment-page-[0-9]+)/?$#i', '/', $rel );
+		if ( '/' === $rel || '' === trim( $rel, '/' ) ) {
+			return true;
+		}
+		if ( self::is_site_page( $path ) || self::is_site_page( (string) wp_parse_url( home_url( $rel ), PHP_URL_PATH ) ) ) {
+			return true;
+		}
+		foreach ( self::content_paths() as $prefix ) {
+			if ( 0 === stripos( trailingslashit( $rel ), trailingslashit( $prefix ) ) ) {
+				return true;
+			}
+		}
+		if ( self::is_plugin_route( $rel ) ) {
+			return true;
+		}
+		if ( preg_match( '#^/[0-9]{4}(?:/[0-9]{2}(?:/[0-9]{2})?)?/?$#', $rel ) ) {
+			return true; // Date archive.
+		}
+		$parts = array_values( array_filter( explode( '/', trim( $rel, '/' ) ), 'strlen' ) );
+		$last  = (string) end( $parts );
+		foreach ( get_post_types( array( 'public' => true ), 'objects' ) as $type ) {
+			$link = $type->has_archive ? get_post_type_archive_link( $type->name ) : '';
+			if ( $link && trailingslashit( PNCP_Private_Urls::relative_path( (string) wp_parse_url( $link, PHP_URL_PATH ) ) ) === trailingslashit( $rel ) ) {
+				return true;
+			}
+		}
+		foreach ( get_taxonomies( array( 'public' => true ), 'objects' ) as $taxonomy ) {
+			$slug = ! empty( $taxonomy->rewrite['slug'] ) ? trim( (string) $taxonomy->rewrite['slug'], '/' ) : '';
+			if ( '' !== $slug && 0 === stripos( ltrim( $rel, '/' ), $slug . '/' ) && get_term_by( 'slug', sanitize_title( $last ), $taxonomy->name ) ) {
+				return true;
+			}
+		}
+		if ( 2 === count( $parts ) && 'author' === strtolower( $parts[0] ) && get_user_by( 'slug', $last ) ) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * The "Content addresses" setting: path prefixes of content that WordPress itself does not know, e.g. the
+	 * pages of a community or forum plugin (/hub/space/).
+	 *
+	 * @return string[] E.g. /hub/space.
+	 */
+	public static function content_paths() {
+		$out = array();
+		foreach ( PNCP_Options::parse_list( PNCP_Options::stored()['content_paths'] ) as $entry ) {
+			$path = (string) wp_parse_url( $entry, PHP_URL_PATH ); // A full address is accepted too.
+			$path = '/' . trim( PNCP_Private_Urls::relative_path( '' !== $path ? $path : $entry ), '/' );
+			if ( '/' !== $path ) {
+				$out[] = $path;
+			}
+		}
+		return (array) apply_filters( 'pncp_content_paths', $out );
+	}
+
+	/**
+	 * Is the path a route of another plugin? The first rewrite rule that matches decides, as in WordPress: a rule
+	 * with only its own query variables (e.g. index.php?fcom_route=…) belongs to a plugin that shows content
+	 * WordPress cannot find by itself. Rules for posts, pages, terms and authors were already checked.
+	 *
+	 * @param string $rel Path within the site.
+	 * @return bool
+	 */
+	private static function is_plugin_route( $rel ) {
+		global $wp_rewrite;
+		if ( ! $wp_rewrite instanceof WP_Rewrite || ! $wp_rewrite->using_permalinks() ) {
+			return false;
+		}
+		$rules = $wp_rewrite->wp_rewrite_rules();
+		if ( ! is_array( $rules ) || ! $rules ) {
+			return false;
+		}
+		$request = trim( $rel, '/' );
+		$decoded = rawurldecode( $request );
+		foreach ( $rules as $match => $query ) {
+			if ( ! preg_match( '#^' . $match . '#', $request ) && ! preg_match( '#^' . $match . '#', $decoded ) ) {
+				continue;
+			}
+			preg_match_all( '/[?&]([^=&]+)=/', (string) $query, $vars );
+			$vars = array_diff( $vars[1], array( 'paged', 'page', 'feed', 'cpage', 'embed' ) );
+			return $vars && ! array_intersect( $vars, self::core_query_vars() );
+		}
+		return false;
+	}
+
+	/**
+	 * The query variables of WordPress itself and of the post types and taxonomies.
+	 *
+	 * @return string[]
+	 */
+	private static function core_query_vars() {
+		static $vars = null;
+		if ( null === $vars ) {
+			$wp   = new WP(); // A fresh object: its lists do not include what plugins add with the query_vars filter.
+			$vars = array_merge( $wp->public_query_vars, $wp->private_query_vars, array( 'rest_route', 'sitemap', 'sitemap-subtype', 'sitemap-stylesheet', 'favicon' ) );
+			foreach ( get_post_types( array(), 'objects' ) as $type ) {
+				if ( is_string( $type->query_var ) && '' !== $type->query_var ) {
+					$vars[] = $type->query_var;
+				}
+			}
+			foreach ( get_taxonomies( array(), 'objects' ) as $taxonomy ) {
+				if ( is_string( $taxonomy->query_var ) && '' !== $taxonomy->query_var ) {
+					$vars[] = $taxonomy->query_var;
+				}
+			}
+		}
+		return $vars;
+	}
+
+	/**
+	 * Is there a post or page of the site at this path? (Only for paths that look like probes, on the admin screen.)
+	 *
+	 * @param string $path Path.
+	 * @return bool
+	 */
+	private static function is_site_page( $path ) {
+		if ( ! function_exists( 'url_to_postid' ) ) {
+			return false;
+		}
+		// The logged path is the full request path (with the folder of a site in a subfolder): it goes after
+		// the scheme, host and port of the site address.
+		$home   = untrailingslashit( home_url( '/' ) );
+		$folder = untrailingslashit( (string) wp_parse_url( $home . '/', PHP_URL_PATH ) );
+		$origin = '' !== $folder ? substr( $home, 0, -strlen( $folder ) ) : $home;
+		return url_to_postid( $origin . $path ) > 0;
+	}
+
+	/* ---------- Bans ---------- */
+
+	/**
+	 * Is the IP banned? Runs on every request, so it avoids the database where it can: when no ban can be in
+	 * effect (the latest expiry ever stored has passed) the answer is known without a query; otherwise the
+	 * object cache or APCu keeps the answer per IP, and only then one query on the PRIMARY KEY.
+	 *
+	 * @param string $ip IP.
+	 * @return bool
+	 */
+	public static function is_banned( $ip ) {
+		global $wpdb;
+		if ( '' === $ip || ! self::ready() ) {
+			return false;
+		}
+		// Bans are stored per ban key (IPv6: the /64, like the limits and strikes), so a client cannot dodge
+		// a ban by moving to another address in the same /64.
+		$bankey = PNCP_Ip::limit_key( $ip );
+		if ( isset( self::$banned[ $bankey ] ) ) {
+			return self::$banned[ $bankey ];
+		}
+		// No ban stored by anyone can still be in effect. (Missing on a site whose tables were not upgraded yet:
+		// then the table is asked.) Not with an object cache: there the per-IP answer below is just as cheap, and a
+		// copy of the settings kept in the cache could be older than the database.
+		if ( ! wp_using_ext_object_cache() ) {
+			$latest = get_option( self::BANS_UNTIL_OPTION, false );
+			if ( false !== $latest && (int) $latest <= time() ) {
+				self::$banned[ $bankey ] = false;
+				return false;
+			}
+		}
+		$key = 'pncp_ban_' . md5( $bankey );
+		if ( wp_using_ext_object_cache() ) {
+			$until = wp_cache_get( $key, 'pncp' );
+			if ( false !== $until ) {
+				self::$banned[ $bankey ] = (int) $until > time();
+				return self::$banned[ $bankey ];
+			}
+		} elseif ( self::apcu_ok() ) {
+			$found = false;
+			$until = apcu_fetch( self::apcu_ban_key( $bankey ), $found );
+			if ( $found ) {
+				self::$banned[ $bankey ] = (int) $until > time();
+				return self::$banned[ $bankey ];
+			}
+		}
+		// 3.12.9: every ban in effect is in the store (keep_bans()), each under its IP: one that is not there is not
+		// banned, with no query in a visitor's request. Only after the store was emptied (until the next run of the
+		// scheduled event) is the table asked, as before.
+		if ( PNCP_Defer::active() && self::bans_kept() ) {
+			self::$banned[ $bankey ] = false;
+			return false;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table; the cache is above.
+		$until = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT until_ts FROM %i WHERE ip = %s', self::bans_table(), $bankey ) );
+		if ( class_exists( 'PNCP_Bots', false ) && PNCP_Bots::explaining() ) {
+			// 3.5: a check (PNCP_Bots::explain()) writes no cache entry; the answer is kept for this request only.
+			self::$banned[ $bankey ] = $until > time();
+			return self::$banned[ $bankey ];
+		}
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_set( $key, $until, 'pncp', $until > time() ? $until - time() : 5 * MINUTE_IN_SECONDS );
+		} elseif ( self::apcu_ok() ) {
+			// At most a minute: APCu belongs to one server, and a ban or an unblock made on another server of the
+			// same site reaches this one only through the table.
+			apcu_store( self::apcu_ban_key( $bankey ), $until, self::apcu_ban_ttl( $until ) );
+		}
+		self::$banned[ $bankey ] = $until > time();
+		return self::$banned[ $bankey ];
+	}
+
+	/**
+	 * 3.4.3: a ban stored or lifted from WP-CLI (or another process without the web server's APCu) did not reach
+	 * the answers that PHP-FPM keeps in APCu: "wp scrapelock block" took effect, and "unblock" ended, only after
+	 * up to a minute. Such a change now writes a new stamp, which is part of the APCu key of every answer
+	 * (is_banned()): the web server asks the table again on the next request. Autoloaded, so reading it costs
+	 * no query.
+	 */
+	private static function bans_changed_elsewhere() {
+		if ( 'cli' !== PHP_SAPI || wp_using_ext_object_cache() || self::apcu_ok() ) {
+			return;
+		}
+		$stamp = (string) microtime( true );
+		if ( ! add_option( self::BANS_STAMP_OPTION, $stamp, '', true ) ) {
+			update_option( self::BANS_STAMP_OPTION, $stamp, true );
+		}
+	}
+
+	/**
+	 * 3.4.3: the APCu key of the ban answer of an IP key. The stamp of the last change made from WP-CLI is part
+	 * of it (see bans_changed_elsewhere()).
+	 *
+	 * @param string $bankey Ban key (IPv6: the /64).
+	 * @return string
+	 */
+	private static function apcu_ban_key( $bankey ) {
+		return self::apcu_key( 'pncp_ban_' . md5( $bankey ) . '_' . (string) get_option( self::BANS_STAMP_OPTION, '' ) );
+	}
+
+	/**
+	 * 3.5: the cache key of the probe ban's 24-hour memory of an IP key (PNCP_Bots::probe_ban_minutes()). Without
+	 * an object cache the stamp of the last ban change made from WP-CLI is part of it, as for the ban answers
+	 * (apcu_ban_key()): "wp scrapelock unblock" cannot reach the web server's APCu, and the new stamp gives a
+	 * lifted IP a clean memory there.
+	 *
+	 * @param string $ip IP or ban key.
+	 * @return string
+	 */
+	public static function probe_memory_key( $ip ) {
+		$key = 'pncp_pk_' . md5( PNCP_Ip::limit_key( (string) $ip ) );
+		return wp_using_ext_object_cache() ? $key : $key . '_' . (string) get_option( self::BANS_STAMP_OPTION, '' );
+	}
+
+	/**
+	 * How long APCu keeps a ban answer: a minute, or less when the ban ends sooner.
+	 *
+	 * @param int $until Ban expiry (0 = not banned).
+	 * @return int Seconds.
+	 */
+	private static function apcu_ban_ttl( $until ) {
+		if ( $until > time() ) {
+			// 3.12.9: a ban as long as it lasts: a visitor's request does not ask the table again (bans_kept()), so
+			// the answer must not go before the ban does. The scheduled event brings in bans stored from WP-CLI or
+			// another server every minute (keep_bans()); a ban lifted from another server ends here with the
+			// cached answer (on a site served by several servers each with its own APCu).
+			return max( 1, $until - time() );
+		}
+		return $until > time() ? max( 1, min( MINUTE_IN_SECONDS, $until - time() ) ) : MINUTE_IN_SECONDS;
+	}
+
+	/**
+	 * 3.12.9: the store's key that says every ban in effect is in it (with APCu, for the stamp of the last change
+	 * made from WP-CLI, see apcu_ban_key()).
+	 *
+	 * @return string
+	 */
+	private static function bans_kept_key() {
+		return 'pncp_bans_kept' . ( wp_using_ext_object_cache() ? '' : '_' . (string) get_option( self::BANS_STAMP_OPTION, '' ) );
+	}
+
+	/**
+	 * 3.12.9: are all bans in effect in the store (keep_bans())?
+	 *
+	 * @return bool
+	 */
+	private static function bans_kept() {
+		return false !== PNCP_Defer::get( self::bans_kept_key() );
+	}
+
+	/**
+	 * 3.12.9: the scheduled event (PNCP_Defer::flush()) puts every ban in effect into the store, each under its IP,
+	 * so that a visitor's request answers is_banned() from there alone. With an object cache once (every ban
+	 * stored or lifted later changes its entry there); with APCu on every run, since a ban stored from WP-CLI
+	 * or another server does not reach this server's APCu otherwise. More than LOAD_BANS bans: not done, and the
+	 * table is asked per IP as before.
+	 */
+	public static function keep_bans() {
+		if ( '' === PNCP_Defer::store() || PNCP_Defer::active() || ! self::ready() || ( wp_using_ext_object_cache() && self::bans_kept() ) ) {
+			return;
+		}
+		$bans = self::active_bans( self::LOAD_BANS + 1 );
+		if ( count( $bans ) > self::LOAD_BANS ) {
+			PNCP_Defer::delete( self::bans_kept_key() );
+			return;
+		}
+		$now = time();
+		foreach ( $bans as $bankey => $ban ) {
+			if ( wp_using_ext_object_cache() ) {
+				wp_cache_set( 'pncp_ban_' . md5( (string) $bankey ), (int) $ban['until'], 'pncp', max( 1, (int) $ban['until'] - $now ) );
+			} else {
+				apcu_store( self::apcu_ban_key( (string) $bankey ), (int) $ban['until'], max( 1, (int) $ban['until'] - $now ) );
+			}
+		}
+		PNCP_Defer::set( self::bans_kept_key(), $now, wp_using_ext_object_cache() ? 0 : 3 * MINUTE_IN_SECONDS );
+	}
+
+	/**
+	 * Raises the latest ban expiry (BANS_UNTIL_OPTION) to $until if that is later. Atomic, so two bans stored
+	 * at the same moment cannot leave the earlier expiry behind: the value is a 10-digit number, so comparing
+	 * it as text is comparing it as a number, on any database. It is never lowered (an unblock leaves it, and
+	 * it simply passes).
+	 *
+	 * @param int $until Ban expiry.
+	 */
+	private static function raise_bans_until( $until ) {
+		global $wpdb;
+		$until = max( 0, min( 9999999999, (int) $until ) );
+		$value = sprintf( '%010d', $until );
+		if ( add_option( self::BANS_UNTIL_OPTION, $value, '', true ) ) {
+			return;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Atomic compare-and-raise; the options API cannot do it.
+		$changed = $wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value < %s", $value, self::BANS_UNTIL_OPTION, $value ) );
+		if ( $changed ) {
+			wp_cache_delete( self::BANS_UNTIL_OPTION, 'options' );
+			$all = wp_cache_get( 'alloptions', 'options' );
+			if ( is_array( $all ) && isset( $all[ self::BANS_UNTIL_OPTION ] ) ) {
+				$all[ self::BANS_UNTIL_OPTION ] = $value;
+				wp_cache_set( 'alloptions', $all, 'options' );
+			}
+		}
+	}
+
+	/**
+	 * Forgets the request's ban cache (in long-running processes, e.g. WP-CLI and tests).
+	 */
+	public static function reset_cache() {
+		self::$banned = array();
+	}
+
+	/**
+	 * Bans the IP for a number of minutes.
+	 *
+	 * @param string $ip      IP.
+	 * @param int    $minutes Minutes.
+	 * @param string $reason  Reason (key of reasons()).
+	 */
+	public static function ban( $ip, $minutes, $reason ) {
+		// Never the Google / Bing IPs, whoever tried to "trap" them, and never the CDN edge that stands in for
+		// the visitors (a ban on a Cloudflare edge would block every visitor behind it).
+		if ( '' === $ip || ! filter_var( $ip, FILTER_VALIDATE_IP ) || PNCP_Bots::is_official_crawler_ip( $ip ) || PNCP_Ip::is_cdn_edge( $ip ) || self::is_shared_proxy( $ip ) ) {
+			return;
+		}
+		$until = time() + max( 1, (int) $minutes ) * MINUTE_IN_SECONDS;
+		// Stored under the ban key (IPv6: the /64); the log entry keeps the exact IP that tripped it.
+		self::store_ban( PNCP_Ip::limit_key( $ip ), $until, $reason, time() );
+		self::add( 'ban', 403, $ip );
+		PNCP_Fail2ban::log_ban( $ip, (int) $minutes, $reason ); // 3.7: for fail2ban, when that option is on.
+		PNCP_Reputation::on_ban( $ip, $reason ); // 3.7: a block lowers the IP's reputation, when that option is on.
+	}
+
+	/**
+	 * 3.6.1: is the address the proxy that every visitor of this request comes through, unrecognised ("Real
+	 * visitor IP" does not trust it, see PNCP_Ip::untrusted_proxy_peer())? A ban on it would refuse the whole site
+	 * for its duration (behind a container network or a load balancer on a private address), so it is never
+	 * banned and earns no violation. The administrator is warned instead (PNCP_Origin::notice(), Site Health).
+	 *
+	 * @param string $ip IP.
+	 * @return bool
+	 */
+	private static function is_shared_proxy( $ip ) {
+		return ( PNCP_Ip::is_private( $ip ) || PNCP_Ip::is_local( $ip ) ) && PNCP_Ip::remote_addr() === PNCP_Ip::normalize( $ip ) && PNCP_Ip::untrusted_proxy_peer();
+	}
+
+	/**
+	 * Writes (or renews) a ban, atomically.
+	 *
+	 * @param string $ip     IP.
+	 * @param int    $until  Expiry.
+	 * @param string $reason Reason.
+	 * @param int    $since  Since when.
+	 */
+	private static function store_ban( $ip, $until, $reason, $since ) {
+		global $wpdb;
+		if ( PNCP_Defer::active() ) {
+			// 3.12.9: in a visitor's request with a persistent store: in effect at once through the store (every
+			// request reads bans from there), written to the table, the pre-cache check's file and the CDN by the
+			// scheduled event (store_deferred_bans()). Never shorter than the ban the store holds.
+			if ( wp_using_ext_object_cache() ) {
+				$until = max( (int) $until, (int) wp_cache_get( 'pncp_ban_' . md5( $ip ), 'pncp' ) );
+				wp_cache_set( 'pncp_ban_' . md5( $ip ), $until, 'pncp', max( 1, $until - time() ) );
+			} else {
+				$until = max( (int) $until, (int) apcu_fetch( self::apcu_ban_key( $ip ) ) );
+				apcu_store( self::apcu_ban_key( $ip ), $until, self::apcu_ban_ttl( $until ) );
+			}
+			self::$banned[ $ip ] = true;
+			PNCP_Defer::push( 'ban', array( $ip, $until, (string) $reason, (int) $since ) );
+			return;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Atomic write to the plugin table.
+		$ok = $wpdb->query(
+			$wpdb->prepare(
+				'INSERT INTO %i (ip, until_ts, since_ts, reason) VALUES (%s, %d, %d, %s) ON DUPLICATE KEY UPDATE since_ts = IF(until_ts <= UNIX_TIMESTAMP(), VALUES(since_ts), since_ts), until_ts = GREATEST(until_ts, VALUES(until_ts)), reason = VALUES(reason)',
+				self::bans_table(),
+				$ip,
+				$until,
+				$since,
+				substr( (string) $reason, 0, 20 )
+			)
+		);
+		if ( false === $ok ) {
+			// Database without ON DUPLICATE KEY / GREATEST (e.g. SQLite): REPLACE, 3.6.1: never with an earlier
+			// expiry than the ban already stored.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+			$until = max( (int) $until, (int) $wpdb->get_var( $wpdb->prepare( 'SELECT until_ts FROM %i WHERE ip = %s', self::bans_table(), $ip ) ) );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+			$wpdb->replace(
+				self::bans_table(),
+				array(
+					'ip'       => $ip,
+					'until_ts' => $until,
+					'since_ts' => $since,
+					'reason'   => substr( (string) $reason, 0, 20 ),
+				),
+				array( '%s', '%d', '%d', '%s' )
+			);
+		} elseif ( 1 !== (int) $ok ) {
+			// 3.6.1: an existing row was renewed, and GREATEST() kept the later expiry. The caches and the pre-cache
+			// check's ban file get that one, not the one asked for: a trap hit (10 minutes) of an IP banned for an
+			// hour shortened its ban there, and cached pages were served to it again.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table; bans are rare.
+			$until = max( (int) $until, (int) $wpdb->get_var( $wpdb->prepare( 'SELECT until_ts FROM %i WHERE ip = %s', self::bans_table(), $ip ) ) );
+		}
+		self::raise_bans_until( $until );
+		self::$banned[ $ip ] = true;
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_set( 'pncp_ban_' . md5( $ip ), $until, 'pncp', max( 1, $until - time() ) );
+		} elseif ( self::apcu_ok() ) {
+			apcu_store( self::apcu_ban_key( $ip ), $until, self::apcu_ban_ttl( $until ) );
+		}
+		self::bans_changed_elsewhere();
+		PNCP_Precheck::mirror_ban( $ip, $until );
+		/**
+		 * A ban was added or renewed (blocking at the CDN follows it).
+		 *
+		 * @param string $ip    Ban key (IPv6: the /64).
+		 * @param int    $until Expiry.
+		 */
+		do_action( 'pncp_bans_changed', $ip, $until );
+	}
+
+	/**
+	 * 3.12.9: the bans visitors' requests decided (store_ban()), written by the scheduled event as store_ban()
+	 * writes them without a store: the table, the latest expiry, the pre-cache check's file, the CDN.
+	 *
+	 * @param array<int, mixed> $rows Queued bans: [ban key, until, reason, since].
+	 */
+	public static function store_deferred_bans( $rows ) {
+		if ( ! self::ready() ) {
+			return;
+		}
+		foreach ( $rows as $row ) {
+			if ( is_array( $row ) && 4 === count( $row ) && (int) $row[1] > time() ) {
+				self::store_ban( (string) $row[0], (int) $row[1], (string) $row[2], (int) $row[3] );
+			}
+		}
+	}
+
+	/**
+	 * A ban decided by the pre-cache check: stored like the others, so that it shows under "Blocked IPs"
+	 * and can be lifted there. Expired ones are skipped.
+	 *
+	 * @param string $ip     IP.
+	 * @param int    $until  Expiry.
+	 * @param string $reason Reason.
+	 * @param int    $since  Since when.
+	 */
+	public static function import_ban( $ip, $until, $reason, $since ) {
+		// The same exceptions as ban(): never the Google / Bing IPs, and never the CDN edge that stands in for the visitors.
+		if ( '' === $ip || ! filter_var( $ip, FILTER_VALIDATE_IP ) || $until <= time() || PNCP_Bots::is_official_crawler_ip( $ip ) || PNCP_Ip::is_cdn_edge( $ip ) ) {
+			return;
+		}
+		self::store_ban( PNCP_Ip::limit_key( $ip ), (int) $until, $reason, (int) $since );
+	}
+
+	/**
+	 * Lifts the ban on an IP.
+	 *
+	 * @param string $ip IP, or the ban key as stored (IPv6: e.g. 2001:db8:1:2::/64).
+	 */
+	public static function unban( $ip ) {
+		global $wpdb;
+		// An IPv6 address is banned under its /64 (see ban()): lift that, not the exact address.
+		$ip = false === strpos( (string) $ip, '/' ) ? PNCP_Ip::limit_key( (string) $ip ) : (string) $ip;
+		// 3.4.3: the table first and the cached answers after it. The other way round, a request of the banned IP
+		// between the two read the row that was still there and cached the ban again (PHP-FPM: for a minute).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$wpdb->delete( self::bans_table(), array( 'ip' => $ip ), array( '%s' ) );
+		PNCP_Precheck::forget_ban( $ip );
+		self::cache_delete( 'pncp_st_' . md5( PNCP_Ip::limit_key( $ip ) ) );
+		self::cache_delete( self::probe_memory_key( $ip ) ); // 3.5: the probe ban's 24-hour memory: a lifted IP starts clean.
+		PNCP_Reputation::forget( $ip ); // 3.7: and its reputation too: unblocking it by hand says it is fine.
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete( 'pncp_ban_' . md5( $ip ), 'pncp' );
+		} elseif ( self::apcu_ok() ) {
+			apcu_delete( self::apcu_ban_key( $ip ) );
+		}
+		unset( self::$banned[ $ip ] );
+		self::bans_changed_elsewhere();
+		/** This action is documented in includes/class-pncp-log.php */
+		do_action( 'pncp_bans_changed', $ip, 0 );
+	}
+
+	/**
+	 * Lifts all bans.
+	 */
+	public static function unban_all() {
+		global $wpdb;
+		$ips = array_keys( self::active_bans( 0 ) );
+		// 3.4.3: the table first, the cached answers after it (see unban()).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i', self::bans_table() ) );
+		PNCP_Precheck::forget_all_bans();
+		foreach ( $ips as $ip ) {
+			self::cache_delete( 'pncp_st_' . md5( PNCP_Ip::limit_key( (string) $ip ) ) );
+			self::cache_delete( self::probe_memory_key( (string) $ip ) ); // 3.5: the probe ban's memory.
+			if ( wp_using_ext_object_cache() ) {
+				wp_cache_delete( 'pncp_ban_' . md5( (string) $ip ), 'pncp' );
+			} elseif ( self::apcu_ok() ) {
+				apcu_delete( self::apcu_ban_key( (string) $ip ) );
+			}
+		}
+		self::$banned = array();
+		self::bans_changed_elsewhere();
+		/** This action is documented in includes/class-pncp-log.php */
+		do_action( 'pncp_bans_changed', '', 0 );
+	}
+
+	/**
+	 * The active bans, most recent first.
+	 *
+	 * @param int $limit Maximum count (0 = all).
+	 * @return array<string, array<string, mixed>>
+	 */
+	public static function active_bans( $limit = self::MAX_BANS ) {
+		global $wpdb;
+		if ( ! self::ready() ) {
+			return array();
+		}
+		$sql = $wpdb->prepare( 'SELECT ip, until_ts, since_ts, reason FROM %i WHERE until_ts > %d ORDER BY since_ts DESC', self::bans_table(), time() );
+		if ( (int) $limit > 0 ) {
+			$sql .= $wpdb->prepare( ' LIMIT %d', (int) $limit );
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.NotPrepared -- Plugin table; prepared above.
+		$rows = (array) $wpdb->get_results( $sql, ARRAY_A );
+		$out  = array();
+		foreach ( $rows as $row ) {
+			$out[ (string) $row['ip'] ] = array(
+				'until'  => (int) $row['until_ts'],
+				'since'  => (int) $row['since_ts'],
+				'reason' => (string) $row['reason'],
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * How many bans are currently in effect.
+	 *
+	 * @return int
+	 */
+	public static function count_bans() {
+		global $wpdb;
+		if ( ! self::ready() ) {
+			return 0;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		return (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE until_ts > %d', self::bans_table(), time() ) );
+	}
+
+	/**
+	 * Records a "violation". When they reach the limit within 10 minutes, the IP is banned.
+	 *
+	 * @param string $ip     IP.
+	 * @param string $reason Reason.
+	 * @return bool Whether the IP was just banned.
+	 */
+	public static function strike( $ip, $reason ) {
+		$s       = PNCP_Options::get();
+		$strikes = (int) $s['ban_strikes'];
+		// "Monitor only" never leads to a ban: nothing is counted toward one either, so switching to blocking
+		// starts with a clean slate.
+		// 3.6.1: never for the request's IP when it may be spoofed (PNCP_Ip::reliable(); strike() is only called
+		// for the current request), and never for an unrecognised proxy every visitor comes through.
+		if ( $strikes < 1 || '' === $ip || PNCP_Ip::is_cdn_edge( $ip ) || PNCP_Options::monitoring( $s ) || ! PNCP_Ip::reliable() || self::is_shared_proxy( $ip ) ) {
+			return false;
+		}
+		$key = 'pncp_st_' . md5( PNCP_Ip::limit_key( $ip ) ); // IPv6: per /64, like the limits.
+		if ( wp_using_ext_object_cache() ) {
+			// Atomic: two concurrent violations cannot both read the same value and lose a strike.
+			wp_cache_add( $key, 0, 'pncp', 10 * MINUTE_IN_SECONDS );
+			$count = (int) wp_cache_incr( $key, 1, 'pncp' );
+		} elseif ( self::apcu_ok() ) {
+			// Atomic too, in PHP's shared memory (bots that send requests in parallel would otherwise lose strikes).
+			$name = self::apcu_key( $key );
+			apcu_add( $name, 0, 10 * MINUTE_IN_SECONDS );
+			$count = (int) apcu_inc( $name );
+		} else {
+			// 3.6.1: atomic in the plugin's table (cache_incr()); read + write of a transient otherwise, as before.
+			$count = self::cache_incr( $key, 10 * MINUTE_IN_SECONDS );
+		}
+		if ( $count >= $strikes ) {
+			self::cache_delete( $key );
+			if ( self::apcu_ok() ) {
+				apcu_delete( self::apcu_key( $key ) );
+			}
+			self::ban( $ip, (int) $s['ban_minutes'], $reason );
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Can the per-minute counters live in APCu (PHP's shared memory) instead of the database? Only where APCu is
+	 * shared by all PHP workers of the site (PHP-FPM, Apache mod_php); under CGI or LSAPI each process may
+	 * have its own, and the counts would be split. Filter `pncp_use_apcu`.
+	 *
+	 * @return bool
+	 */
+	public static function apcu_ok() {
+		static $ok = null;
+		if ( null === $ok ) {
+			$ok = function_exists( 'apcu_enabled' ) && apcu_enabled() && in_array( PHP_SAPI, array( 'fpm-fcgi', 'apache2handler' ), true );
+			$ok = (bool) apply_filters( 'pncp_use_apcu', $ok );
+		}
+		return $ok;
+	}
+
+	/**
+	 * An APCu key for this site (several sites may share one server and its APCu).
+	 *
+	 * @param string $key Key.
+	 * @return string
+	 */
+	public static function apcu_key( $key ) {
+		static $prefix = null;
+		if ( null === $prefix ) {
+			$prefix = 'pncp_' . substr( md5( ABSPATH . '|' . get_current_blog_id() ), 0, 8 ) . '_';
+		}
+		return $prefix . $key;
+	}
+
+	/* ---------- 3.6.1: short-lived values in the plugin's own table (kv_table()) ---------- */
+
+	/**
+	 * Can the table of short-lived values be used? Only on MySQL / MariaDB (mysqli: the counters read
+	 * LAST_INSERT_ID() of their own connection), once the table exists (schema 4). Answered once per request
+	 * and site; a query that fails (the table was dropped, a database that cannot run it) turns it off for the
+	 * rest of the request, and everything falls back to transients, as before 3.6.1.
+	 *
+	 * @return bool
+	 */
+	public static function kv_on() {
+		global $wpdb;
+		$site = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
+		if ( ! isset( self::$kv[ $site ] ) ) {
+			self::$kv[ $site ] = $wpdb instanceof wpdb && $wpdb->dbh instanceof mysqli && (int) get_option( 'pncp_db_version', 0 ) >= self::KV_VERSION;
+		}
+		return self::$kv[ $site ];
+	}
+
+	/**
+	 * A query on the table failed: the rest of the request uses transients.
+	 */
+	private static function kv_failed() {
+		$site              = function_exists( 'get_current_blog_id' ) ? (int) get_current_blog_id() : 0;
+		self::$kv[ $site ] = false;
+	}
+
+	/**
+	 * Reads a value, like get_transient(): false when there is none or it has expired.
+	 *
+	 * @param string $key Key.
+	 * @return mixed|null The value (false = none); null when the table cannot be used.
+	 */
+	public static function kv_get( $key ) {
+		global $wpdb;
+		if ( ! self::kv_on() ) {
+			return null;
+		}
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table: these values are the cache.
+		$row   = $wpdb->get_row( $wpdb->prepare( 'SELECT v, expires FROM %i WHERE k = %s', self::kv_table(), (string) $key ), ARRAY_N );
+		$error = (string) $wpdb->last_error;
+		$wpdb->suppress_errors( $suppress );
+		if ( '' !== $error ) {
+			self::kv_failed();
+			return null;
+		}
+		if ( ! is_array( $row ) || (int) $row[1] < time() ) {
+			return false; // None, or expired (the hourly cleanup deletes it).
+		}
+		return maybe_unserialize( $row[0] );
+	}
+
+	/**
+	 * Writes a value, like set_transient(): a value that is still valid keeps its expiry (a transient's timeout
+	 * is set when it is created), an expired or new one gets now + $ttl.
+	 *
+	 * @param string $key   Key.
+	 * @param mixed  $value Value.
+	 * @param int    $ttl   Seconds.
+	 * @return bool|null Whether it was written; null when the table cannot be used.
+	 */
+	public static function kv_set( $key, $value, $ttl ) {
+		global $wpdb;
+		if ( ! self::kv_on() ) {
+			return null;
+		}
+		$now      = time();
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$done = $wpdb->query(
+			$wpdb->prepare(
+				'INSERT INTO %i (k, v, expires) VALUES (%s, %s, %d) ON DUPLICATE KEY UPDATE expires = IF(expires < %d, VALUES(expires), expires), v = VALUES(v)',
+				self::kv_table(),
+				(string) $key,
+				maybe_serialize( $value ),
+				$now + max( 1, (int) $ttl ),
+				$now
+			)
+		);
+		$wpdb->suppress_errors( $suppress );
+		if ( false === $done ) {
+			self::kv_failed();
+			return null;
+		}
+		return true;
+	}
+
+	/**
+	 * Writes a value only when there is none (or it has expired). Atomic: of two requests at the same moment,
+	 * one gets true.
+	 *
+	 * @param string $key   Key.
+	 * @param mixed  $value Value.
+	 * @param int    $ttl   Seconds.
+	 * @return bool|null Whether this call wrote it; null when the table cannot be used.
+	 */
+	public static function kv_add( $key, $value, $ttl ) {
+		global $wpdb;
+		if ( ! self::kv_on() ) {
+			return null;
+		}
+		$now      = time();
+		$value    = maybe_serialize( $value );
+		$expires  = $now + max( 1, (int) $ttl );
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- Plugin table, atomic insert.
+		$added = $wpdb->query( $wpdb->prepare( 'INSERT IGNORE INTO %i (k, v, expires) VALUES (%s, %s, %d)', self::kv_table(), (string) $key, $value, $expires ) );
+		if ( 0 === $added ) {
+			// There is one: taken over only if it has expired (the row lock lets one request do it).
+			$added = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET v = %s, expires = %d WHERE k = %s AND expires < %d', self::kv_table(), $value, $expires, (string) $key, $now ) );
+		}
+		// phpcs:enable
+		$wpdb->suppress_errors( $suppress );
+		if ( false === $added ) {
+			self::kv_failed();
+			return null;
+		}
+		return 1 === (int) $added;
+	}
+
+	/**
+	 * Adds $step to a counter and returns the new count, atomically: the addition happens inside MySQL, and the
+	 * new value is read back with LAST_INSERT_ID() on the same connection (as PNCP_Bots::db_incr() did in
+	 * wp_options). A new or expired counter starts at $step, valid for $ttl seconds.
+	 *
+	 * @param string $key  Key.
+	 * @param int    $ttl  Seconds (from the first count).
+	 * @param int    $step How much to add.
+	 * @return int|null The count; null when the table cannot be used.
+	 */
+	public static function kv_incr( $key, $ttl, $step = 1 ) {
+		global $wpdb;
+		if ( ! self::kv_on() ) {
+			return null;
+		}
+		$now      = time();
+		$step     = max( 1, (int) $step );
+		$suppress = $wpdb->suppress_errors( true );
+		// v is assigned before expires, so both IF()s read the expiry the row had.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Atomic counter in the plugin table.
+		$rows = $wpdb->query(
+			$wpdb->prepare(
+				'INSERT INTO %i (k, v, expires) VALUES (%s, %s, %d) ON DUPLICATE KEY UPDATE v = LAST_INSERT_ID(IF(expires < %d, %d, v + %d)), expires = IF(expires < %d, VALUES(expires), expires)',
+				self::kv_table(),
+				(string) $key,
+				(string) $step,
+				$now + max( 1, (int) $ttl ),
+				$now,
+				$step,
+				$step,
+				$now
+			)
+		);
+		$count = (int) $wpdb->insert_id; // mysqli_insert_id() of the same (write) connection: LAST_INSERT_ID(expr).
+		$wpdb->suppress_errors( $suppress );
+		if ( false === $rows ) {
+			self::kv_failed();
+			return null;
+		}
+		if ( 1 === (int) $rows ) {
+			return $step; // A new row.
+		}
+		return $count >= $step ? $count : null; // Unexpected: the caller falls back, as PNCP_Bots::db_incr() does.
+	}
+
+	/**
+	 * Adds $step to a counter that already exists and is still valid; nothing when there is none.
+	 *
+	 * @param string $key  Key.
+	 * @param int    $step How much to add.
+	 * @return int|false|null The new count; false when there is no such counter; null when the table cannot be used.
+	 */
+	public static function kv_bump( $key, $step = 1 ) {
+		global $wpdb;
+		if ( ! self::kv_on() || ! ( $wpdb->dbh instanceof mysqli ) ) {
+			return null;
+		}
+		$step     = max( 1, (int) $step );
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Atomic counter in the plugin table.
+		$rows = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET v = LAST_INSERT_ID(v + %d) WHERE k = %s AND expires >= %d', self::kv_table(), $step, (string) $key, time() ) );
+		$wpdb->suppress_errors( $suppress );
+		if ( false === $rows ) {
+			self::kv_failed();
+			return null;
+		}
+		if ( 1 !== (int) $rows ) {
+			return false;
+		}
+		// wpdb reads insert_id only after an INSERT: LAST_INSERT_ID(expr) of the UPDATE just run, same connection.
+		$count = (int) mysqli_insert_id( $wpdb->dbh ); // phpcs:ignore WordPress.DB.RestrictedFunctions -- wpdb has no accessor for it.
+		return $count >= $step + 1 ? $count : null;
+	}
+
+	/**
+	 * Deletes a value.
+	 *
+	 * @param string $key Key.
+	 * @return bool|null Null when the table cannot be used.
+	 */
+	public static function kv_delete( $key ) {
+		global $wpdb;
+		if ( ! self::kv_on() ) {
+			return null;
+		}
+		$suppress = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Plugin table.
+		$done = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE k = %s', self::kv_table(), (string) $key ) );
+		$wpdb->suppress_errors( $suppress );
+		if ( false === $done ) {
+			self::kv_failed();
+			return null;
+		}
+		return true;
+	}
+
+	/* ---------- Cache: object cache if present, otherwise APCu (see apcu_ok()), otherwise the plugin's table (3.6.1), otherwise transients ---------- */
+
+	/**
+	 * Read.
+	 *
+	 * @param string $key Key.
+	 * @return mixed False when there is nothing.
+	 */
+	public static function cache_get( $key ) {
+		if ( wp_using_ext_object_cache() ) {
+			return wp_cache_get( $key, 'pncp' );
+		}
+		if ( self::apcu_ok() ) {
+			// No database query and no row in wp_options (log grouping, the human check throttle and the like).
+			return apcu_fetch( self::apcu_key( $key ) );
+		}
+		$value = self::kv_get( $key );
+		return null !== $value ? $value : get_transient( $key );
+	}
+
+	/**
+	 * Write.
+	 *
+	 * @param string $key   Key.
+	 * @param mixed  $value Value.
+	 * @param int    $ttl   Seconds.
+	 */
+	public static function cache_set( $key, $value, $ttl ) {
+		self::$unstored = false;
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_set( $key, $value, 'pncp', max( 1, (int) $ttl ) );
+		} elseif ( self::apcu_ok() ) {
+			apcu_store( self::apcu_key( $key ), $value, max( 1, (int) $ttl ) );
+		} elseif ( null === self::kv_set( $key, $value, $ttl ) ) {
+			if ( false === get_transient( $key ) && ! self::transient_slot() ) {
+				self::$unstored = true; // 3.6.1: a new transient past the minute's allowance.
+				return;
+			}
+			set_transient( $key, $value, max( 1, (int) $ttl ) );
+		}
+	}
+
+	/**
+	 * 3.6.1: may one more new transient be written this minute (TRANSIENT_NEW_PER_MINUTE)? Only asked on the last
+	 * fallback (no object cache, APCu or table). Counted in one transient, read then written: not atomic, so a few
+	 * more may pass under concurrency, which is enough for a cap on table growth.
+	 *
+	 * @return bool
+	 */
+	private static function transient_slot() {
+		$limit = (int) apply_filters( 'pncp_transient_new_per_minute', self::TRANSIENT_NEW_PER_MINUTE );
+		if ( $limit <= 0 ) {
+			return true;
+		}
+		$key  = 'pncp_tn_' . (int) floor( time() / MINUTE_IN_SECONDS );
+		$used = (int) get_transient( $key );
+		if ( $used >= $limit ) {
+			return false;
+		}
+		set_transient( $key, $used + 1, 2 * MINUTE_IN_SECONDS );
+		return true;
+	}
+
+	/**
+	 * 3.6.1: did the last cache_set() / cache_add() / cache_incr() leave its value unstored (new transients over
+	 * the minute's allowance)? The human check's throttle then answers 429 rather than not counting.
+	 *
+	 * @return bool
+	 */
+	public static function unstored() {
+		return self::$unstored;
+	}
+
+	/**
+	 * 3.4.3: write only if the key is not there yet; atomic with an object cache or APCu.
+	 *
+	 * @param string $key   Key.
+	 * @param mixed  $value Value.
+	 * @param int    $ttl   Seconds.
+	 * @return bool Whether this call wrote it.
+	 */
+	public static function cache_add( $key, $value, $ttl ) {
+		self::$unstored = false;
+		if ( wp_using_ext_object_cache() ) {
+			return (bool) wp_cache_add( $key, $value, 'pncp', max( 1, (int) $ttl ) );
+		}
+		if ( self::apcu_ok() ) {
+			return (bool) apcu_add( self::apcu_key( $key ), $value, max( 1, (int) $ttl ) );
+		}
+		$added = self::kv_add( $key, $value, $ttl );
+		if ( null !== $added ) {
+			return $added; // 3.6.1: atomic here too.
+		}
+		if ( false !== get_transient( $key ) ) {
+			return false;
+		}
+		if ( ! self::transient_slot() ) {
+			self::$unstored = true; // 3.6.1: past the minute's allowance: not written, and not claimed.
+			return false;
+		}
+		set_transient( $key, $value, max( 1, (int) $ttl ) );
+		return true;
+	}
+
+	/**
+	 * 3.4.3: adds 1 to a counter and returns the new count; atomic with an object cache or APCu.
+	 *
+	 * @param string $key Key.
+	 * @param int    $ttl Seconds (from the first count).
+	 * @return int
+	 */
+	public static function cache_incr( $key, $ttl ) {
+		self::$unstored = false;
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_add( $key, 0, 'pncp', max( 1, (int) $ttl ) );
+			$count = wp_cache_incr( $key, 1, 'pncp' );
+			if ( false !== $count ) {
+				return (int) $count;
+			}
+		} elseif ( self::apcu_ok() ) {
+			apcu_add( self::apcu_key( $key ), 0, max( 1, (int) $ttl ) );
+			$count = apcu_inc( self::apcu_key( $key ) );
+			if ( false !== $count ) {
+				return (int) $count;
+			}
+		} else {
+			$count = self::kv_incr( $key, $ttl );
+			if ( null !== $count ) {
+				return $count; // 3.6.1: atomic here too.
+			}
+		}
+		$count = (int) self::cache_get( $key ) + 1;
+		self::cache_set( $key, $count, $ttl );
+		return $count;
+	}
+
+	/**
+	 * Delete.
+	 *
+	 * @param string $key Key.
+	 */
+	public static function cache_delete( $key ) {
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete( $key, 'pncp' );
+		} elseif ( self::apcu_ok() ) {
+			apcu_delete( self::apcu_key( $key ) );
+		} elseif ( null === self::kv_delete( $key ) ) {
+			delete_transient( $key );
+		}
+	}
+
+	/**
+	 * Suggested text for the Privacy Policy.
+	 */
+	public static function privacy_policy() {
+		if ( ! is_admin() || ! function_exists( 'wp_add_privacy_policy_content' ) ) {
+			return;
+		}
+		wp_add_privacy_policy_content(
+			__( 'ScrapeLock', 'scrapelock' ),
+			'<p>' . esc_html__( 'To protect content from automated copying, when a request is blocked we record the IP address, the browser\'s User-Agent, the page and the time. This data is deleted automatically after a few days and is not used for any other purpose.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html__( 'If blocking at the CDN is turned on, the IP addresses that are blocked temporarily are also sent to our CDN provider (Cloudflare or Bunny CDN), with a short note that gives the reason and the end of the block, so the CDN can refuse them before they reach our server. Each one is removed from the CDN when the block ends. Nothing else about visitors is sent.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html__( 'So that administrators are never blocked by mistake, the IP addresses from which administrators used the site\'s dashboard in the last 30 days are kept; older ones are deleted automatically.', 'scrapelock' ) . '</p>'
+			// 3.7.
+			. '<p>' . esc_html__( 'If IP reputation is turned on, for each IP address (stored only as a one-way hash) we keep, for up to 7 days, when it last read pages, passed the automatic human check, was used to sign in, or was refused or blocked, to treat it more or less strictly. We count visits that come from AI assistants (such as ChatGPT or Perplexity) per day and page only, without any data about the visitor.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html__( 'If the CrowdSec blocklist is turned on, we download a list of IP addresses known for attacks and check visitors against it on our server; no data about visitors is sent to CrowdSec or the list\'s provider. If writing blocks to the system log is turned on, the IP addresses that are blocked temporarily are also written to our server\'s system log, so the server\'s firewall can block them for the same time.', 'scrapelock' ) . '</p>'
+			// 3.8.
+			. '<p>' . esc_html__( 'To see where the site is attacked, for failed sign-ins, visits to the sign-in page or the dashboard without signing in, XML-RPC calls and requests that look for weak points, we record the IP address, the address asked for, the time (per hour) and, for a failed sign-in, the username that was tried. This is deleted automatically after 7, 30 or 90 days and is not used for any other purpose.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html__( 'If the weekly attack report is turned on, a summary of the attack record (counts, the addresses attacked, the IP addresses that attacked most and the usernames tried) is emailed once a week to the site\'s administration email address.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html( PNCP_Login::privacy_text() ) . '</p>'
+			. '<p>' . esc_html__( 'When a vulnerable point is locked (Vulnerable points), refused requests to it (XML-RPC, wp-admin while signed out, author archives) are written to the block log with the visitor\'s IP address and User-Agent, like other blocks. The list of changes keeps the username of the administrator who made each change.', 'scrapelock' ) . '</p>'
+			// 3.12.1.
+			. '<p>' . esc_html__( 'When a signed-in member goes over a per-account limit, the block log also keeps the member\'s username with that entry, deleted with the rest of the log.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html( PNCP_Bunny::privacy_policy() ) . '</p>'
+			// 3.12.1: Traffic, with this site's retention and IP addresses setting.
+			. '<p>' . esc_html( PNCP_Traffic::privacy_text() ) . '</p>'
+			// 3.12.5.
+			. '<p>' . esc_html__( 'When you are signed in, ScrapeLock sets a cookie named pncp_si with the value 1 in your browser, so that this site\'s pages can tell that you are signed in even when they come from a cache. It contains no personal data, is removed when you sign out and lasts no longer than your sign-in.', 'scrapelock' ) . '</p>'
+			. '<p>' . esc_html__( 'ScrapeLock Stealth changes the addresses of the theme, plugin and media files in the pages sent to visitors. It stores no data about visitors. Its self-test and scan only request this site\'s own public pages, from the site itself.', 'scrapelock' ) . '</p>'
+		);
+	}
+}

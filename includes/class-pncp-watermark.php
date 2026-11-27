@@ -1,0 +1,1822 @@
+<?php
+/**
+ * Image watermarking.
+ *
+ * - Applied to the sizes WordPress generates (thumbnail, medium, large…) and, optionally, to the
+ *   full-size image. Before that, the clean full-size file is saved in a hidden folder, so it can
+ *   always be restored.
+ * - Never a double watermark: each image records (meta `_pncp_wm`) which files are already watermarked. When
+ *   sizes are regenerated, they are always generated from a clean source.
+ * - Excluded: the watermark itself, the site icon, the logo, the WooCommerce placeholder image
+ *   and (by default) product images, which Google Merchant, Skroutz etc. reject.
+ *
+ * @package ScrapeLock
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * GD watermark: a PNG image from the media library or, if none is set, the site's domain.
+ */
+final class PNCP_Watermark {
+
+	/**
+	 * Meta holding the image state: ['full' => [relative path => md5 of the watermarked file], 'sizes' => [file => 1|0]].
+	 */
+	const META = '_pncp_wm';
+
+	/**
+	 * Cron hook that removes the watermark from one image (e.g. when it becomes a logo or a product image).
+	 */
+	const CRON_UNMARK = 'pncp_wm_unmark';
+
+	/**
+	 * Supported image types.
+	 *
+	 * @var string[]
+	 */
+	private static $mimes = array( 'image/jpeg', 'image/png', 'image/webp' );
+
+	/**
+	 * How many sizes failed to regenerate during the last run.
+	 *
+	 * @var int
+	 */
+	private static $errors = 0;
+
+	/**
+	 * Per-request watermark cache.
+	 *
+	 * @var resource|\GdImage|false|null
+	 */
+	private static $mark = null;
+
+	/**
+	 * The faded watermark of this request, per opacity.
+	 *
+	 * @var array<int, resource|\GdImage>
+	 */
+	private static $faded = array();
+
+	/**
+	 * The stand-ins for clean full-size images worked out in this request (see stand_in()).
+	 *
+	 * @var array<int, array|null>
+	 */
+	private static $stand_ins = array();
+
+	/**
+	 * Registers the hooks.
+	 */
+	public static function init() {
+		add_filter( 'wp_generate_attachment_metadata', array( __CLASS__, 'on_generate' ), 20, 3 );
+		add_action( 'delete_attachment', array( __CLASS__, 'on_delete' ) );
+		add_action( self::CRON_UNMARK, array( __CLASS__, 'unmark' ) );
+		add_action( 'added_post_meta', array( __CLASS__, 'on_post_meta' ), 10, 4 );
+		add_action( 'updated_post_meta', array( __CLASS__, 'on_post_meta' ), 10, 4 );
+		add_action( 'updated_option', array( __CLASS__, 'on_option' ), 10, 3 );
+		add_action( 'added_option', array( __CLASS__, 'on_added_option' ), 10, 2 );
+		add_filter( 'load_image_to_edit_path', array( __CLASS__, 'edit_from_clean' ), 10, 2 );
+		add_action( 'updated_post_meta', array( __CLASS__, 'on_edited' ), 10, 3 );
+		add_filter( 'wp_calculate_image_srcset', array( __CLASS__, 'srcset' ), 10, 5 );
+		// When the full size is not watermarked, visitors get the largest watermarked size wherever the full size
+		// would be linked: the product gallery zoom / lightbox, the Product Gallery blocks, the Store API, wc/v3.
+		add_filter( 'wp_get_attachment_image_src', array( __CLASS__, 'public_image_src' ), 20, 4 );
+		add_filter( 'woocommerce_gallery_image_html_attachment_image_params', array( __CLASS__, 'gallery_params' ), 20, 2 );
+		add_filter( 'woocommerce_single_product_image_thumbnail_html', array( __CLASS__, 'gallery_html' ), 20, 2 );
+		add_filter( 'woocommerce_available_variation', array( __CLASS__, 'variation_data' ), 20, 3 );
+		add_filter( 'woocommerce_structured_data_product', array( __CLASS__, 'structured_data' ), 20, 2 );
+		add_filter( 'woocommerce_rest_prepare_product_object', array( __CLASS__, 'rest_product' ), 20, 3 );
+		add_filter( 'woocommerce_rest_prepare_product_variation_object', array( __CLASS__, 'rest_product' ), 20, 3 );
+		// 3.4.2: the media endpoint of the REST API (source_url, guid, the description's link), the attachment
+		// page's link to the file, and the redirect from an attachment page to its file (attachment pages off).
+		add_filter( 'rest_prepare_attachment', array( __CLASS__, 'rest_attachment' ), 20, 3 );
+		add_filter( 'wp_get_attachment_link', array( __CLASS__, 'attachment_link' ), 20, 2 );
+		add_filter( 'redirect_canonical', array( __CLASS__, 'attachment_redirect' ), 20, 2 );
+		// 3.4.3: an image inserted at "Full Size" in a post (its src, the "link to media file" around it, the
+		// lightbox's uploadedSrc). After core's lightbox (priority 15).
+		add_filter( 'wp_content_img_tag', array( __CLASS__, 'content_img' ), 20, 3 );
+		add_filter( 'render_block_core/image', array( __CLASS__, 'image_block' ), 20, 2 );
+	}
+
+	/**
+	 * Is the GD library available?
+	 *
+	 * @return bool
+	 */
+	public static function available() {
+		return function_exists( 'imagecreatetruecolor' ) && function_exists( 'imagecopyresampled' ) && function_exists( 'imagerotate' );
+	}
+
+	/* ---------- Which images ---------- */
+
+	/**
+	 * Site images that never get a watermark: icon, logos, placeholder, watermark.
+	 *
+	 * @return int[]
+	 */
+	public static function protected_ids() {
+		$ids = array(
+			(int) PNCP_Options::stored()['watermark_image_id'],
+			(int) get_option( 'site_icon' ),
+			(int) get_option( 'site_logo' ),
+			(int) get_theme_mod( 'custom_logo' ),
+			(int) get_option( 'woocommerce_placeholder_image' ),
+		);
+		return array_values( array_filter( $ids ) );
+	}
+
+	/**
+	 * Is this a WooCommerce product image? (attached to a product, featured image or gallery image)
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return bool
+	 */
+	public static function is_product_image( $attachment_id ) {
+		global $wpdb;
+		$attachment_id = (int) $attachment_id;
+		$parent        = (int) wp_get_post_parent_id( $attachment_id );
+		if ( $parent && in_array( get_post_type( $parent ), array( 'product', 'product_variation' ), true ) ) {
+			return true;
+		}
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery -- One query per image, only while it is being processed.
+		$thumb = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT pm.post_id FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+				WHERE pm.meta_key = '_thumbnail_id' AND pm.meta_value = %s AND p.post_type IN ('product','product_variation') LIMIT 1",
+				(string) $attachment_id
+			)
+		);
+		if ( $thumb ) {
+			return true;
+		}
+		$galleries = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_product_image_gallery' AND meta_value LIKE %s",
+				'%' . $wpdb->esc_like( (string) $attachment_id ) . '%'
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery
+		foreach ( (array) $galleries as $gallery ) {
+			if ( in_array( $attachment_id, array_map( 'intval', explode( ',', (string) $gallery ) ), true ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Does this image get a watermark with the current settings?
+	 *
+	 * @param int                  $attachment_id Attachment ID.
+	 * @param array<string, mixed> $s             Settings.
+	 * @return bool
+	 */
+	public static function eligible( $attachment_id, $s ) {
+		$attachment_id = (int) $attachment_id;
+		if ( empty( $s['enabled'] ) || empty( $s['watermark_enabled'] ) || ! self::available() ) {
+			return false;
+		}
+		if ( ! in_array( get_post_mime_type( $attachment_id ), self::$mimes, true ) ) {
+			return false;
+		}
+		if ( in_array( $attachment_id, self::protected_ids(), true ) ) {
+			return false;
+		}
+		$context = (string) get_post_meta( $attachment_id, '_wp_attachment_context', true );
+		if ( in_array( $context, array( 'site-icon', 'custom-logo', 'site-logo' ), true ) ) {
+			return false;
+		}
+		if ( empty( $s['watermark_products'] ) && self::is_product_image( $attachment_id ) ) {
+			return false;
+		}
+
+		/**
+		 * Filter to exclude images.
+		 *
+		 * @param bool $apply         Whether to apply the watermark.
+		 * @param int  $attachment_id Attachment ID.
+		 */
+		return (bool) apply_filters( 'pncp_watermark_attachment', true, $attachment_id );
+	}
+
+	/* ---------- New uploads and size regeneration ---------- */
+
+	/**
+	 * Runs every time WordPress generates sizes (new upload, «Regenerate Thumbnails», missing sizes).
+	 *
+	 * @param array<string, mixed> $metadata      The metadata.
+	 * @param int                  $attachment_id Attachment ID.
+	 * @param string               $context       create | update.
+	 * @return array<string, mixed>
+	 */
+	public static function on_generate( $metadata, $attachment_id, $context = 'create' ) {
+		if ( ! is_array( $metadata ) || empty( $metadata['file'] ) ) {
+			return $metadata;
+		}
+		$s     = PNCP_Options::get();
+		$state = self::state( $attachment_id );
+
+		// If the full size is watermarked, the sizes just generated come from it:
+		// restore the clean image and regenerate sizes from a clean source, otherwise they would get a double watermark.
+		$regen = false;
+		if ( $state['full'] ) {
+			if ( ! self::restore_full( $attachment_id, $state ) ) {
+				// The clean file could not be put back: the full size is still watermarked. Going on would draw a
+				// second watermark on the sizes and overwrite the clean backup with the watermarked file.
+				return $metadata;
+			}
+			$state['full'] = array();
+			$regen         = true;
+		}
+		if ( 'create' === $context ) {
+			$state['sizes'] = array();
+		}
+
+		$apply = self::eligible( $attachment_id, $s );
+		if ( ! $apply && ! $regen ) {
+			self::save_state( $attachment_id, $state );
+			return $metadata;
+		}
+
+		$metadata = self::process_sizes( $attachment_id, $metadata, $state, $s, $apply, $regen );
+		if ( $apply && ! empty( $s['watermark_full'] ) ) {
+			self::mark_full( $attachment_id, $state, $s );
+		} elseif ( ! $apply ) {
+			self::drop_backups( $attachment_id );
+		}
+		self::save_state( $attachment_id, $state );
+		return $metadata;
+	}
+
+	/**
+	 * Rebuilds an image from a clean source, with or without a watermark (bulk apply tool).
+	 * Safe to run again as many times as needed: it always starts from the clean original. This way
+	 * it also removes the 1.x watermarks, which left no marker.
+	 *
+	 * @param int  $attachment_id Attachment ID.
+	 * @param bool $apply         true = watermarked (if allowed), false = clean.
+	 * @return string done | skipped | error
+	 */
+	public static function rebuild( $attachment_id, $apply ) {
+		$attachment_id = (int) $attachment_id;
+		if ( ! in_array( get_post_mime_type( $attachment_id ), self::$mimes, true ) ) {
+			return 'skipped';
+		}
+		$metadata = wp_get_attachment_metadata( $attachment_id );
+		if ( ! is_array( $metadata ) || empty( $metadata['file'] ) ) {
+			return 'skipped';
+		}
+		if ( function_exists( 'wp_raise_memory_limit' ) ) {
+			wp_raise_memory_limit( 'image' );
+		}
+
+		$s     = PNCP_Options::get();
+		$state = self::state( $attachment_id );
+		if ( ! self::restore_full( $attachment_id, $state ) ) {
+			// The full size is still watermarked: dropping the backups or rebuilding from it would lose the clean image.
+			return 'error';
+		}
+		$state = array(
+			'full'  => array(),
+			'sizes' => array(),
+		);
+
+		$apply        = $apply && self::eligible( $attachment_id, $s );
+		self::$errors = 0;
+		$metadata     = self::process_sizes( $attachment_id, $metadata, $state, $s, $apply, true );
+		if ( $apply && ! empty( $s['watermark_full'] ) ) {
+			self::mark_full( $attachment_id, $state, $s );
+		}
+		if ( ! $apply ) {
+			self::drop_backups( $attachment_id );
+		}
+		self::save_state( $attachment_id, $state );
+		wp_update_attachment_metadata( $attachment_id, $metadata );
+		return self::$errors ? 'error' : 'done';
+	}
+
+	/**
+	 * Removes the watermark from one image (cron, when the image becomes a logo / product image).
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 */
+	public static function unmark( $attachment_id ) {
+		$state = self::state( $attachment_id );
+		if ( $state['full'] || in_array( 1, $state['sizes'], true ) ) {
+			self::rebuild( $attachment_id, false );
+		}
+	}
+
+	/**
+	 * Sizes: (optionally) regenerate from a clean source, then watermark those that are not watermarked yet.
+	 *
+	 * @param int                  $attachment_id ID.
+	 * @param array<string, mixed> $metadata      Metadata.
+	 * @param array<string, mixed> $state         State (modified).
+	 * @param array<string, mixed> $s             Settings.
+	 * @param bool                 $apply         Whether to apply the watermark.
+	 * @param bool                 $regen         Regenerate from a clean source the ones not yet recorded.
+	 * @return array<string, mixed> Metadata (with updated filesize).
+	 */
+	private static function process_sizes( $attachment_id, $metadata, &$state, $s, $apply, $regen ) {
+		if ( empty( $metadata['sizes'] ) || ! is_array( $metadata['sizes'] ) ) {
+			return $metadata;
+		}
+		$dir = trailingslashit( dirname( (string) get_attached_file( $attachment_id, true ) ) );
+		// The full-size files have already been restored (restore_full), so they are clean. On a new upload the
+		// full size is still clean here too (mark_full() runs after the sizes).
+		$source = $regen || $apply ? self::clean_source( $attachment_id ) : '';
+		// Watermarked sizes are made from the full size WordPress uses for its own sizes (the "-scaled" file,
+		// at most 2560px), not from a huge original: it is clean here as well.
+		$attached  = (string) get_attached_file( $attachment_id, true );
+		$sizes_src = '' !== $attached && is_file( $attached ) ? $attached : $source;
+		/**
+		 * Whether a watermarked JPEG / WebP size is made from the clean original with a single lossy save, instead
+		 * of opening the size WordPress already compressed and compressing it a second time. Costs one more
+		 * resize per size; turn off on very slow servers.
+		 *
+		 * @param bool $single Default true.
+		 */
+		$single = (bool) apply_filters( 'pncp_watermark_single_compression', true );
+		$crops  = wp_get_registered_image_subsizes();
+
+		foreach ( $metadata['sizes'] as $name => $size ) {
+			if ( empty( $size['file'] ) ) {
+				continue;
+			}
+			$file = wp_basename( $size['file'] );
+			// Two sizes with the same dimensions share one file: process it once.
+			if ( array_key_exists( $file, $state['sizes'] ) ) {
+				continue;
+			}
+			$path = $dir . $file;
+			$mime = isset( $size['mime-type'] ) ? (string) $size['mime-type'] : (string) wp_check_filetype( $file )['type'];
+
+			$crop  = isset( $crops[ $name ]['crop'] ) ? $crops[ $name ]['crop'] : true;
+			$lossy = in_array( $mime, array( 'image/jpeg', 'image/webp' ), true );
+			$mark  = $apply && (int) $size['width'] >= (int) $s['watermark_min_width'];
+			// Made once, at the highest quality, from the clean source: the watermark goes on it and it is
+			// compressed a single time. Then a regeneration of the size itself is not needed either.
+			$tmp = $mark && $lossy && $single && '' !== $sizes_src ? self::lossless_size( $sizes_src, $path, (int) $size['width'], (int) $size['height'], $crop, $mime ) : '';
+
+			if ( $regen && '' === $tmp ) {
+				if ( '' === $source || ! self::resize_from( $source, $path, (int) $size['width'], (int) $size['height'], $crop, $mime ) ) {
+					// Not regenerated from a clean source: it may already be watermarked, so we do not add a second one.
+					++self::$errors;
+					continue;
+				}
+			}
+
+			$marked = false;
+			if ( '' !== $tmp ) {
+				$marked = self::apply_to_file( $tmp, $mime, $s, $path, $source );
+				wp_delete_file( $tmp );
+				// The watermark could not be drawn: the size WordPress made was not regenerated from a clean source
+				// either (it was skipped above), so it is done now.
+				if ( ! $marked && $regen && ( '' === $source || ! self::resize_from( $source, $path, (int) $size['width'], (int) $size['height'], $crop, $mime ) ) ) {
+					++self::$errors;
+					continue;
+				}
+			} elseif ( $mark ) {
+				$marked = self::apply_to_file( $path, $mime, $s, null, '' !== $source ? $source : null );
+			}
+			$state['sizes'][ $file ] = $marked ? 1 : 0;
+			if ( $regen && ! $marked ) {
+				self::drop_stale_copies( $path ); // Made clean again: copies of the watermarked version are stale.
+			}
+
+			if ( is_file( $path ) ) {
+				clearstatcache( true, $path );
+				$metadata['sizes'][ $name ]['filesize'] = (int) filesize( $path );
+			}
+		}
+		return $metadata;
+	}
+
+	/**
+	 * Watermark the full size (and the original upload, if WordPress downscaled it to «-scaled»).
+	 * The clean file is saved before every change.
+	 *
+	 * @param int                  $attachment_id ID.
+	 * @param array<string, mixed> $state         State (modified).
+	 * @param array<string, mixed> $s             Settings.
+	 */
+	private static function mark_full( $attachment_id, &$state, $s ) {
+		$mime = (string) get_post_mime_type( $attachment_id );
+		foreach ( self::full_files( $attachment_id ) as $path ) {
+			$rel = self::relative( $path );
+			if ( isset( $state['full'][ $rel ] ) || ! self::ensure_backup( $path ) ) {
+				continue;
+			}
+			$type = wp_check_filetype( $path )['type'];
+			if ( self::apply_to_file( $path, $type ? $type : $mime, $s, null, self::backup_path( $path ) ) ) {
+				clearstatcache( true, $path );
+				// Hash of the file we wrote: if it changes (e.g. image replacement), the backup is no longer valid.
+				$state['full'][ $rel ] = (string) md5_file( $path );
+			}
+		}
+	}
+
+	/**
+	 * The full-size files: the attached file (e.g. -scaled) and the original upload.
+	 *
+	 * @param int $attachment_id ID.
+	 * @return string[]
+	 */
+	private static function full_files( $attachment_id ) {
+		$files    = array();
+		$attached = (string) get_attached_file( $attachment_id, true );
+		if ( '' !== $attached && is_file( $attached ) ) {
+			$files[] = $attached;
+		}
+		$original = function_exists( 'wp_get_original_image_path' ) ? (string) wp_get_original_image_path( $attachment_id, true ) : '';
+		if ( '' !== $original && $original !== $attached && is_file( $original ) ) {
+			$files[] = $original;
+		}
+		return $files;
+	}
+
+	/**
+	 * Restores the clean full-size files from the backup.
+	 *
+	 * Only when the file on disk is still the one we wrote (same hash). If it changed (e.g.
+	 * «Enable Media Replace» uploaded a new image under the same name), the file on disk is the new clean
+	 * original and the old backup is deleted. A backup without a record is never deleted: it may be the only
+	 * clean copy.
+	 *
+	 * @param int                  $attachment_id ID.
+	 * @param array<string, mixed> $state         State.
+	 * @return bool false when a watermarked file could not be replaced by its clean backup.
+	 */
+	private static function restore_full( $attachment_id, $state ) {
+		$ok       = true;
+		$paths    = array();
+		$original = function_exists( 'wp_get_original_image_path' ) ? (string) wp_get_original_image_path( $attachment_id, true ) : '';
+		$attached = (string) get_attached_file( $attachment_id, true );
+		// Original upload first: WordPress regenerates the «-scaled» from it.
+		foreach ( array( $original, $attached ) as $path ) {
+			if ( '' !== $path ) {
+				$paths[ self::relative( $path ) ] = $path;
+			}
+		}
+		foreach ( array_keys( (array) $state['full'] ) as $rel ) {
+			$paths[ (string) $rel ] = self::absolute( (string) $rel );
+		}
+		$derived_ok = false; // The original upload is still ours: the -scaled was simply regenerated from it.
+		$orig_rel   = '' !== $original && $original !== $attached ? self::relative( $original ) : '';
+		foreach ( $paths as $rel => $path ) {
+			$backup = self::backup_path( $path );
+			if ( '' === $backup || ! is_file( $backup ) ) {
+				continue;
+			}
+			$hash = isset( $state['full'][ $rel ] ) ? (string) $state['full'][ $rel ] : '';
+			$ours = '' !== $hash && is_file( $path ) && md5_file( $path ) === $hash;
+			if ( $rel === $orig_rel ) {
+				$derived_ok = $ours;
+			} elseif ( '' !== $hash && $derived_ok && is_file( $path ) ) {
+				$ours = true;
+			}
+			if ( ! is_file( $path ) ) {
+				// The file is missing (e.g. offload plugin): the backup is never deleted in this case.
+				if ( '' !== $hash && copy( $backup, $path ) ) {
+					self::keep_owner( $path );
+				}
+			} elseif ( $ours ) {
+				if ( ! copy( $backup, $path ) ) {
+					$ok = false; // The file on disk is still the watermarked one.
+					continue;
+				}
+				self::drop_stale_copies( $path );
+			} elseif ( '' !== $hash ) {
+				wp_delete_file( $backup ); // A new file replaced the one we wrote: the backup is no longer valid.
+			}
+			// No record of the file (e.g. the record was lost): nothing can prove the backup is stale, and it may
+			// be the only clean copy. It is left alone, never deleted.
+		}
+		return $ok;
+	}
+
+	/**
+	 * The source for new sizes: the original upload or the full size. Always called after restore_full,
+	 * so the files on disk are clean.
+	 *
+	 * @param int $attachment_id ID.
+	 * @return string
+	 */
+	private static function clean_source( $attachment_id ) {
+		$original = function_exists( 'wp_get_original_image_path' ) ? (string) wp_get_original_image_path( $attachment_id, true ) : '';
+		$attached = (string) get_attached_file( $attachment_id, true );
+		foreach ( array( $original, $attached ) as $path ) {
+			if ( '' !== $path && is_file( $path ) ) {
+				return $path;
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * The WordPress image editor (crop, rotate) starts from the clean backup,
+	 * so the new image does not carry the watermark.
+	 *
+	 * @param string $path          File to edit.
+	 * @param int    $attachment_id ID.
+	 * @return string
+	 */
+	public static function edit_from_clean( $path, $attachment_id ) {
+		$state = self::state( $attachment_id );
+		$rel   = self::relative( (string) $path );
+		if ( '' === $rel || empty( $state['full'][ $rel ] ) || ! is_file( (string) $path ) || md5_file( (string) $path ) !== $state['full'][ $rel ] ) {
+			return $path;
+		}
+		$backup = self::backup_path( (string) $path );
+		return '' !== $backup && is_file( $backup ) ? $backup : $path;
+	}
+
+	/**
+	 * The classic image editor (Media → Edit image → crop, rotate, Save) writes the new image and its sizes from
+	 * the clean copy and saves the metadata without generating sizes the usual way, so on_generate() never sees
+	 * them: the edited image would be published without a watermark. After it saves, the image is rebuilt once,
+	 * with the watermark if it is allowed. 3.4.3: the same after «Restore original image», which put back the
+	 * pre-edit files (the full size clean) while the record still described the edited ones.
+	 *
+	 * @param int    $meta_id   Meta ID.
+	 * @param int    $object_id Attachment ID.
+	 * @param string $meta_key  Key.
+	 */
+	public static function on_edited( $meta_id, $object_id, $meta_key ) {
+		static $queued = array();
+		// phpcs:disable WordPress.Security.NonceVerification -- Only reads which core action is running; core checked its nonce.
+		if ( '_wp_attachment_metadata' !== $meta_key || ! wp_doing_ajax() || ! isset( $_REQUEST['action'], $_REQUEST['do'] ) || 'image-editor' !== $_REQUEST['action'] || ! in_array( $_REQUEST['do'], array( 'save', 'restore' ), true ) ) {
+			return;
+		}
+		// phpcs:enable
+		$object_id = (int) $object_id;
+		if ( isset( $queued[ $object_id ] ) || ! self::eligible( $object_id, PNCP_Options::get() ) ) {
+			return;
+		}
+		$queued[ $object_id ] = true;
+		// After the editor has finished (its answer is sent with wp_die(), then shutdown runs).
+		add_action(
+			'shutdown',
+			static function () use ( $object_id ) {
+				self::rebuild( $object_id, true );
+			}
+		);
+	}
+
+	/**
+	 * When the full-size image is not watermarked ("Watermark the full-size image too" is off), it is left out
+	 * of srcset: otherwise large and retina screens would download the clean full-size file instead of the
+	 * watermarked sizes, and anyone could take it from there.
+	 *
+	 * @param array<int, array<string, mixed>> $sources       Sources.
+	 * @param array<int, int>                  $size_array    Width and height.
+	 * @param string                           $image_src     The src.
+	 * @param array<string, mixed>             $image_meta    Metadata.
+	 * @param int                              $attachment_id Attachment ID.
+	 * @return array<int, array<string, mixed>>
+	 */
+	public static function srcset( $sources, $size_array, $image_src, $image_meta, $attachment_id ) {
+		if ( ! is_array( $sources ) || count( $sources ) < 2 || empty( $image_meta['file'] ) ) {
+			return $sources;
+		}
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || ! empty( $s['watermark_full'] ) ) {
+			return $sources;
+		}
+		$state = self::state( (int) $attachment_id );
+		if ( ! in_array( 1, $state['sizes'], true ) ) {
+			return $sources; // This image has no watermarked sizes.
+		}
+		$full = wp_basename( (string) $image_meta['file'] );
+		foreach ( $sources as $width => $source ) {
+			if ( isset( $source['url'] ) && wp_basename( (string) wp_parse_url( (string) $source['url'], PHP_URL_PATH ) ) === $full ) {
+				unset( $sources[ $width ] );
+			}
+		}
+		return $sources;
+	}
+
+	/* ---------- Public stand-in for a clean full size ---------- */
+
+	/**
+	 * Does the current request see the public (watermarked) stand-in instead of a clean full-size image? Not for
+	 * staff (users who can edit posts, so shop managers too), exempt users, the admin screens, WP-CLI or cron:
+	 * they keep the real full size.
+	 *
+	 * @return bool
+	 */
+	private static function public_view() {
+		static $memo = array();
+		$user        = get_current_user_id();
+		if ( isset( $memo[ $user ] ) ) {
+			return $memo[ $user ];
+		}
+		if ( ( defined( 'WP_CLI' ) && WP_CLI ) || wp_doing_cron() || ( is_admin() && ! wp_doing_ajax() ) ) {
+			return false; // Not cached: is_admin() can still change while WordPress loads.
+		}
+		if ( ! did_action( 'init' ) ) {
+			return false; // The current user is not known yet.
+		}
+		$s             = PNCP_Options::get();
+		$memo[ $user ] = ! empty( $s['enabled'] ) && ! PNCP_Lockdown::can( 'edit_posts' ) && ! PNCP_Options::user_is_exempt( $s );
+		return $memo[ $user ];
+	}
+
+	/**
+	 * The largest watermarked size of an image whose full size is clean, as [url, width, height, clean URLs], or
+	 * null when the image needs no stand-in (no watermarked size, or the full size is watermarked itself).
+	 * A size with the proportions of the full image is preferred, so a zoom or lightbox shows the whole picture.
+	 *
+	 * @param int $attachment_id Attachment ID.
+	 * @return array{0: string, 1: int, 2: int, 3: string[]}|null
+	 */
+	public static function stand_in( $attachment_id ) {
+		$memo          = &self::$stand_ins;
+		$attachment_id = (int) $attachment_id;
+		if ( $attachment_id <= 0 ) {
+			return null;
+		}
+		if ( array_key_exists( $attachment_id, $memo ) ) {
+			return $memo[ $attachment_id ];
+		}
+		$memo[ $attachment_id ] = null;
+		$s                      = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || ! in_array( get_post_mime_type( $attachment_id ), self::$mimes, true ) ) {
+			return null;
+		}
+		$state = self::state( $attachment_id );
+		if ( $state['full'] || ! in_array( 1, $state['sizes'], true ) ) {
+			return null; // The full size carries the watermark, or no size does.
+		}
+		/**
+		 * Whether visitors get the largest watermarked size instead of the clean full-size image (zoom,
+		 * lightbox, Store API, wc/v3, the image of the product's structured data).
+		 *
+		 * @param bool $replace       Default true.
+		 * @param int  $attachment_id Attachment ID.
+		 */
+		if ( ! apply_filters( 'pncp_watermark_replace_full', true, $attachment_id ) ) {
+			return null;
+		}
+		$meta = wp_get_attachment_metadata( $attachment_id );
+		if ( ! is_array( $meta ) || empty( $meta['file'] ) || empty( $meta['sizes'] ) || ! is_array( $meta['sizes'] ) ) {
+			return null;
+		}
+		$fw   = isset( $meta['width'] ) ? (int) $meta['width'] : 0;
+		$fh   = isset( $meta['height'] ) ? (int) $meta['height'] : 0;
+		$best = null;
+		$rank = array( -1, -1 );
+		foreach ( $meta['sizes'] as $size ) {
+			if ( empty( $size['file'] ) || empty( $size['width'] ) || empty( $size['height'] ) ) {
+				continue;
+			}
+			$file = wp_basename( (string) $size['file'] );
+			if ( empty( $state['sizes'][ $file ] ) ) {
+				continue; // Not watermarked (e.g. narrower than the minimum width).
+			}
+			$w         = (int) $size['width'];
+			$h         = (int) $size['height'];
+			$ratio     = $fw > 0 && $fh > 0 && wp_image_matches_ratio( $fw, $fh, $w, $h ) ? 1 : 0;
+			$this_rank = array( $ratio, $w * $h );
+			if ( $this_rank > $rank ) {
+				$rank = $this_rank;
+				$best = array( $file, $w, $h );
+			}
+		}
+		if ( null === $best ) {
+			return null;
+		}
+		$url = (string) wp_get_attachment_url( $attachment_id );
+		if ( '' === $url ) {
+			return null;
+		}
+		$clean = array( $url );
+		if ( function_exists( 'wp_get_original_image_url' ) ) {
+			$original = (string) wp_get_original_image_url( $attachment_id );
+			if ( '' !== $original && $original !== $url ) {
+				$clean[] = $original;
+			}
+		}
+		$base                   = substr( $url, 0, (int) strrpos( $url, '/' ) + 1 );
+		$memo[ $attachment_id ] = array( $base . $best[0], $best[1], $best[2], $clean );
+		return $memo[ $attachment_id ];
+	}
+
+	/**
+	 * Is this URL one of the clean full-size files of the stand-in (with or without a query string, any scheme)?
+	 *
+	 * @param string                                        $url      URL.
+	 * @param array{0: string, 1: int, 2: int, 3: string[]} $stand_in The stand-in.
+	 * @return bool
+	 */
+	private static function is_clean_url( $url, $stand_in ) {
+		$path = (string) wp_parse_url( (string) $url, PHP_URL_PATH );
+		if ( '' === $path ) {
+			return false;
+		}
+		foreach ( $stand_in[3] as $clean ) {
+			if ( (string) wp_parse_url( $clean, PHP_URL_PATH ) === $path ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * The URL a visitor gets for an image URL: the stand-in if it is a clean full-size file, otherwise unchanged.
+	 *
+	 * @param string $url           URL.
+	 * @param int    $attachment_id Attachment ID.
+	 * @return string
+	 */
+	public static function public_url( $url, $attachment_id ) {
+		if ( ! is_string( $url ) || '' === $url || ! self::public_view() ) {
+			return $url;
+		}
+		$stand_in = self::stand_in( $attachment_id );
+		return null !== $stand_in && self::is_clean_url( $url, $stand_in ) ? $stand_in[0] : $url;
+	}
+
+	/**
+	 * Every clean full-size URL in a piece of HTML or text replaced with the stand-in.
+	 *
+	 * @param string $text          HTML / text.
+	 * @param int    $attachment_id Attachment ID.
+	 * @return string
+	 */
+	private static function replace_in( $text, $attachment_id ) {
+		if ( ! is_string( $text ) || '' === $text || ! self::public_view() ) {
+			return $text;
+		}
+		$stand_in = self::stand_in( $attachment_id );
+		if ( null === $stand_in ) {
+			return $text;
+		}
+		foreach ( $stand_in[3] as $clean ) {
+			// The URL as written, escaped for HTML, with "/" escaped for JSON, and without its scheme.
+			$no_scheme = (string) preg_replace( '#^https?:#i', '', $clean );
+			$stand     = (string) preg_replace( '#^https?:#i', '', $stand_in[0] );
+			$pairs     = array(
+				$no_scheme                           => $stand,
+				esc_url( $no_scheme )                => esc_url( $stand ),
+				str_replace( '/', '\/', $no_scheme ) => str_replace( '/', '\/', $stand ),
+			);
+			foreach ( $pairs as $from => $to ) {
+				if ( '' !== $from ) {
+					$text = str_replace( $from, $to, $text );
+				}
+			}
+		}
+		return $text;
+	}
+
+	/**
+	 * Filter wp_get_attachment_image_src: when a visitor would get the clean full-size file (size "full", or a
+	 * size the image does not have, which falls back to the full size), they get the largest watermarked size,
+	 * with its own width and height. The srcset WordPress builds from it then has no clean file either.
+	 *
+	 * @param array|false  $image         [url, width, height, is_intermediate] or false.
+	 * @param int          $attachment_id Attachment ID.
+	 * @param string|int[] $size          Requested size.
+	 * @param bool         $icon          Icon.
+	 * @return array|false
+	 */
+	public static function public_image_src( $image, $attachment_id, $size, $icon ) {
+		unset( $size, $icon );
+		if ( ! is_array( $image ) || empty( $image[0] ) || ! empty( $image[3] ) || ! self::public_view() ) {
+			return $image;
+		}
+		$stand_in = self::stand_in( (int) $attachment_id );
+		if ( null === $stand_in || ! self::is_clean_url( (string) $image[0], $stand_in ) ) {
+			return $image;
+		}
+		return array( $stand_in[0], $stand_in[1], $stand_in[2], true );
+	}
+
+	/**
+	 * The zoom / lightbox attributes of a classic product gallery image (data-src, data-large_image and its
+	 * size), in case a theme or plugin filled them from the attachment URL.
+	 *
+	 * @param array<string, mixed> $params        Attributes.
+	 * @param int                  $attachment_id Attachment ID.
+	 * @return array<string, mixed>
+	 */
+	public static function gallery_params( $params, $attachment_id ) {
+		if ( ! is_array( $params ) || ! self::public_view() ) {
+			return $params;
+		}
+		$stand_in = self::stand_in( (int) $attachment_id );
+		if ( null === $stand_in ) {
+			return $params;
+		}
+		foreach ( array( 'data-src', 'data-large_image' ) as $key ) {
+			if ( isset( $params[ $key ] ) && is_string( $params[ $key ] ) && self::is_clean_url( html_entity_decode( $params[ $key ], ENT_QUOTES ), $stand_in ) ) {
+				$params[ $key ]                    = esc_url( $stand_in[0] );
+				$params['data-large_image_width']  = (string) $stand_in[1];
+				$params['data-large_image_height'] = (string) $stand_in[2];
+			}
+		}
+		return $params;
+	}
+
+	/**
+	 * The HTML of one classic product gallery image (the <a href> around it, data-* attributes): no clean
+	 * full-size URL for visitors, also when a theme or plugin wrote it itself.
+	 *
+	 * @param string $html          HTML.
+	 * @param int    $attachment_id Attachment ID.
+	 * @return string
+	 */
+	public static function gallery_html( $html, $attachment_id ) {
+		return self::replace_in( $html, (int) $attachment_id );
+	}
+
+	/**
+	 * The image of a variation (data-product_variations on the product page, used when a variation is picked):
+	 * its "url" is the attachment URL, which is the clean full-size file.
+	 *
+	 * @param array<string, mixed> $data      Variation data.
+	 * @param mixed                $product   Parent product.
+	 * @param mixed                $variation Variation.
+	 * @return array<string, mixed>
+	 */
+	public static function variation_data( $data, $product = null, $variation = null ) {
+		unset( $product, $variation );
+		if ( ! is_array( $data ) || empty( $data['image_id'] ) || empty( $data['image'] ) || ! is_array( $data['image'] ) || ! self::public_view() ) {
+			return $data;
+		}
+		$stand_in = self::stand_in( (int) $data['image_id'] );
+		if ( null === $stand_in ) {
+			return $data;
+		}
+		foreach ( array( 'url', 'src', 'full_src' ) as $key ) {
+			if ( isset( $data['image'][ $key ] ) && is_string( $data['image'][ $key ] ) && self::is_clean_url( $data['image'][ $key ], $stand_in ) ) {
+				$data['image'][ $key ] = $stand_in[0];
+				if ( 'full_src' === $key ) {
+					$data['image']['full_src_w'] = $stand_in[1];
+					$data['image']['full_src_h'] = $stand_in[2];
+				}
+			}
+		}
+		if ( isset( $data['image']['srcset'] ) && is_string( $data['image']['srcset'] ) ) {
+			$data['image']['srcset'] = self::replace_in( $data['image']['srcset'], (int) $data['image_id'] );
+		}
+		return $data;
+	}
+
+	/**
+	 * The image of the product's structured data (JSON-LD), which WooCommerce takes from the attachment URL.
+	 *
+	 * @param array<string, mixed> $markup  Markup.
+	 * @param mixed                $product Product.
+	 * @return array<string, mixed>
+	 */
+	public static function structured_data( $markup, $product = null ) {
+		if ( ! is_array( $markup ) || empty( $markup['image'] ) || ! is_string( $markup['image'] ) || ! is_object( $product ) || ! method_exists( $product, 'get_image_id' ) ) {
+			return $markup;
+		}
+		$markup['image'] = self::public_url( $markup['image'], (int) $product->get_image_id() );
+		return $markup;
+	}
+
+	/**
+	 * WooCommerce REST (wc/v1-v3) products and variations: images[].src (and a variation's image.src) is the
+	 * attachment URL. Users who are not staff get the stand-in; staff and the admin keep the real full size.
+	 *
+	 * @param mixed $response The response.
+	 * @param mixed $item     Product.
+	 * @param mixed $request  Request.
+	 * @return mixed
+	 */
+	public static function rest_product( $response, $item = null, $request = null ) {
+		unset( $item, $request );
+		if ( ! $response instanceof WP_REST_Response || ! self::public_view() ) {
+			return $response;
+		}
+		$data = $response->get_data();
+		if ( ! is_array( $data ) ) {
+			return $response;
+		}
+		$fix = static function ( $image ) {
+			if ( is_array( $image ) && ! empty( $image['id'] ) && isset( $image['src'] ) && is_string( $image['src'] ) ) {
+				$image['src'] = self::public_url( $image['src'], (int) $image['id'] );
+			}
+			return $image;
+		};
+		if ( isset( $data['images'] ) && is_array( $data['images'] ) ) {
+			$data['images'] = array_map( $fix, $data['images'] );
+		}
+		if ( isset( $data['image'] ) && is_array( $data['image'] ) ) {
+			$data['image'] = $fix( $data['image'] );
+		}
+		$response->set_data( $data );
+		return $response;
+	}
+
+	/**
+	 * 3.4.2: wp/v2/media (one image, or the list): source_url (the attachment URL), guid (the original upload)
+	 * and the description (on the attachment page it links the file) carry the clean full-size file. Users who
+	 * are not staff get the stand-in there too; staff and the admin keep the real full size.
+	 *
+	 * @param mixed $response The response.
+	 * @param mixed $post     Attachment.
+	 * @param mixed $request  Request.
+	 * @return mixed
+	 */
+	public static function rest_attachment( $response, $post = null, $request = null ) {
+		unset( $request );
+		if ( ! $response instanceof WP_REST_Response || ! $post instanceof WP_Post || ! self::public_view() ) {
+			return $response;
+		}
+		$id = (int) $post->ID;
+		if ( null === self::stand_in( $id ) ) {
+			return $response;
+		}
+		$data = $response->get_data();
+		if ( ! is_array( $data ) ) {
+			return $response;
+		}
+		if ( isset( $data['source_url'] ) && is_string( $data['source_url'] ) ) {
+			$data['source_url'] = self::public_url( $data['source_url'], $id );
+		}
+		foreach ( array( 'guid', 'description', 'caption' ) as $field ) {
+			foreach ( array( 'rendered', 'raw' ) as $part ) {
+				if ( isset( $data[ $field ][ $part ] ) && is_string( $data[ $field ][ $part ] ) ) {
+					$data[ $field ][ $part ] = 'guid' === $field ? self::public_url( $data[ $field ][ $part ], $id ) : self::replace_in( $data[ $field ][ $part ], $id );
+				}
+			}
+		}
+		if ( isset( $data['media_details']['sizes'] ) && is_array( $data['media_details']['sizes'] ) ) {
+			foreach ( $data['media_details']['sizes'] as $name => $size ) {
+				if ( is_array( $size ) && isset( $size['source_url'] ) && is_string( $size['source_url'] ) ) {
+					$data['media_details']['sizes'][ $name ]['source_url'] = self::public_url( $size['source_url'], $id );
+				}
+			}
+		}
+		if ( isset( $data['media_details'] ) && is_array( $data['media_details'] ) && ! PNCP_Lockdown::can( 'upload_files' ) && ! PNCP_Lockdown::can( 'edit_post', $id ) ) {
+			$data['media_details'] = self::public_media_details( $data['media_details'], $id );
+		}
+		$response->set_data( $data );
+		return $response;
+	}
+
+	/**
+	 * 3.4.3: media_details for a visitor. file (the relative path of the clean full size), original_image and the
+	 * full width and height are enough to build the clean full-size URL, so they go: width, height, filesize and
+	 * sizes.full become those of the stand-in, as wp_get_attachment_image_src() already gives it.
+	 *
+	 * @param array<string, mixed> $details       media_details.
+	 * @param int                  $attachment_id Attachment ID.
+	 * @return array<string, mixed>
+	 */
+	private static function public_media_details( $details, $attachment_id ) {
+		$image = wp_get_attachment_image_src( $attachment_id, 'full' );
+		if ( ! is_array( $image ) || empty( $image[0] ) || empty( $image[3] ) ) {
+			return $details; // No stand-in for this request: the real data stays.
+		}
+		unset( $details['file'], $details['original_image'] );
+		$details['width']  = (int) $image[1];
+		$details['height'] = (int) $image[2];
+		unset( $details['filesize'] );
+		$file = wp_basename( (string) wp_parse_url( (string) $image[0], PHP_URL_PATH ) );
+		$full = array(
+			'file'       => $file,
+			'width'      => (int) $image[1],
+			'height'     => (int) $image[2],
+			'mime_type'  => (string) get_post_mime_type( $attachment_id ),
+			'source_url' => (string) $image[0],
+		);
+		if ( isset( $details['sizes'] ) && is_array( $details['sizes'] ) ) {
+			foreach ( $details['sizes'] as $name => $size ) {
+				if ( 'full' !== $name && is_array( $size ) && isset( $size['file'] ) && $file === $size['file'] ) {
+					if ( isset( $size['filesize'] ) ) {
+						$details['filesize'] = (int) $size['filesize'];
+					}
+					if ( ! empty( $size['mime_type'] ) ) {
+						$full['mime_type'] = (string) $size['mime_type'];
+					}
+					break;
+				}
+			}
+			$details['sizes']['full'] = $full;
+		}
+		return $details;
+	}
+
+	/**
+	 * 3.4.2: the link to the file on an attachment page (wp_get_attachment_link(), its href is the attachment
+	 * URL, the clean full-size file).
+	 *
+	 * @param string      $html HTML.
+	 * @param int|WP_Post $id   Attachment ID or post (as passed to wp_get_attachment_link()).
+	 * @return string
+	 */
+	public static function attachment_link( $html, $id = 0 ) {
+		// 3.4.3: themes pass a WP_Post; casting it to int warned and gave 1.
+		$id = $id instanceof WP_Post ? (int) $id->ID : ( is_numeric( $id ) ? (int) $id : 0 );
+		$id = $id > 0 ? $id : (int) get_the_ID();
+		return $id > 0 ? self::replace_in( $html, $id ) : $html;
+	}
+
+	/**
+	 * 3.4.2: with attachment pages off (the default since WordPress 6.4), an attachment page redirects to the
+	 * file, the clean full-size one. A visitor is sent to the stand-in instead.
+	 *
+	 * @param string|false $redirect_url  Where WordPress redirects to.
+	 * @param string       $requested_url The requested URL.
+	 * @return string|false
+	 */
+	public static function attachment_redirect( $redirect_url, $requested_url = '' ) {
+		unset( $requested_url );
+		if ( ! is_string( $redirect_url ) || '' === $redirect_url || ! is_attachment() ) {
+			return $redirect_url;
+		}
+		return self::public_url( $redirect_url, (int) get_queried_object_id() );
+	}
+
+	/**
+	 * 3.4.3: an <img> in post content (classic or block) that points at the clean full-size file, e.g. an image
+	 * inserted at "Full Size": its src was left as it is, and only srcset lost the full size.
+	 *
+	 * @param string $html          The img tag.
+	 * @param string $context       Context.
+	 * @param int    $attachment_id Attachment ID (0 when unknown).
+	 * @return string
+	 */
+	public static function content_img( $html, $context = '', $attachment_id = 0 ) {
+		unset( $context );
+		return (int) $attachment_id > 0 ? self::replace_in( $html, (int) $attachment_id ) : $html;
+	}
+
+	/**
+	 * 3.4.3: the Image block: its "link to media file" (<a href>) and the lightbox's full-size source.
+	 *
+	 * @param string               $content Block HTML.
+	 * @param array<string, mixed> $block   Block.
+	 * @return string
+	 */
+	public static function image_block( $content, $block = array() ) {
+		$id = is_array( $block ) && isset( $block['attrs']['id'] ) ? (int) $block['attrs']['id'] : 0;
+		if ( $id <= 0 || ! self::public_view() || null === self::stand_in( $id ) ) {
+			return $content;
+		}
+		// The lightbox (WordPress 6.5+) keeps the full-size URL in the Interactivity API state, printed in the footer.
+		if ( function_exists( 'wp_interactivity_state' ) ) {
+			$state = wp_interactivity_state( 'core/image' );
+			$fix   = array();
+			foreach ( isset( $state['metadata'] ) && is_array( $state['metadata'] ) ? $state['metadata'] : array() as $key => $item ) {
+				if ( is_array( $item ) && isset( $item['uploadedSrc'] ) && is_string( $item['uploadedSrc'] ) ) {
+					$url = self::public_url( $item['uploadedSrc'], $id );
+					if ( $url !== $item['uploadedSrc'] ) {
+						$stand_in    = self::stand_in( $id );
+						$fix[ $key ] = array(
+							'uploadedSrc'  => $url,
+							'targetWidth'  => $stand_in[1],
+							'targetHeight' => $stand_in[2],
+						);
+					}
+				}
+			}
+			if ( $fix ) {
+				wp_interactivity_state( 'core/image', array( 'metadata' => $fix ) );
+			}
+		}
+		return self::replace_in( $content, $id );
+	}
+
+	/**
+	 * The size made from the clean source at the highest quality, in a temporary file next to it: the watermark
+	 * is drawn on it and the result is compressed once, at the site's quality.
+	 *
+	 * @param string     $source Clean source.
+	 * @param string     $path   The size's file (only its folder and type are used).
+	 * @param int        $width  Width.
+	 * @param int        $height Height.
+	 * @param bool|array $crop   Crop.
+	 * @param string     $mime   Type.
+	 * @return string The temporary file, or '' (then the size WordPress made is used).
+	 */
+	private static function lossless_size( $source, $path, $width, $height, $crop, $mime ) {
+		$ext = 'image/webp' === $mime ? 'webp' : 'jpg';
+		$tmp = trailingslashit( dirname( $path ) ) . 'pncp-' . wp_generate_password( 10, false ) . '.' . $ext;
+		if ( ! self::resize_from( $source, $tmp, $width, $height, $crop, $mime, 100 ) ) {
+			if ( is_file( $tmp ) ) {
+				wp_delete_file( $tmp );
+			}
+			return '';
+		}
+		return $tmp;
+	}
+
+	/**
+	 * Generates a size from the source, under the same file name WordPress already uses.
+	 *
+	 * @param string     $source Source.
+	 * @param string     $target Target file.
+	 * @param int        $width  Width.
+	 * @param int        $height Height.
+	 * @param bool|array $crop   Crop.
+	 * @param string     $mime   Target file type.
+	 * @param int        $quality Quality (0 = the site's).
+	 * @return bool
+	 */
+	private static function resize_from( $source, $target, $width, $height, $crop, $mime, $quality = 0 ) {
+		$editor = wp_get_image_editor( $source );
+		if ( is_wp_error( $editor ) ) {
+			return false;
+		}
+		if ( $quality > 0 ) {
+			$editor->set_quality( $quality );
+		}
+		if ( method_exists( $editor, 'maybe_exif_rotate' ) ) {
+			$editor->maybe_exif_rotate();
+		}
+		$current = $editor->get_size();
+		// Same dimensions as the source: WordPress does not resize, it is saved as is.
+		if ( (int) $current['width'] !== $width || (int) $current['height'] !== $height ) {
+			$resized = $editor->resize( $width, $height, $crop );
+			if ( is_wp_error( $resized ) ) {
+				return false;
+			}
+		}
+		$new   = ! file_exists( $target );
+		$saved = $editor->save( $target, $mime ? $mime : null );
+		if ( is_wp_error( $saved ) || empty( $saved['path'] ) ) {
+			return false;
+		}
+		// If a format filter (image_editor_output_format) changed the extension, the file keeps the name WordPress knows.
+		if ( $saved['path'] !== $target && is_file( $saved['path'] ) ) {
+			copy( $saved['path'], $target );
+			wp_delete_file( $saved['path'] );
+		}
+		if ( $new ) {
+			self::keep_owner( $target );
+		}
+		return true;
+	}
+
+	/* ---------- Backups of the clean files ---------- */
+
+	/**
+	 * The hidden backup folder, inside uploads, with a random name (not guessable).
+	 * Contains .htaccess (Apache) and an empty index.html; for Nginx see the server rules.
+	 *
+	 * @return string Path with a trailing / ('' if it could not be created).
+	 */
+	public static function backup_dir() {
+		$uploads = wp_get_upload_dir();
+		if ( ! empty( $uploads['error'] ) ) {
+			return '';
+		}
+		$name = (string) get_option( 'pncp_backup_dir' );
+		if ( ! preg_match( '/^pncp-originals-[a-z0-9]{12}$/', $name ) ) {
+			$name = 'pncp-originals-' . strtolower( wp_generate_password( 12, false, false ) );
+			update_option( 'pncp_backup_dir', $name, false );
+		}
+		$dir = trailingslashit( $uploads['basedir'] ) . $name . '/';
+		if ( ! is_dir( $dir ) && ! self::mkdir_owner( $dir ) ) {
+			return '';
+		}
+		if ( ! is_file( $dir . '.htaccess' ) ) {
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Small configuration file.
+			file_put_contents( $dir . '.htaccess', "Require all denied\n<IfModule !mod_authz_core.c>\nDeny from all\n</IfModule>\n" );
+			// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+			file_put_contents( $dir . 'index.html', '' );
+			self::keep_owner( $dir . '.htaccess' );
+			self::keep_owner( $dir . 'index.html' );
+		}
+		return $dir;
+	}
+
+	/**
+	 * The path relative to uploads.
+	 *
+	 * @param string $path Absolute path.
+	 * @return string
+	 */
+	private static function relative( $path ) {
+		$base = trailingslashit( wp_get_upload_dir()['basedir'] );
+		return 0 === strpos( $path, $base ) ? substr( $path, strlen( $base ) ) : '';
+	}
+
+	/**
+	 * Absolute path from a path relative to uploads.
+	 *
+	 * @param string $rel Relative path.
+	 * @return string
+	 */
+	private static function absolute( $rel ) {
+		return trailingslashit( wp_get_upload_dir()['basedir'] ) . ltrim( $rel, '/' );
+	}
+
+	/**
+	 * Where the clean backup of a file is stored.
+	 *
+	 * @param string $path File inside uploads.
+	 * @return string
+	 */
+	public static function backup_path( $path ) {
+		$rel = self::relative( (string) $path );
+		if ( '' === $rel || false !== strpos( $rel, '..' ) ) {
+			return '';
+		}
+		$dir = self::backup_dir();
+		return '' === $dir ? '' : $dir . $rel;
+	}
+
+	/**
+	 * Saves the clean file. Called after restore_full, so the file on disk is clean
+	 * and the backup is always refreshed from it.
+	 *
+	 * @param string $path File.
+	 * @return bool
+	 */
+	private static function ensure_backup( $path ) {
+		$backup = self::backup_path( $path );
+		if ( '' === $backup || ! self::mkdir_owner( dirname( $backup ) ) ) {
+			return false;
+		}
+		$new = ! file_exists( $backup );
+		if ( ! copy( $path, $backup ) ) {
+			return false;
+		}
+		if ( $new ) {
+			self::keep_owner( $backup );
+		}
+		return true;
+	}
+
+	/**
+	 * 3.12.10: wp_mkdir_p(); as root (WP-CLI --allow-root, e.g. `wp media regenerate`), each new folder goes to the
+	 * owner of the WordPress folder with 0755 (PNCP_File_Owner).
+	 *
+	 * @param string $dir Folder.
+	 * @return bool
+	 */
+	private static function mkdir_owner( $dir ) {
+		return PNCP_File_Owner::is_root() ? PNCP_File_Owner::mkdir( $dir, 0755 ) : wp_mkdir_p( $dir );
+	}
+
+	/**
+	 * 3.12.10: as root, a file this class created goes to the owner of the WordPress folder, readable by all (0644,
+	 * root's umask may be 077), so the web server can serve it and WordPress can later replace it. Nothing otherwise.
+	 *
+	 * @param string $file New file.
+	 */
+	private static function keep_owner( $file ) {
+		if ( PNCP_File_Owner::is_root() && is_file( $file ) ) {
+			@chmod( $file, 0644 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_chmod
+			PNCP_File_Owner::restore( $file );
+		}
+	}
+
+	/**
+	 * Deletes the backups of an image.
+	 *
+	 * @param int  $attachment_id ID.
+	 * @param bool $edits         Also those of the versions the image editor kept (deletion only).
+	 */
+	private static function drop_backups( $attachment_id, $edits = false ) {
+		$paths = self::full_files( $attachment_id );
+		foreach ( array_keys( self::state( $attachment_id )['full'] ) as $rel ) {
+			$paths[] = self::absolute( (string) $rel );
+		}
+		// 3.4.3: on deletion, also the backups of the other versions the image editor kept (pre-edit and edited
+		// full sizes): WordPress deletes those files, their clean copies must not stay behind.
+		$versions = $edits ? get_post_meta( $attachment_id, '_wp_attachment_backup_sizes', true ) : array();
+		if ( is_array( $versions ) && $versions ) {
+			$dir = trailingslashit( dirname( (string) get_attached_file( $attachment_id, true ) ) );
+			foreach ( $versions as $key => $version ) {
+				if ( 0 === strpos( (string) $key, 'full-' ) && ! empty( $version['file'] ) ) {
+					$paths[] = $dir . wp_basename( (string) $version['file'] );
+				}
+			}
+		}
+		foreach ( array_unique( $paths ) as $path ) {
+			$backup = self::backup_path( $path );
+			if ( '' !== $backup && is_file( $backup ) ) {
+				wp_delete_file( $backup );
+			}
+		}
+	}
+
+	/**
+	 * Image deletion: the backups are removed too.
+	 *
+	 * @param int $attachment_id ID.
+	 */
+	public static function on_delete( $attachment_id ) {
+		$edited = get_post_meta( $attachment_id, '_wp_attachment_backup_sizes', true );
+		if ( get_post_meta( $attachment_id, self::META, true ) || ( $edited && get_option( 'pncp_backup_dir' ) ) ) {
+			self::drop_backups( (int) $attachment_id, true );
+		}
+	}
+
+	/* ---------- State ---------- */
+
+	/**
+	 * The state of an image.
+	 *
+	 * @param int $attachment_id ID.
+	 * @return array{full: array<string, string>, sizes: array<string, int>}
+	 */
+	public static function state( $attachment_id ) {
+		$state = get_post_meta( (int) $attachment_id, self::META, true );
+		$state = is_array( $state ) ? $state : array();
+		return array(
+			'full'  => isset( $state['full'] ) && is_array( $state['full'] ) ? array_map( 'strval', $state['full'] ) : array(),
+			'sizes' => isset( $state['sizes'] ) && is_array( $state['sizes'] ) ? array_map( 'intval', $state['sizes'] ) : array(),
+		);
+	}
+
+	/**
+	 * Saves the state (deletes the meta if the image is completely clean).
+	 *
+	 * @param int                  $attachment_id ID.
+	 * @param array<string, mixed> $state         State.
+	 */
+	private static function save_state( $attachment_id, $state ) {
+		unset( self::$stand_ins[ (int) $attachment_id ] );
+		if ( ! $state['full'] && ! in_array( 1, $state['sizes'], true ) ) {
+			delete_post_meta( (int) $attachment_id, self::META );
+			return;
+		}
+		update_post_meta( (int) $attachment_id, self::META, $state );
+	}
+
+	/* ---------- Automatic removal on logos and product images ---------- */
+
+	/**
+	 * When an image becomes a product image, it loses the watermark (unless allowed on products).
+	 *
+	 * @param int    $meta_id    ID meta.
+	 * @param int    $object_id  Post ID.
+	 * @param string $meta_key   Key.
+	 * @param mixed  $meta_value Value.
+	 */
+	public static function on_post_meta( $meta_id, $object_id, $meta_key, $meta_value ) {
+		if ( ! in_array( $meta_key, array( '_thumbnail_id', '_product_image_gallery' ), true ) ) {
+			return;
+		}
+		if ( ! empty( PNCP_Options::get()['watermark_products'] ) || ! in_array( get_post_type( $object_id ), array( 'product', 'product_variation' ), true ) ) {
+			return;
+		}
+		self::schedule_unmark( array_map( 'intval', explode( ',', (string) $meta_value ) ) );
+	}
+
+	/**
+	 * When an image becomes the site icon / logo / placeholder, it loses the watermark.
+	 *
+	 * @param string $option Option.
+	 * @param mixed  $old    Old value.
+	 * @param mixed  $value  New value.
+	 */
+	public static function on_option( $option, $old, $value ) {
+		if ( in_array( $option, array( 'site_icon', 'site_logo', 'woocommerce_placeholder_image' ), true ) ) {
+			self::schedule_unmark( array( (int) $value ) );
+		} elseif ( PNCP_OPTION === $option && is_array( $value ) && ! empty( $value['watermark_image_id'] ) ) {
+			// The image set as the watermark must not itself be watermarked.
+			self::schedule_unmark( array( (int) $value['watermark_image_id'] ) );
+		} elseif ( 0 === strpos( $option, 'theme_mods_' ) && is_array( $value ) && ! empty( $value['custom_logo'] ) ) {
+			self::schedule_unmark( array( (int) $value['custom_logo'] ) );
+		}
+	}
+
+	/**
+	 * The same for options being created now.
+	 *
+	 * @param string $option Option.
+	 * @param mixed  $value  Value.
+	 */
+	public static function on_added_option( $option, $value ) {
+		self::on_option( $option, null, $value );
+	}
+
+	/**
+	 * Schedules removal for the images that are watermarked.
+	 *
+	 * @param int[] $ids IDs.
+	 */
+	private static function schedule_unmark( $ids ) {
+		foreach ( array_unique( array_filter( $ids ) ) as $id ) {
+			if ( get_post_meta( $id, self::META, true ) && ! wp_next_scheduled( self::CRON_UNMARK, array( $id ) ) ) {
+				wp_schedule_single_event( time() + 10, self::CRON_UNMARK, array( $id ) );
+			}
+		}
+	}
+
+	/* ---------- Drawing ---------- */
+
+	/**
+	 * Watermark a single file.
+	 *
+	 * @param string               $path     File to read.
+	 * @param string               $mime     Type.
+	 * @param array<string, mixed> $s        Settings.
+	 * @param string|null          $dest     File to write (null = the same file).
+	 * @param string|null          $icc_from File to take the JPEG colour profile from (null = $path).
+	 * @return bool
+	 */
+	public static function apply_to_file( $path, $mime, $s, $dest = null, $icc_from = null ) {
+		$dest = null === $dest ? $path : (string) $dest;
+		if ( ! self::available() || ! is_file( $path ) || ! wp_is_writable( is_file( $dest ) ? $dest : dirname( $dest ) ) ) {
+			return false;
+		}
+		// The colour profile (phones: Display P3) is read before the file is written: GD drops it.
+		$icc = 'image/jpeg' === $mime ? self::jpeg_icc( null !== $icc_from && is_file( (string) $icc_from ) ? (string) $icc_from : $path ) : '';
+		// A large original (a 48-megapixel photo is about 200 MB in GD) needs the memory WordPress allows for
+		// images, not the normal limit, or the upload would end in a fatal error.
+		if ( function_exists( 'wp_raise_memory_limit' ) ) {
+			wp_raise_memory_limit( 'image' );
+		}
+		$image = self::load( $path, $mime );
+		if ( ! $image ) {
+			return false;
+		}
+		$mark = self::mark( (int) $s['watermark_image_id'] );
+		if ( ! $mark ) {
+			return false;
+		}
+
+		$width  = imagesx( $image );
+		$height = imagesy( $image );
+		$mark_w = imagesx( $mark );
+		$mark_h = imagesy( $mark );
+		$target = max( 1, (int) round( $width * max( 5, min( 60, (int) $s['watermark_size'] ) ) / 100 ) );
+		$scale  = min( 1, $target / $mark_w );
+		$dst_w  = max( 1, (int) round( $mark_w * $scale ) );
+		$dst_h  = max( 1, (int) round( $mark_h * $scale ) );
+
+		// The watermark is faded once per request (at most 1600px wide), not again for every size of every image:
+		// fading goes pixel by pixel in PHP. Scaling an already faded watermark gives the same result.
+		$faded = self::faded_mark( $mark, (int) $s['watermark_opacity'] );
+		$layer = self::transparent( $dst_w, $dst_h );
+		imagecopyresampled( $layer, $faded, 0, 0, 0, 0, $dst_w, $dst_h, imagesx( $faded ), imagesy( $faded ) );
+		imagealphablending( $image, true );
+
+		$position = (string) $s['watermark_position'];
+		if ( 'tiled' === $position ) {
+			self::tile( $image, $layer );
+		} else {
+			$margin = (int) round( min( $width, $height ) * 0.02 );
+			switch ( $position ) {
+				case 'tl':
+					$x = $margin;
+					$y = $margin;
+					break;
+				case 'tr':
+					$x = $width - $dst_w - $margin;
+					$y = $margin;
+					break;
+				case 'bl':
+					$x = $margin;
+					$y = $height - $dst_h - $margin;
+					break;
+				case 'center':
+					$x = (int) round( ( $width - $dst_w ) / 2 );
+					$y = (int) round( ( $height - $dst_h ) / 2 );
+					break;
+				default:
+					$x = $width - $dst_w - $margin;
+					$y = $height - $dst_h - $margin;
+			}
+			imagecopy( $image, $layer, $x, $y, 0, 0, $dst_w, $dst_h );
+		}
+
+		$new = ! file_exists( $dest );
+		if ( ! self::save( $image, $dest, $mime ) ) {
+			return false;
+		}
+		if ( '' !== $icc ) {
+			self::jpeg_put_icc( $dest, $icc );
+		}
+		if ( $new ) {
+			self::keep_owner( $dest ); // 3.12.10: a size file that was missing, made now as root.
+		}
+		self::drop_stale_copies( $dest );
+		return true;
+	}
+
+	/**
+	 * The ICC colour profile segments (APP2 "ICC_PROFILE") of a JPEG file, as raw bytes ('' when there is none).
+	 *
+	 * @param string $file JPEG file.
+	 * @return string
+	 */
+	private static function jpeg_icc( $file ) {
+		// The same source serves every size of an image: read once per request. The profile sits in the first
+		// segments, so only the start of the file is read.
+		static $cache = array();
+		$key          = $file . '|' . (int) @filemtime( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Missing file = no profile.
+		if ( isset( $cache[ $key ] ) ) {
+			return $cache[ $key ];
+		}
+		$data          = (string) @file_get_contents( $file, false, null, 0, 1048576 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Local file.
+		$cache[ $key ] = self::icc_segments( $data );
+		return $cache[ $key ];
+	}
+
+	/**
+	 * The ICC segments in the bytes of a JPEG.
+	 *
+	 * @param string $data JPEG bytes (at least its header).
+	 * @return string
+	 */
+	private static function icc_segments( $data ) {
+		if ( "\xFF\xD8" !== substr( $data, 0, 2 ) ) {
+			return '';
+		}
+		$out = '';
+		$pos = 2;
+		$len = strlen( $data );
+		while ( $pos + 4 <= $len && "\xFF" === $data[ $pos ] ) {
+			$marker = ord( $data[ $pos + 1 ] );
+			if ( 0xDA === $marker || 0xD9 === $marker ) {
+				break; // Image data starts: no more metadata segments.
+			}
+			$size = unpack( 'n', substr( $data, $pos + 2, 2 ) )[1];
+			if ( $size < 2 || $pos + 2 + $size > $len ) {
+				break;
+			}
+			if ( 0xE2 === $marker && "ICC_PROFILE\0" === substr( $data, $pos + 4, 12 ) ) {
+				$out .= substr( $data, $pos, 2 + $size );
+			}
+			$pos += 2 + $size;
+		}
+		return $out;
+	}
+
+	/**
+	 * Puts ICC profile segments into a JPEG written by GD (which has none), after its JFIF header.
+	 *
+	 * @param string $file JPEG file.
+	 * @param string $icc  Segments from jpeg_icc().
+	 */
+	private static function jpeg_put_icc( $file, $icc ) {
+		$data = (string) @file_get_contents( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Local file.
+		if ( "\xFF\xD8" !== substr( $data, 0, 2 ) || '' !== self::icc_segments( $data ) ) {
+			return;
+		}
+		$at = 2;
+		if ( "\xFF\xE0" === substr( $data, 2, 2 ) ) {
+			$at = 4 + unpack( 'n', substr( $data, 4, 2 ) )[1]; // After APP0 (JFIF), where readers expect it.
+		}
+		// owner: an in-place rewrite of the file apply_to_file() has just written (same inode), whose owner it keeps.
+		file_put_contents( $file, substr( $data, 0, $at ) . $icc . substr( $data, $at ), LOCK_EX ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- The file just written.
+	}
+
+	/**
+	 * Removes copies other plugins made of a file that has just been rewritten: WebP / AVIF next to it
+	 * ("photo.jpg.webp", as EWWW, Imagify and WebP Express name them). They were made from the previous
+	 * version, so they would serve the image without (or with the old) watermark to browsers that get the
+	 * WebP. The plugin makes them again from the new file, or the browser gets the file itself.
+	 *
+	 * @param string $file File that was rewritten.
+	 */
+	private static function drop_stale_copies( $file ) {
+		foreach ( array( '.webp', '.avif' ) as $ext ) {
+			if ( is_file( $file . $ext ) ) {
+				wp_delete_file( $file . $ext );
+			}
+		}
+		/**
+		 * Fires after ScrapeLock rewrote an image file (watermark added or removed), for image optimizers and
+		 * CDNs that keep their own copy of it.
+		 *
+		 * @param string $file The file.
+		 */
+		do_action( 'pncp_watermark_file_changed', $file );
+	}
+
+	/**
+	 * Repeated watermark in a diagonal pattern across the whole image.
+	 *
+	 * @param resource|\GdImage $image Image.
+	 * @param resource|\GdImage $layer Watermark (already with transparency).
+	 */
+	private static function tile( $image, $layer ) {
+		$rotated = imagerotate( $layer, 30, imagecolorallocatealpha( $layer, 0, 0, 0, 127 ) );
+		if ( ! $rotated ) {
+			return;
+		}
+		imagesavealpha( $rotated, true );
+		$w      = imagesx( $image );
+		$h      = imagesy( $image );
+		$tile_w = imagesx( $rotated );
+		$tile_h = imagesy( $rotated );
+		$step_x = max( 1, (int) round( $tile_w * 1.6 ) );
+		$step_y = max( 1, (int) round( $tile_h * 1.4 ) );
+		$row    = 0;
+		for ( $y = -$tile_h / 2; $y < $h; $y += $step_y ) {
+			$offset = ( $row % 2 ) ? (int) round( $step_x / 2 ) : 0;
+			for ( $x = -$tile_w / 2 + $offset; $x < $w; $x += $step_x ) {
+				imagecopy( $image, $rotated, (int) $x, (int) $y, 0, 0, $tile_w, $tile_h );
+			}
+			++$row;
+		}
+	}
+
+	/**
+	 * New transparent image.
+	 *
+	 * @param int $w Width.
+	 * @param int $h Height.
+	 * @return resource|\GdImage
+	 */
+	private static function transparent( $w, $h ) {
+		$img = imagecreatetruecolor( $w, $h );
+		imagealphablending( $img, false );
+		imagesavealpha( $img, true );
+		imagefill( $img, 0, 0, imagecolorallocatealpha( $img, 0, 0, 0, 127 ) );
+		return $img;
+	}
+
+	/**
+	 * Opens a JPEG, PNG or WebP image.
+	 *
+	 * @param string $path Path.
+	 * @param string $mime Type.
+	 * @return resource|\GdImage|false
+	 */
+	private static function load( $path, $mime ) {
+		switch ( $mime ) {
+			case 'image/jpeg':
+				return function_exists( 'imagecreatefromjpeg' ) ? @imagecreatefromjpeg( $path ) : false; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			case 'image/png':
+				$img = function_exists( 'imagecreatefrompng' ) ? @imagecreatefrompng( $path ) : false; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				if ( $img ) {
+					// Palette PNG: convert to truecolor, otherwise the transparent watermark breaks.
+					if ( ! imageistruecolor( $img ) ) {
+						imagepalettetotruecolor( $img );
+					}
+					imagesavealpha( $img, true );
+				}
+				return $img;
+			case 'image/webp':
+				$img = function_exists( 'imagecreatefromwebp' ) ? @imagecreatefromwebp( $path ) : false; // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				if ( $img ) {
+					imagesavealpha( $img, true );
+				}
+				return $img;
+		}
+		return false;
+	}
+
+	/**
+	 * Saves in the same format.
+	 *
+	 * @param resource|\GdImage $image Image.
+	 * @param string            $path  Path.
+	 * @param string            $mime  Type.
+	 * @return bool
+	 */
+	private static function save( $image, $path, $mime ) {
+		switch ( $mime ) {
+			case 'image/jpeg':
+				return imagejpeg( $image, $path, self::quality( $mime ) );
+			case 'image/png':
+				return imagepng( $image, $path, 6 );
+			case 'image/webp':
+				return function_exists( 'imagewebp' ) && imagewebp( $image, $path, self::quality( $mime ) );
+		}
+		return false;
+	}
+
+	/**
+	 * The quality the site uses for its images (WordPress' own filters, as its image editor reads them), so a
+	 * watermarked file is not compressed differently from the rest.
+	 *
+	 * @param string $mime Type.
+	 * @return int 1–100.
+	 */
+	private static function quality( $mime ) {
+		$quality = 'image/webp' === $mime ? 86 : 82;
+		// phpcs:disable WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WordPress core filters.
+		$quality = (int) apply_filters( 'wp_editor_set_quality', $quality, $mime );
+		if ( 'image/jpeg' === $mime ) {
+			$quality = (int) apply_filters( 'jpeg_quality', $quality, 'pncp_watermark' );
+		}
+		// phpcs:enable
+		return max( 1, min( 100, $quality ) );
+	}
+
+	/**
+	 * The watermark image: the library PNG or the site's domain as text.
+	 *
+	 * @param int $image_id PNG image ID (0 = text).
+	 * @return resource|\GdImage|false
+	 */
+	private static function mark( $image_id ) {
+		if ( null !== self::$mark ) {
+			return self::$mark;
+		}
+		self::$mark = false;
+		if ( $image_id > 0 ) {
+			$file = (string) get_attached_file( $image_id );
+			// If the image was ever watermarked, its clean backup is used.
+			$backup = '' === $file ? '' : self::backup_path( $file );
+			if ( '' !== $backup && is_file( $backup ) ) {
+				$file = $backup;
+			}
+			if ( $file && is_file( $file ) && 'image/png' === get_post_mime_type( $image_id ) ) {
+				$png = @imagecreatefrompng( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+				if ( $png ) {
+					if ( ! imageistruecolor( $png ) ) {
+						imagepalettetotruecolor( $png );
+					}
+					imagesavealpha( $png, true );
+					self::$mark = $png;
+					return self::$mark;
+				}
+			}
+		}
+		self::$mark = self::text_mark( (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
+		return self::$mark;
+	}
+
+	/**
+	 * Forgets the per-request watermark (after a settings change or in tests).
+	 */
+	public static function reset() {
+		self::$mark  = null;
+		self::$faded = array();
+	}
+
+	/**
+	 * The watermark with the opacity applied, made once per request and opacity, at most 1600px wide (the
+	 * largest a watermark is drawn: 60% of a 2560px image).
+	 *
+	 * @param resource|\GdImage $mark    Watermark.
+	 * @param int               $opacity 10–100.
+	 * @return resource|\GdImage
+	 */
+	private static function faded_mark( $mark, $opacity ) {
+		$opacity = max( 10, min( 100, (int) $opacity ) );
+		if ( isset( self::$faded[ $opacity ] ) ) {
+			return self::$faded[ $opacity ];
+		}
+		$w     = imagesx( $mark );
+		$h     = imagesy( $mark );
+		$scale = min( 1, 1600 / max( 1, $w ) );
+		$fw    = max( 1, (int) round( $w * $scale ) );
+		$fh    = max( 1, (int) round( $h * $scale ) );
+		$copy  = self::transparent( $fw, $fh );
+		imagecopyresampled( $copy, $mark, 0, 0, 0, 0, $fw, $fh, $w, $h );
+		self::fade( $copy, $opacity );
+		self::$faded[ $opacity ] = $copy;
+		return $copy;
+	}
+
+	/**
+	 * White text with a shadow. GD's built-in font has Latin characters only,
+	 * which is why the domain is used. For a logo or Greek text, set a PNG image.
+	 *
+	 * @param string $text Text.
+	 * @return resource|\GdImage|false
+	 */
+	private static function text_mark( $text ) {
+		$text = preg_replace( '/[^\x20-\x7E]/', '', $text );
+		if ( '' === $text ) {
+			return false;
+		}
+		$font  = 5;
+		$w     = imagefontwidth( $font ) * strlen( $text ) + 2;
+		$h     = imagefontheight( $font ) + 2;
+		$small = self::transparent( $w, $h );
+		imagestring( $small, $font, 1, 1, $text, imagecolorallocatealpha( $small, 0, 0, 0, 40 ) );
+		imagestring( $small, $font, 0, 0, $text, imagecolorallocatealpha( $small, 255, 255, 255, 0 ) );
+
+		// Scale up x4, so that scaling does not blur too much.
+		$big = self::transparent( $w * 4, $h * 4 );
+		imagecopyresized( $big, $small, 0, 0, 0, 0, $w * 4, $h * 4, $w, $h );
+		return $big;
+	}
+
+	/**
+	 * Reduces each pixel's opacity to the configured percentage.
+	 *
+	 * @param resource|\GdImage $layer   Layer.
+	 * @param int               $opacity 10–100.
+	 */
+	private static function fade( $layer, $opacity ) {
+		if ( $opacity >= 100 ) {
+			return;
+		}
+		$factor = $opacity / 100;
+		$w      = imagesx( $layer );
+		$h      = imagesy( $layer );
+		for ( $x = 0; $x < $w; $x++ ) {
+			for ( $y = 0; $y < $h; $y++ ) {
+				$rgba  = imagecolorat( $layer, $x, $y );
+				$alpha = ( $rgba >> 24 ) & 0x7F;
+				if ( 127 === $alpha ) {
+					continue;
+				}
+				$new = (int) round( 127 - ( 127 - $alpha ) * $factor );
+				imagesetpixel( $layer, $x, $y, imagecolorallocatealpha( $layer, ( $rgba >> 16 ) & 0xFF, ( $rgba >> 8 ) & 0xFF, $rgba & 0xFF, $new ) );
+			}
+		}
+	}
+}

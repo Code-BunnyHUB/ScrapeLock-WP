@@ -1,0 +1,54 @@
+/* ScrapeLock: the unlock screen on the sign-in page (wp-login.php?action=scrapelock-unlock). */
+.pncp-unlock {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+	margin-top: 20px;
+	padding: 24px;
+}
+
+.pncp-unlock-title {
+	font-size: 20px;
+	margin: 0 0 12px;
+}
+
+.pncp-unlock h2 {
+	font-size: 15px;
+	margin: 20px 0 8px;
+}
+
+.pncp-unlock label {
+	display: block;
+	margin-bottom: 4px;
+}
+
+.pncp-unlock select {
+	width: 100%;
+}
+
+.pncp-unlock .notice {
+	border-left: 4px solid #72aee6;
+	background: #f6f7f7;
+	margin: 0 0 12px;
+	padding: 4px 12px;
+}
+
+.pncp-unlock .notice-error {
+	border-left-color: #d63638;
+}
+
+.pncp-unlock .notice-warning {
+	border-left-color: #dba617;
+}
+
+.pncp-unlock .notice-success {
+	border-left-color: #00a32a;
+}
+
+.pncp-unlock code {
+	word-break: break-all;
+}
+
+.pncp-ld-ways li {
+	margin-bottom: 8px;
+}

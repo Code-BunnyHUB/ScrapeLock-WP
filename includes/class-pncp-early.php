@@ -1,0 +1,423 @@
+<?php
+/**
+ * Early check: a small must-use plugin that blocks the obvious cases (bot User-Agent, blocked IP or
+ * referrer, temporarily blocked IP) before the theme and the other plugins load. Optional, off by default.
+ *
+ * @package ScrapeLock
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Writes / removes the mu-plugin and runs the early check from it.
+ *
+ * Everything that needs WordPress to be fully loaded (verification of search engines, limits, logged-in
+ * users and their roles, private feeds, the trap) stays in the normal check, which runs afterwards anyway.
+ * Here, when in doubt, the request passes.
+ */
+final class PNCP_Early {
+
+	const FILE   = 'scrapelock-early.php';
+	const MARKER = 'ScrapeLock early check';
+
+	/**
+	 * 3.4.3: network option (not autoloaded) with the mu-plugins folder ScrapeLock created, see make_dir().
+	 */
+	const DIR_OPTION = 'pncp_mu_dir_created';
+
+	/**
+	 * Runs from the mu-plugin, before the other plugins load.
+	 *
+	 * @param string $dir      The plugin's folder (with a trailing slash).
+	 * @param string $basename The plugin's basename (scrapelock/scrapelock.php), to check that it is active.
+	 */
+	public static function run( $dir, $basename ) {
+		if ( ! self::plugin_active( $basename ) ) {
+			return;
+		}
+		// All the files first: a plugin folder that is only partly there (an update copying its files, an
+		// incomplete upload) must not stop the whole site with a fatal error. The normal check decides then.
+		$files = array();
+		foreach ( array( 'options', 'ip', 'log', 'private-urls', 'paths', 'bots', 'plugin-bots', 'server-ips', 'self-check', 'verify-files', 'defer' ) as $name ) {
+			$file = $dir . 'includes/class-pncp-' . $name . '.php';
+			if ( ! is_readable( $file ) ) {
+				return;
+			}
+			$files[] = $file;
+		}
+		defined( 'PNCP_OPTION' ) || define( 'PNCP_OPTION', 'pncp_settings' );
+		foreach ( $files as $file ) {
+			require_once $file;
+		}
+
+		// 3.8: installer probes. wp-admin/install.php and upgrade.php run with WP_INSTALLING, so WordPress loads
+		// no normal plugin there: only this file sees them, for the attack record (written at shutdown).
+		if ( wp_installing() && is_readable( $dir . 'includes/class-pncp-attacks.php' ) ) {
+			$path = strtolower( (string) wp_parse_url( PNCP_Log::request_uri(), PHP_URL_PATH ) );
+			if ( preg_match( '#/wp-admin/(?:install|upgrade)\.php$#', $path ) ) {
+				require_once $dir . 'includes/class-pncp-attacks.php';
+				PNCP_Attacks::watch_installer();
+			}
+		}
+
+		// 3.12.9: before the first option is read: with APCu and no persistent object cache, ScrapeLock's options
+		// that are not autoloaded come from APCu, and what this check logs is queued (PNCP_Defer).
+		PNCP_Defer::init();
+		PNCP_Self_Check::set_layer( 'early' ); // 3.12.2: the diagnostics of the site's own requests.
+		$verdict = self::check();
+		$monitor = $verdict && PNCP_Options::monitoring();
+		// The normal check reads the settings and the IP again, after translations and the other plugins' filters.
+		PNCP_Options::flush();
+		PNCP_Ip::reset();
+		PNCP_Plugin_Bots::reset(); // 3.10: the other plugins' pncp_plugin_bots filters are not added yet.
+		if ( ! $verdict || $monitor ) {
+			PNCP_Self_Check::set_layer( 'wp' );
+		}
+		if ( $monitor ) {
+			// "Monitor only": logged as "would block" (once for the request, also when the normal check comes to
+			// the same verdict later) and the request goes on.
+			PNCP_Log::add( $verdict[1], PNCP_Log::MONITOR_CODE, $verdict[2] );
+			return;
+		}
+		if ( $verdict ) {
+			PNCP_Log::add( $verdict[1], $verdict[0], $verdict[2] );
+			PNCP_Bots::no_cache();
+			// The plugin's translations load later (WordPress 6.7+ warns about earlier use): the same text
+			// as die_html(), untranslated.
+			wp_die( esc_html( 'Access denied.' ), esc_html( (string) $verdict[0] ), array( 'response' => (int) $verdict[0] ) );
+		}
+	}
+
+	/**
+	 * Is ScrapeLock active on this site (or network-wide)?
+	 *
+	 * @param string $basename Basename.
+	 * @return bool
+	 */
+	private static function plugin_active( $basename ) {
+		// 3.4.3: and where WordPress loads it from. With the plugin folder a symlink (deployments, this file holds
+		// the resolved path), renaming the folder to switch ScrapeLock off left this check blocking on its own.
+		if ( defined( 'WP_PLUGIN_DIR' ) && ! is_file( WP_PLUGIN_DIR . '/' . $basename ) ) {
+			return false;
+		}
+		if ( in_array( $basename, (array) get_option( 'active_plugins', array() ), true ) ) {
+			return true;
+		}
+		return is_multisite() && isset( ( (array) get_site_option( 'active_sitewide_plugins', array() ) )[ $basename ] );
+	}
+
+	/**
+	 * The early check.
+	 *
+	 * @return array{0:int, 1:string, 2:string}|null [code, reason, IP], or null if the request passes.
+	 */
+	public static function check() {
+		$s = PNCP_Options::get();
+		if ( empty( $s['enabled'] ) || empty( $s['early_mode'] ) || self::skip_request() ) {
+			return null;
+		}
+
+		$ip = PNCP_Ip::client_ip();
+		// 3.11: and the server's public address, when the site's request to itself came back through the CDN.
+		if ( '' === $ip || PNCP_Ip::is_local_request() || PNCP_Server_Ips::is_request() ) {
+			return null;
+		}
+		if ( PNCP_Ip::reliable() && PNCP_Ip::in_any( $ip, PNCP_Options::parse_list( $s['allow_ips'] ) ) ) {
+			return null;
+		}
+		/** This filter is documented in includes/class-pncp-bots.php. Only mu-plugins can use it here. */
+		if ( apply_filters( 'pncp_skip_guard', false, 'early', $ip ) ) {
+			return null;
+		}
+		// 3.13.0: a payment gateway's callback to WooCommerce (PNCP_Bots::is_payment_webhook()): never refused here.
+		// The other plugins are not loaded yet, so WooCommerce counts as active when it is in the active plugins.
+		$plugins = array_merge( (array) get_option( 'active_plugins', array() ), is_multisite() ? array_keys( (array) get_site_option( 'active_sitewide_plugins', array() ) ) : array() );
+		if ( PNCP_Bots::is_payment_webhook( null, in_array( 'woocommerce/woocommerce.php', $plugins, true ) ) ) {
+			return null;
+		}
+
+		// A Cloudflare address means "Real visitor IP" is not set: no IP-based decision then, or a single
+		// block would hit every visitor that comes through the same Cloudflare server. 3.4: not when a CDN
+		// shared secret is set and the request does not carry it: then it did not come through this site's
+		// own CDN account, and the address is limited like any other (see PNCP_Ip::is_cdn_edge()).
+		// 3.4.1: only the edge that connected (REMOTE_ADDR); a Cloudflare address from the real-IP header is a
+		// client of its own (a Cloudflare Worker, which a scraper can rent).
+		// 3.6: and not when the edge sent no visitor IP (PNCP_Ip::is_cdn_edge()).
+		// 3.6.1: and not for the address of a proxy that "Real visitor IP" does not trust (PNCP_Ip::untrusted_proxy_peer()).
+		$per_ip = ! ( PNCP_Ip::is_cdn_edge( $ip ) && PNCP_Ip::in_any( $ip, PNCP_Ip::list_of( 'cloudflare' ) ) ) && ! PNCP_Ip::untrusted_proxy_peer();
+
+		if ( $per_ip && PNCP_Ip::in_any( $ip, PNCP_Options::parse_list( $s['block_ips'] ) ) ) {
+			return array( 403, 'blocked_ip', $ip );
+		}
+		if ( PNCP_Bots::referrer_blocked( $s ) ) {
+			return array( 403, 'blocked_ref', $ip );
+		}
+
+		// Googlebot, Bingbot etc. are verified with DNS in the normal check: here they always pass.
+		$ua = PNCP_Bots::user_agent();
+		if ( '' !== PNCP_Bots::claimed_crawler( $ua ) ) {
+			return null;
+		}
+		if ( $per_ip && PNCP_Log::is_banned( $ip ) ) {
+			return array( 403, 'banned', $ip );
+		}
+
+		// 3.11: and the stored list of the plugin bots (PNCP_Plugin_Bots::stored_match()): the other plugins'
+		// pncp_plugin_bots filters are not added yet here.
+		$allowed_ua = '' !== $ua && ( PNCP_Bots::allow_list_match( $ua, $ip, $s ) || PNCP_Bots::ua_in_list( $ua, PNCP_Options::allowed_ai_search( $s ) ) || null !== PNCP_Plugin_Bots::match( $ua, $ip ) || PNCP_Plugin_Bots::stored_match( $ua, $ip ) );
+		// 3.11: /.well-known/* (PNCP_Bots::is_well_known_request()): its services count as allowed, and no
+		// User-Agent is no reason to refuse it there; nor from an address on Google's or Apple's official lists.
+		$well_known = PNCP_Bots::is_well_known_request();
+		if ( $well_known && ! $allowed_ua && '' !== $ua && PNCP_Bots::ua_in_list( $ua, PNCP_Bots::well_known_agents() ) ) {
+			$allowed_ua = true;
+		}
+		if ( ! empty( $s['block_bots'] ) && ! $allowed_ua ) {
+			if ( '' === trim( $ua ) && ! empty( $s['block_empty_ua'] ) && ! $well_known && ! ( $per_ip && PNCP_Bots::is_google_or_apple_ip( $ip ) ) ) {
+				return array( 403, 'empty_ua', $ip );
+			}
+			if ( '' !== $ua && PNCP_Bots::ua_in_list( $ua, PNCP_Options::blocked_agents( $s ) ) ) {
+				return array( 403, 'bot_ua', $ip );
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Requests left entirely to the normal check: wp-admin, AJAX, cron, WP-CLI, XML-RPC, login, forms
+	 * (anything but GET / HEAD), logged-in users, the trap and the private feeds.
+	 *
+	 * @return bool
+	 */
+	private static function skip_request() {
+		if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) || ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) ) {
+			return true;
+		}
+		$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( sanitize_key( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) ) : 'GET';
+		if ( ! in_array( $method, array( 'GET', 'HEAD' ), true ) ) {
+			return true;
+		}
+		// The cookie names are defined after the mu-plugins load: any wordpress_logged_in_* cookie is enough.
+		foreach ( array_keys( $_COOKIE ) as $name ) {
+			if ( 0 === strpos( (string) $name, 'wordpress_logged_in_' ) || ( defined( 'LOGGED_IN_COOKIE' ) && LOGGED_IN_COOKIE === $name ) ) {
+				return true;
+			}
+		}
+		// 3.4.3: decoded before it is cleaned, so a percent-encoded private path (/%CF%84.xml) is recognised.
+		$path = PNCP_Private_Urls::relative_path( PNCP_Bots::request_path() );
+		if ( preg_match( '#^/(?:index\.php/)?(?:wp-login\.php|cp-[0-9a-f]{10}(?:/|$))#i', $path ) || PNCP_Bots::is_open_path( $path ) ) {
+			return true;
+		}
+		$s = PNCP_Options::get();
+		return '' !== trim( (string) $s['private_paths'] ) && PNCP_Private_Urls::path_matches( preg_replace( '#^/index\.php(?=/)#i', '', $path ), PNCP_Options::parse_list( $s['private_paths'] ) );
+	}
+
+	/* ---------- The mu-plugin file ---------- */
+
+	/**
+	 * Path of the mu-plugin.
+	 *
+	 * @return string
+	 */
+	public static function path() {
+		return PNCP_Paths::mu_plugins() . '/' . self::FILE;
+	}
+
+	/**
+	 * Is our mu-plugin in place, pointing to this copy of the plugin?
+	 *
+	 * @return bool
+	 */
+	public static function installed() {
+		$path = self::path();
+		if ( ! is_readable( $path ) ) {
+			return false;
+		}
+		$code = (string) file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Local file.
+		return self::code() === $code;
+	}
+
+	/**
+	 * The mu-plugin code: a plain loader of the plugin's own file, by its full path (written with var_export), with
+	 * comments that say what it is and how to remove it. If the plugin folder disappears, it does nothing.
+	 * 3.12.11: no variable path any more ($pncp_early_dir . 'includes/…' looked like a dropper to malware
+	 * scanners). A file of an earlier version is not installed() and is written again by sync() (on the upgrade,
+	 * pncp_upgrade_files()); ours() still recognises it by its Plugin Name, so it is replaced or removed.
+	 *
+	 * @return string
+	 */
+	public static function code() {
+		$dir      = trailingslashit( PNCP_DIR );
+		$basename = plugin_basename( PNCP_FILE );
+		$early    = var_export( $dir . 'includes/class-pncp-early.php', true ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_var_export -- Writes the path as PHP code.
+		return "<?php\n"
+			. "/**\n"
+			. ' * Plugin Name: ' . self::MARKER . "\n"
+			. " * Description: Created by ScrapeLock (setting \"Early check\"). Blocks known bots before the theme and the other plugins load. It is removed when the setting is turned off or ScrapeLock is deactivated.\n"
+			. " * Author: ScrapeLock\n"
+			. " *\n"
+			. " * This file only loads ScrapeLock's own early check from the plugin folder. To remove it, turn off the\n"
+			. " * \"Early check\" setting of ScrapeLock or deactivate ScrapeLock; deleting this file by hand is safe too.\n"
+			. " *\n"
+			. " * @package ScrapeLock\n"
+			. " */\n\n"
+			. "defined( 'ABSPATH' ) || exit;\n\n"
+			. 'if ( is_readable( ' . $early . " ) ) {\n"
+			. "\trequire_once " . $early . ";\n"
+			. "\tPNCP_Early::run( " . var_export( $dir, true ) . ', ' . var_export( $basename, true ) . " );\n" // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_var_export -- Writes the folder and the basename as PHP code.
+			. "}\n";
+	}
+
+	/**
+	 * Brings the mu-plugin in line with the setting: writes it when "Early check" is on, removes it when off.
+	 * On multisite it is shared by all sites, so it is only written there (each site checks its own setting).
+	 *
+	 * @return bool Whether the file is now as it should be.
+	 */
+	public static function sync() {
+		$s = PNCP_Options::stored();
+		if ( ! empty( $s['early_mode'] ) ) {
+			return self::installed() || self::write();
+		}
+		if ( is_multisite() ) {
+			return true;
+		}
+		self::remove();
+		return ! file_exists( self::path() );
+	}
+
+	/**
+	 * Writes the mu-plugin. Only with direct file access: never asks for FTP details.
+	 *
+	 * @return bool
+	 */
+	private static function write() {
+		$filesystem = self::filesystem();
+		if ( ! $filesystem ) {
+			return false;
+		}
+		if ( ! self::make_dir() ) {
+			return false;
+		}
+		$path = self::path();
+		if ( $filesystem->exists( $path ) && ! self::ours( $path ) ) {
+			return false; // Someone else's file with the same name: never overwritten.
+		}
+		// Written next to it first (not ending in .php, so WordPress never loads it), then renamed over it: a
+		// request loading the must-use plugins meanwhile, or a write cut short (disk full, quota), never leaves
+		// a half-written file there, which would stop every page of the site, wp-admin included, with a fatal error.
+		// 3.12.10: an existing file keeps its owner, group and mode; a new one gets WordPress's file mode and, when
+		// run as root (wp --allow-root), the owner of the WordPress folder, so PHP-FPM can still read it. Applied to
+		// the temporary file before the rename, so the live file never has the wrong owner.
+		$meta = PNCP_File_Owner::capture( $path );
+		$mode = null !== $meta ? $meta['mode'] : FS_CHMOD_FILE;
+		$code = self::code();
+		// 3.12.11: no ".php" anywhere in its name (up to 3.12.10: scrapelock-early.php.RANDOM.tmp).
+		$tmp  = dirname( $path ) . '/scrapelock-early-' . wp_generate_password( 8, false ) . '.tmp';
+		if ( ! $filesystem->put_contents( $tmp, $code, $mode ) || (string) file_get_contents( $tmp ) !== $code ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Local file.
+			$filesystem->delete( $tmp );
+			return false;
+		}
+		PNCP_File_Owner::restore( $tmp, $meta );
+		if ( ! @rename( $tmp, $path ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.rename_rename -- Atomic replace in the same folder; WP_Filesystem has no atomic move.
+			$filesystem->delete( $tmp );
+			// Where the rename is refused (e.g. a file in use on Windows), written in place, as before.
+			if ( ! $filesystem->put_contents( $path, $code, $mode ) ) {
+				return false;
+			}
+		}
+		PNCP_File_Owner::restore( $path, $meta );
+		// OPcache would keep running the previous file (e.g. one that points to the plugin's former folder).
+		if ( function_exists( 'opcache_invalidate' ) ) {
+			opcache_invalidate( $path, true );
+		}
+		return self::installed();
+	}
+
+	/**
+	 * Removes the mu-plugin, only if it is ours.
+	 */
+	public static function remove() {
+		$path = self::path();
+		if ( file_exists( $path ) && self::ours( $path ) ) {
+			wp_delete_file( $path );
+		}
+		self::remove_dir(); // 3.4.3: and the mu-plugins folder, if ScrapeLock created it and it is now empty.
+	}
+
+	/**
+	 * 3.4.3: creates the mu-plugins folder when it is not there, and records that ScrapeLock created it (a
+	 * network option, not autoloaded), so that remove_dir() takes it away again once it is empty. Used for the
+	 * early check and the Lockdown guard.
+	 *
+	 * @return bool Whether the folder is there.
+	 */
+	public static function make_dir() {
+		$dir = PNCP_Paths::mu_plugins();
+		if ( is_dir( $dir ) ) {
+			return true;
+		}
+		if ( ! wp_mkdir_p( $dir ) ) {
+			return false;
+		}
+		// 3.12.10: created as root (wp --allow-root), the folder goes to the owner of the WordPress folder.
+		PNCP_File_Owner::restore( $dir, null );
+		update_site_option( self::DIR_OPTION, $dir ); // On a single site: update_option() with autoload off.
+		return true;
+	}
+
+	/**
+	 * 3.4.3: removes the mu-plugins folder, only when ScrapeLock created it (make_dir()) and it is empty: a
+	 * folder that was already there, or that now holds other files, is never removed.
+	 */
+	public static function remove_dir() {
+		$dir = (string) get_site_option( self::DIR_OPTION, '' );
+		if ( '' === $dir ) {
+			return;
+		}
+		clearstatcache();
+		if ( is_dir( $dir ) ) {
+			$files = scandir( $dir );
+			if ( false === $files || array() !== array_diff( $files, array( '.', '..' ) ) ) {
+				return; // Not empty (or not readable): kept, and still ours to remove later.
+			}
+			if ( ! @rmdir( $dir ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_rmdir -- Only an empty folder ScrapeLock created.
+				return;
+			}
+		}
+		delete_site_option( self::DIR_OPTION );
+	}
+
+	/**
+	 * Was the file written by ScrapeLock?
+	 *
+	 * @param string $path Path.
+	 * @return bool
+	 */
+	public static function ours( $path ) {
+		if ( ! is_readable( $path ) ) {
+			return false;
+		}
+		$head = (string) file_get_contents( $path, false, null, 0, 200 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Local file.
+		return false !== strpos( $head, 'Plugin Name: ' . self::MARKER );
+	}
+
+	/**
+	 * WP_Filesystem with direct access, or null.
+	 *
+	 * @return WP_Filesystem_Base|null
+	 */
+	private static function filesystem() {
+		if ( ! function_exists( 'get_filesystem_method' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/file.php';
+		}
+		// The check writes a test file in the folder it is given: for a mu-plugins folder that does not exist yet
+		// (most sites) it would always fail and the file would never be written. Then wp-content is asked.
+		$mu      = PNCP_Paths::mu_plugins();
+		$context = is_dir( $mu ) ? $mu : dirname( $mu );
+		if ( 'direct' !== get_filesystem_method( array(), $context ) || ! WP_Filesystem() ) {
+			return null;
+		}
+		global $wp_filesystem;
+		return $wp_filesystem instanceof WP_Filesystem_Base ? $wp_filesystem : null;
+	}
+}

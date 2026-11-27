@@ -1,0 +1,267 @@
+<?php
+/**
+ * Plugin uninstall: removes settings, the log table, cron events and transient data.
+ *
+ * Does NOT delete the folder with the clean image originals (uploads/pncp-originals-…), nor its index
+ * (the _pncp_wm meta of each image and pncp_backup_dir): if some images are watermarked at full size, those
+ * are their only clean copies, and a reinstall can restore them with "Remove watermark".
+ *
+ * @package ScrapeLock
+ */
+
+defined( 'WP_UNINSTALL_PLUGIN' ) || exit;
+
+require_once __DIR__ . '/includes/class-pncp-paths.php';
+
+// 3.8: the classes of 3.8 clean up after themselves (their .htaccess blocks, their rules at Bunny CDN). The plugin
+// itself is not loaded here: its classes are loaded when first used, as in scrapelock.php.
+defined( 'PNCP_OPTION' ) || define( 'PNCP_OPTION', 'pncp_settings' );
+defined( 'PNCP_DIR' ) || define( 'PNCP_DIR', __DIR__ . '/' );
+spl_autoload_register(
+	static function ( $pncp_class ) {
+		if ( 0 !== strpos( $pncp_class, 'PNCP_' ) ) {
+			return;
+		}
+		$pncp_file = __DIR__ . '/includes/class-' . str_replace( '_', '-', strtolower( $pncp_class ) ) . '.php';
+		if ( is_readable( $pncp_file ) ) {
+			require_once $pncp_file;
+		}
+	}
+);
+
+/**
+ * 3.8: what the 3.8 classes stored on one site: the Bunny CDN Edge Rules made by ScrapeLock, the "ScrapeLock
+ * Hardening" and "ScrapeLock Stealth" blocks of the site's .htaccess, the attack record, the sign-in protection's
+ * data and their options and events. Each part on its own: one that fails does not stop the others, and the
+ * options, events and table are also deleted directly below.
+ */
+function pncp_uninstall_380() {
+	$pncp_bunny_rules = get_option( 'pncp_bunny_rules', array() );
+	$pncp_parts       = array( 'PNCP_Hardening', 'PNCP_Stealth', 'PNCP_Login', 'PNCP_Attack_Report', 'PNCP_Attacks', 'PNCP_Traffic' ); // 3.12: PNCP_Traffic.
+	if ( is_array( $pncp_bunny_rules ) && $pncp_bunny_rules ) {
+		array_unshift( $pncp_parts, 'PNCP_Bunny' ); // Leftover rules carry "ScrapeLock:" in the Bunny dashboard.
+	}
+	foreach ( $pncp_parts as $pncp_class ) {
+		try {
+			call_user_func( array( $pncp_class, 'uninstall' ) );
+		} catch ( Throwable $pncp_error ) {
+			unset( $pncp_error );
+		}
+	}
+}
+
+/**
+ * Cleans up a single site.
+ */
+function pncp_uninstall_site() {
+	global $wpdb;
+
+	// Blocks still waiting to be removed at the CDN (deactivation stops after 20 seconds, or on a rate limit):
+	// one more try now, before their list is deleted with the settings. Otherwise they would stay at the CDN
+	// for good, as permanent blocks. Rules that are still left carry the note "ScrapeLock" in the CDN dashboard.
+	$pncp_retire = get_option( 'pncp_edge_retire', array() );
+	$pncp_config = get_option( 'pncp_edge', array() );
+	if ( ( is_array( $pncp_retire ) && $pncp_retire ) || ( is_array( $pncp_config ) && ! empty( $pncp_config['provider'] ) ) ) {
+		try {
+			defined( 'PNCP_OPTION' ) || define( 'PNCP_OPTION', 'pncp_settings' );
+			foreach ( array( 'time', 'options', 'ip', 'log', 'edge' ) as $pncp_class ) {
+				require_once __DIR__ . '/includes/class-pncp-' . $pncp_class . '.php';
+			}
+			PNCP_Edge::remove_all( 20 );
+		} catch ( Throwable $pncp_error ) {
+			unset( $pncp_error ); // Uninstall goes on: the leftover rules can be removed in the CDN dashboard.
+		}
+	}
+	unset( $pncp_retire, $pncp_config );
+	pncp_uninstall_380();
+	// 3.10.1: apple-touch-icon.png and OneSignalSDKWorker.js, only those ScrapeLock created and nobody changed.
+	try {
+		PNCP_Site_Files::remove_all();
+	} catch ( Throwable $pncp_error ) {
+		unset( $pncp_error );
+	}
+	delete_option( 'pncp_site_files' );
+	delete_transient( 'pncp_health_site_files' );
+	// 3.12.6: the verification files (and only their own files in the root folder).
+	try {
+		PNCP_Verify_Files::remove_all();
+	} catch ( Throwable $pncp_error ) {
+		unset( $pncp_error );
+	}
+	delete_option( 'pncp_verify_files' );
+	delete_option( 'pncp_verify_files_data' );
+
+	foreach ( array( 'pncp_settings', 'pncp_version', 'pncp_db_version', 'pncp_emergency_until', 'pncp_ip_lists', 'pncp_ip_lists_cloudflare', 'pncp_ip_lists_bunny', 'pncp_ip_lists_bunny_sum', 'pncp_ip_lists_google', 'pncp_ip_lists_bing', 'pncp_ip_lists_openai_search', 'pncp_ip_lists_openai_user', 'pncp_ip_lists_perplexity_bot', 'pncp_ip_lists_perplexity_user', 'pncp_ip_lists_anthropic', 'pncp_ip_lists_apple', 'pncp_ip_lists_duckduckgo', 'pncp_ip_lists_updated', 'pncp_bans', 'pncp_feed_token', 'pncp_feed_stats', 'pncp_legacy_token_notice', 'pncp_legacy_token_migrated', 'pncp_wm_cursor_apply', 'pncp_wm_cursor_remove', 'pncp_upgrade_lock', 'pncp_geo', 'pncp_origin_proxy', 'pncp_proxy_peer', 'pncp_precheck_status', 'pncp_precheck_key', 'pncp_precheck_block', 'pncp_precheck_redis_conn', 'pncp_log_uas', 'pncp_log_account', 'pncp_lockdown', 'pncp_lockdown_log', 'pncp_integrity', 'pncp_integrity_report', 'pncp_integrity_alerted', 'pncp_integrity_dbcode', 'pncp_surge', 'pncp_surge_last', 'pncp_surge_alert', 'pncp_edge', 'pncp_edge_state', 'pncp_edge_retire', 'pncp_edge_staff', 'pncp_edge_lock', 'pncp_edge_dirty', 'pncp_edge_not_before', 'pncp_edge_calls', 'pncp_edge_send_notice', 'pncp_lockdown_snap', 'pncp_lockdown_digests', 'pncp_lockdown_window', 'pncp_lockdown_mutex', 'pncp_lockdown_mutex_pri', 'pncp_lockdown_fails', 'pncp_lockdown_dblock', 'pncp_integrity_stat', 'pncp_integrity_scan', 'pncp_upgrade_files', 'pncp_log_cleaned', 'pncp_bans_until', 'pncp_monitor_ended', 'pncp_settings_backups', 'pncp_lockdown_updates_mailed', 'pncp_bans_stamp', 'pncp_dc_stamp', 'pncp_precheck_hv_key', 'pncp_crowdsec_ranges', 'pncp_crowdsec_state', 'pncp_attacks_db', 'pncp_attacks_gen', 'pncp_attack_report_last', 'pncp_hardening', 'pncp_hardening_history', 'pncp_login_locks', 'pncp_bunny_config', 'pncp_bunny_state', 'pncp_bunny_rules', 'pncp_bunny_calls', 'pncp_stealth' ) as $pncp_option ) {
+		delete_option( $pncp_option );
+	}
+	delete_option( 'pncp_bunny_login_strict' ); // 3.9: the login lock at Bunny uses the explicit list.
+	delete_option( 'pncp_xmlrpc_use' ); // 3.9: when XML-RPC was last used for real.
+	delete_option( 'pncp_plugin_bots' ); // 3.10: the service bots of plugins the administrator stopped allowing.
+	delete_option( 'pncp_bunny_login_admin_ip' ); // 3.13.0: the exact IP of the administrator who locked wp-login.php at Bunny.
+	delete_option( 'pncp_bunny_purge' ); // 3.13.0: when the Bunny cache was last purged after a content change.
+	delete_option( 'pncp_bunny_import_on' ); // 3.13.0: when the import of Bunny's logs was turned on.
+	wp_unschedule_hook( 'pncp_bunny_purge' );
+	wp_unschedule_hook( 'pncp_refresh_bunny_edges' ); // 3.13.0: Bunny's edge list, asked for by a new edge.
+	delete_option( 'pncp_server_ips' ); // 3.11: the server's own addresses (PNCP_Server_Ips).
+	delete_option( 'pncp_server_key' ); // 3.11: the key of the site's signed requests to itself.
+	delete_option( 'pncp_plugin_bot_agents' ); // 3.11: the allowed plugin bots, for the early check.
+	// 3.12.2: the notes of the site's requests to itself and the last self-check (PNCP_Self_Check). Its transients
+	// (pncp_selfcheck_route, pncp_edge_spare) go with every _transient_pncp_ row below.
+	delete_option( 'pncp_selfcheck_log' );
+	delete_option( 'pncp_selfcheck_last' );
+	delete_option( 'pncp_fastcgi_last' ); // 3.12.7: the counts of the last purge of the Nginx fastcgi cache.
+	delete_option( 'pncp_rules_state' ); // 3.12.3: the installed server rules against the current ones.
+	delete_option( 'pncp_rules_texts' ); // 3.12.3: the text of the last rules shown, for "See what changed".
+	delete_option( 'pncp_wizard_state' ); // 3.12.6: the dismissed "For my site" proposals.
+	delete_option( 'pncp_stealth_rules_seen' ); // 3.12.6: the Stealth rules last seen on the server.
+	delete_transient( 'pncp_selfcheck_route' );
+	delete_transient( 'pncp_edge_spare' );
+	// 3.12: Traffic (also dropped by PNCP_Traffic::uninstall() above; here too, should that have failed).
+	foreach ( array( 'pncp_traffic', 'pncp_traffic_hour', 'pncp_traffic_day', 'pncp_traffic_err' ) as $pncp_table ) {
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.DirectDatabaseQuery.SchemaChange -- Uninstall.
+		$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . $pncp_table ) );
+	}
+	unset( $pncp_table );
+	foreach ( array( 'pncp_traffic_db', 'pncp_traffic_state', 'pncp_traffic_gen', 'pncp_traffic_alerts' ) as $pncp_option ) {
+		delete_option( $pncp_option );
+	}
+	// Every event of each hook, whatever its arguments (wp_clear_scheduled_hook() only removes the ones without).
+	foreach ( array( 'pncp_refresh_ip_lists', 'pncp_log_cleanup', 'pncp_log_cleanup_more', 'pncp_wm_unmark', 'pncp_edge_sync', 'pncp_integrity_official', 'pncp_integrity_resume', 'pncp_surge_mail', 'pncp_surge_mail_alert', 'pncp_defer_flush', 'pncp_background_purge', 'pncp_upgrade_files', 'pncp_crowdsec_sync', 'pncp_attack_report_weekly', 'pncp_bunny_run', 'pncp_stealth_check', 'pncp_stealth_refresh', 'pncp_stealth_restart', 'pncp_server_ips_changed', 'pncp_traffic_run', 'pncp_verify_files_expire' ) as $pncp_hook ) {
+		wp_unschedule_hook( $pncp_hook );
+	}
+	// The Lockdown guard (must-use plugin), only if it is ours, with its data: 3.12.11 the folder
+	// mu-plugins/scrapelock-lockdown-data (guard.json, index.html, .htaccess and the private folder data-<hex> with
+	// snapshot.json and fails.json); the signed lock file written when the guard could not be (the private folder
+	// data-<hex> of wp-content/uploads/scrapelock-lockdown or wp-content/scrapelock-lockdown, with lock.json and
+	// fails.json); and the files of 3.12.10 and older (the guard with its data inside, fails.php, lock-<hex>.php,
+	// fails-<hex>.php, index.php, 3.4.0's scrapelock-lockdown-fails.json). Only ScrapeLock's files, whatever the keys
+	// they were made with, and the folders when they are empty then (PNCP_Seal::remove_guard()).
+	try {
+		PNCP_Seal::remove_guard();
+		PNCP_Seal::remove_beacon();
+	} catch ( Throwable $pncp_error ) {
+		unset( $pncp_error );
+	}
+	// The lock file of the code checks (in the must-use plugins folder, or in wp-content).
+	foreach ( array( PNCP_Paths::mu_plugins(), PNCP_Paths::content() ) as $pncp_dir ) {
+		if ( file_exists( $pncp_dir . '/scrapelock-lockdown.lock' ) ) {
+			wp_delete_file( $pncp_dir . '/scrapelock-lockdown.lock' );
+		}
+	}
+
+	// The per-attachment "already watermarked" record (_pncp_wm) and pncp_backup_dir are kept on purpose: they
+	// are the index of the clean image originals, which are intentionally not deleted (see the file header).
+	// Without them a later reinstall could no longer tell which backup belongs to which file.
+
+	// The country database folder (this site's uploads; on multisite each site has its own). Its files first,
+	// then the now-empty folder.
+	$pncp_geo = trailingslashit( wp_upload_dir( null, false )['basedir'] ) . 'scrapelock-geo';
+	foreach ( array( 'v4.bin', 'v6.bin', 'index.html', 'index.php', '.htaccess' ) as $pncp_geo_file ) {
+		if ( file_exists( $pncp_geo . '/' . $pncp_geo_file ) ) {
+			wp_delete_file( $pncp_geo . '/' . $pncp_geo_file );
+		}
+	}
+	if ( is_dir( $pncp_geo ) ) {
+		@rmdir( $pncp_geo ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_rmdir -- Only succeeds when empty; harmless otherwise.
+	}
+	unset( $pncp_geo, $pncp_geo_file );
+
+	// "No PHP in the uploads folder": ScrapeLock's block in the .htaccess of the uploads folder (other content stays).
+	$pncp_htaccess = trailingslashit( wp_upload_dir( null, false )['basedir'] ) . '.htaccess';
+	if ( file_exists( $pncp_htaccess ) ) {
+		require_once __DIR__ . '/includes/class-pncp-rules.php';
+		PNCP_Rules::remove_marker_block( $pncp_htaccess ); // The whole block, markers included.
+	}
+	unset( $pncp_htaccess );
+
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery, WordPress.DB.DirectDatabaseQuery.SchemaChange -- Runs once, on uninstall.
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . 'pncp_log' ) );
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . 'pncp_bans' ) );
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . 'pncp_kv' ) ); // 3.6.1: short-lived values.
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . 'pncp_crowdsec' ) ); // 3.7: CrowdSec blocklist.
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . 'pncp_airef' ) ); // 3.7: visits from AI assistants.
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . 'pncp_attacks' ) ); // 3.8: the attack record.
+	delete_option( 'pncp_attacks_meta_purged' ); // 3.10: the one-time cleanup of site-metadata rows.
+	$wpdb->query(
+		$wpdb->prepare(
+			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s",
+			$wpdb->esc_like( '_transient_pncp_' ) . '%',
+			$wpdb->esc_like( '_transient_timeout_pncp_' ) . '%',
+			$wpdb->esc_like( '_site_transient_pncp_' ) . '%',
+			$wpdb->esc_like( '_site_transient_timeout_pncp_' ) . '%',
+			$wpdb->esc_like( 'pncp_dc_' ) . '%',
+			$wpdb->esc_like( 'pncp_ip_lists_dc_' ) . '%'
+		)
+	);
+	// phpcs:enable
+}
+
+// The pre-cache check (normally already removed on deactivation): its line in wp-config.php and its files.
+if ( ! is_multisite() ) {
+	require_once __DIR__ . '/includes/class-pncp-precheck.php';
+	PNCP_Precheck::remove( false );
+}
+
+// The early check (mu-plugin, shared by all sites of a network): removed only if ScrapeLock wrote it.
+$pncp_early = PNCP_Paths::mu_plugins() . '/scrapelock-early.php';
+if ( is_readable( $pncp_early ) && false !== strpos( (string) file_get_contents( $pncp_early, false, null, 0, 200 ), 'Plugin Name: ScrapeLock early check' ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Local file.
+	wp_delete_file( $pncp_early );
+}
+unset( $pncp_early );
+// 3.4.3: the mu-plugins folder, only if ScrapeLock created it and nothing else is in it now.
+$pncp_mu_dir = (string) get_site_option( 'pncp_mu_dir_created', '' );
+if ( '' !== $pncp_mu_dir && is_dir( $pncp_mu_dir ) && wp_normalize_path( $pncp_mu_dir ) === wp_normalize_path( PNCP_Paths::mu_plugins() ) && 2 === count( (array) scandir( $pncp_mu_dir ) ) ) {
+	@rmdir( $pncp_mu_dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged, WordPress.WP.AlternativeFunctions.file_system_operations_rmdir -- Only an empty folder ScrapeLock created.
+}
+delete_site_option( 'pncp_mu_dir_created' );
+unset( $pncp_mu_dir );
+
+if ( is_multisite() ) {
+	foreach ( get_sites(
+		array(
+			'fields' => 'ids',
+			'number' => 0,
+		)
+	) as $pncp_site_id ) {
+		switch_to_blog( $pncp_site_id );
+		pncp_uninstall_site();
+		restore_current_blog();
+	}
+} else {
+	pncp_uninstall_site();
+}
+
+// Lockdown: on multisite its state is network-wide (site options); the pending app secret is user meta.
+delete_site_option( 'pncp_lockdown' );
+delete_site_option( 'pncp_lockdown_log' );
+delete_site_option( 'pncp_lockdown_mutex' );
+delete_site_option( 'pncp_lockdown_mutex_pri' );
+delete_site_option( 'pncp_lockdown_fails' );
+delete_site_option( 'pncp_lockdown_dblock' );
+delete_site_option( 'pncp_integrity' );
+delete_site_option( 'pncp_integrity_report' );
+delete_site_option( 'pncp_integrity_scan' );
+delete_site_option( 'pncp_integrity_dbcode' ); // 3.6.
+delete_metadata( 'user', 0, 'pncp_lockdown_pending', '', true );
+// 3.8: sign-in protection (users are network-wide): the keyed IPs each account signed in from, the unlock tokens.
+delete_metadata( 'user', 0, 'pncp_login_known', '', true );
+delete_metadata( 'user', 0, 'pncp_login_unlock', '', true );
+delete_site_option( 'pncp_lockdown_digests' );
+// 3.4, multisite: the snapshot of the whole network, its fingerprints and the changes noted while unlocked for a while.
+delete_site_option( 'pncp_lockdown_net_snap' );
+delete_site_option( 'pncp_lockdown_net_digests' );
+delete_site_option( 'pncp_lockdown_net_window' );
+
+// Network transients (Lockdown wrong-code counters, recovery codes shown once, cached checksums): on multisite
+// they live in the network's own table, which the per-site cleanup above does not reach.
+if ( is_multisite() ) {
+	global $wpdb; // uninstall.php is included from inside a function: the global must be named.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Runs once, on uninstall.
+	$wpdb->query(
+		$wpdb->prepare(
+			"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s OR meta_key LIKE %s",
+			$wpdb->esc_like( '_site_transient_pncp_' ) . '%',
+			$wpdb->esc_like( '_site_transient_timeout_pncp_' ) . '%'
+		)
+	);
+}

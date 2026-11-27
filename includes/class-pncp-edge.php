@@ -1,0 +1,2844 @@
+<?php
+/**
+ * Blocking at the CDN: the IPs ScrapeLock bans are also blocked by Cloudflare or Bunny CDN, with the site
+ * owner's own account. A scraper that keeps going is then stopped at the edge, before its requests reach the
+ * server (no PHP, no database). Each block is removed when the ban ends.
+ *
+ * @package ScrapeLock
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Keeps the CDN's block list in step with the active bans: adds the new ones, removes the ones that ended.
+ * Runs from cron, never while a visitor waits.
+ */
+final class PNCP_Edge {
+
+	/**
+	 * Provider, zone and token (protected while the site is locked).
+	 */
+	const CONFIG = 'pncp_edge';
+
+	/**
+	 * What is blocked at the CDN now, the last run and the last error.
+	 */
+	const STATE = 'pncp_edge_state';
+
+	/**
+	 * Blocks of a previous configuration (another zone or provider, or turned off) still to be removed.
+	 */
+	const RETIRE = 'pncp_edge_retire';
+
+	/**
+	 * Recent IPs of administrators: never blocked at the CDN, where a block also covers wp-admin.
+	 */
+	const STAFF = 'pncp_edge_staff';
+
+	const CRON = 'pncp_edge_sync';
+
+	/**
+	 * The lock of a run: a row in wp_options that holds the time it ends. Taken with one atomic UPDATE, so two
+	 * runs can never both hold it (a transient can be read as free by two requests at once).
+	 */
+	const LOCK = 'pncp_edge_lock';
+
+	/**
+	 * Changes since the last run (bans added or lifted, settings saved): a value that changes every time.
+	 * A run that sees it change while it works schedules another run, so no change is lost.
+	 */
+	const DIRTY = 'pncp_edge_dirty';
+
+	/**
+	 * API calls per run, so a run stays short and well inside the providers' rate limits.
+	 */
+	const BATCH = 25;
+
+	/**
+	 * Seconds a run may start new API calls. With the 10-second timeout of one call, a run ends within about
+	 * 25 seconds, inside PHP's usual 30-second time limit (3.4.2: 15 instead of 20 seconds; the plugin no longer
+	 * raises the time limit). When less time is left in the request (other scheduled tasks ran first in the same
+	 * cron request), the run stops earlier: see deadline(). The lock lasts much longer than that (LOCK_TTL), so
+	 * it never expires during a run.
+	 */
+	const BUDGET = 15;
+
+	/**
+	 * Seconds one API call may take.
+	 */
+	const CALL_TIMEOUT = 10;
+
+	/**
+	 * Seconds the lock is held at most, if a run dies without releasing it.
+	 */
+	const LOCK_TTL = 300;
+
+	/**
+	 * Removals the CDN refuses (other than "not found") are tried this many times before they are given up
+	 * and listed on the settings page, to be removed by hand.
+	 */
+	const TRIES = 3;
+
+	/**
+	 * 3.4.1: no API call before this time (an option holding a Unix time). Set when the CDN asked to slow down or
+	 * refused the token; a ban that comes in meanwhile no longer starts a run early.
+	 */
+	const NOT_BEFORE = 'pncp_edge_not_before';
+
+	/**
+	 * 3.4.1: the API calls of the last 5 minutes (an option: [window start, calls]). Cloudflare allows 1200 calls
+	 * per 5 minutes for the whole account, shared with the dashboard and other tools: ScrapeLock makes at most
+	 * CALL_BUDGET of them.
+	 */
+	const CALLS = 'pncp_edge_calls';
+
+	/**
+	 * 3.4.1: API calls in 5 minutes at most.
+	 */
+	const CALL_BUDGET = 300;
+
+	/**
+	 * 3.9: option set by the upgrade when a site that already sent its blocks to the CDN got "Send temporary
+	 * blocks to the CDN" on: the administrators are told once about the new switch.
+	 */
+	const NOTICE = 'pncp_edge_send_notice';
+
+	/**
+	 * 3.9: admin-post action of the switch, the one-click "Trust Bunny CDN addresses" and the notice.
+	 */
+	const SWITCH_ACTION = 'pncp_edge_switch';
+
+	/**
+	 * 3.9: query argument that opens the folded "Blocking at the CDN (advanced)" part after a redirect (value
+	 * 'edge'), so its buttons stay in view after Save, Test, Import now, Lock, Confirm, Unlock or Disconnect.
+	 */
+	const OPEN_ARG = 'pncp_open';
+
+	/**
+	 * Seconds the CDN asked to wait (Retry-After) in the last answer of this request.
+	 *
+	 * @var int
+	 */
+	private static $retry_after = 0;
+
+	/**
+	 * Whether this request removes everything (deactivation, uninstall): those calls are neither held to nor
+	 * counted in CALL_BUDGET, since there may be no later run to finish them (a 429 from the CDN still stops them).
+	 *
+	 * @var bool
+	 */
+	private static $removing_all = false;
+
+	/**
+	 * The lock value of this request while it holds the lock.
+	 *
+	 * @var string
+	 */
+	private static $lock = '';
+
+	const CLOUDFLARE_API = 'https://api.cloudflare.com/client/v4';
+	const BUNNY_API      = 'https://api.bunny.net';
+
+	/**
+	 * Registers the hooks.
+	 */
+	public static function init() {
+		add_action( self::CRON, array( __CLASS__, 'sync' ) );
+		add_action( 'pncp_bans_changed', array( __CLASS__, 'soon' ) );
+		// Protection turned off or on, or the real-IP setting changed: the blocks follow.
+		add_action( 'update_option_' . PNCP_OPTION, array( __CLASS__, 'soon' ) );
+		add_action( 'admin_init', array( __CLASS__, 'remember_staff' ) );
+		add_action( 'admin_init', array( __CLASS__, 'spare_server_ips' ) ); // 3.12.2: see there.
+		// Administrators who stopped opening wp-admin: their IPs go after 30 days all the same.
+		add_action( PNCP_Log::CRON, array( __CLASS__, 'prune_staff' ) );
+		// 3.9: "Send temporary blocks to the CDN".
+		add_action( 'admin_post_' . self::SWITCH_ACTION, array( __CLASS__, 'handle_switch' ) );
+		add_action( 'admin_notices', array( __CLASS__, 'render_upgrade_notice' ) );
+	}
+
+	/* ---------- Configuration ---------- */
+
+	/**
+	 * The supported CDNs.
+	 *
+	 * @return array<string, string>
+	 */
+	public static function providers() {
+		return array(
+			'cloudflare' => 'Cloudflare',
+			'bunny'      => 'Bunny CDN',
+		);
+	}
+
+	/**
+	 * The stored configuration. The token can also come from wp-config.php (SCRAPELOCK_EDGE_TOKEN), which
+	 * keeps it out of the database.
+	 *
+	 * @return array{provider:string, zone:string, token:string}
+	 */
+	public static function config() {
+		$c     = get_option( self::CONFIG, array() );
+		$c     = is_array( $c ) ? $c : array();
+		$token = self::token_from_config() ? (string) SCRAPELOCK_EDGE_TOKEN : ( isset( $c['token'] ) ? (string) $c['token'] : '' );
+		return array(
+			'provider' => isset( $c['provider'] ) && isset( self::providers()[ $c['provider'] ] ) ? (string) $c['provider'] : '',
+			'zone'     => isset( $c['zone'] ) ? (string) $c['zone'] : '',
+			'token'    => self::clean_token( $token ),
+		);
+	}
+
+	/**
+	 * Is the token set in wp-config.php?
+	 *
+	 * @return bool
+	 */
+	public static function token_from_config() {
+		return defined( 'SCRAPELOCK_EDGE_TOKEN' ) && '' !== self::clean_token( (string) SCRAPELOCK_EDGE_TOKEN );
+	}
+
+	/**
+	 * A zone ID as each provider writes it: Cloudflare 32 hexadecimal characters, Bunny a number.
+	 *
+	 * @param string $provider Provider.
+	 * @param string $zone     Zone ID.
+	 * @return string Empty if not valid.
+	 */
+	public static function clean_zone( $provider, $zone ) {
+		$zone = strtolower( trim( (string) $zone ) );
+		if ( 'cloudflare' === $provider ) {
+			return preg_match( '/^[0-9a-f]{32}$/', $zone ) ? $zone : '';
+		}
+		if ( 'bunny' === $provider ) {
+			return preg_match( '/^[0-9]{1,12}$/', $zone ) ? $zone : '';
+		}
+		return '';
+	}
+
+	/**
+	 * A token or API key: letters, digits, "-" and "_" only.
+	 *
+	 * @param string $token Token.
+	 * @return string
+	 */
+	public static function clean_token( $token ) {
+		$token = trim( (string) $token );
+		return preg_match( '/^[A-Za-z0-9_\-]{16,200}$/', $token ) ? $token : '';
+	}
+
+	/**
+	 * Is everything filled in to talk to the CDN?
+	 *
+	 * @param array{provider:string, zone:string, token:string}|null $c Configuration (null = stored).
+	 * @return bool
+	 */
+	public static function usable( $c = null ) {
+		$c = null === $c ? self::config() : $c;
+		return '' !== $c['provider'] && '' !== $c['zone'] && '' !== $c['token'];
+	}
+
+	/**
+	 * Should the bans be blocked at the CDN now? Not while protection is off, and not while the real visitor
+	 * IP is read from a header without checking the proxy: anyone could then put any address in that header,
+	 * get it banned and so blocked at the CDN for everyone.
+	 *
+	 * @return bool
+	 */
+	public static function active() {
+		$s = PNCP_Options::stored();
+		return self::usable() && ! empty( $s['enabled'] ) && empty( $s['trust_any_proxy'] );
+	}
+
+	/**
+	 * 3.9: is "Send temporary blocks to the CDN" on? Off, the connection is only kept and tested: no new block is
+	 * sent, and the blocks sent before stay until their temporary block ends (or is lifted), then go as usual.
+	 * Edge Rules (the Bunny card, "Vulnerable points") and the CDN's own rules do not depend on it.
+	 *
+	 * @return bool
+	 */
+	public static function send_blocks() {
+		$s = PNCP_Options::stored();
+		return ! empty( $s['edge_send_blocks'] );
+	}
+
+	/**
+	 * Saves a new configuration. The blocks made with the previous one (another zone or CDN, or turned off)
+	 * are removed in the background, with the previous credentials.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $config New configuration (token already resolved).
+	 */
+	public static function save_config( $config ) {
+		$old = self::config();
+		// A new token for the same zone manages the same blocks; another zone or CDN, or off, does not.
+		if ( $old['provider'] !== $config['provider'] || $old['zone'] !== $config['zone'] ) {
+			self::retire( $old );
+		}
+		$stored = array(
+			'provider' => $config['provider'],
+			'zone'     => $config['zone'],
+			'token'    => self::token_from_config() ? '' : $config['token'],
+		);
+		if ( false === get_option( self::CONFIG, false ) ) {
+			add_option( self::CONFIG, $stored, '', false );
+		} else {
+			update_option( self::CONFIG, $stored, false );
+		}
+		// 3.4.1: new credentials (or another zone) need not wait for what the CDN answered the old ones.
+		if ( $old['provider'] !== $config['provider'] || $old['zone'] !== $config['zone'] || $old['token'] !== $config['token'] ) {
+			delete_option( self::NOT_BEFORE );
+		}
+		self::soon();
+	}
+
+	/**
+	 * Moves the blocks made with a configuration to the removal queue, with what is needed to remove them, and
+	 * empties the state. A token kept in wp-config.php is never copied into the database: the queue only notes
+	 * that it comes from there, and it is read from wp-config.php again when the blocks are removed.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c Configuration the blocks were made with.
+	 */
+	private static function retire( $c ) {
+		$state = self::state( true );
+		$items = array();
+		foreach ( $state['rules'] as $key => $rule ) {
+			if ( ! empty( $rule['own'] ) ) {
+				$items[ $key ] = $rule;
+			}
+		}
+		if ( $items && self::usable( $c ) ) {
+			self::queue_add( $c, $items );
+		}
+		$state['rules'] = array();
+		$state['error'] = '';
+		// No configuration owns the state now: a run still busy with the old one hands what it does next to the
+		// removal queue (see commit_rule()).
+		$state['owner'] = '';
+		self::save_state( $state );
+	}
+
+	/**
+	 * Adds blocks to the removal queue, as one entry with the credentials to remove them.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c     Configuration the blocks were made with.
+	 * @param array<string, array<string, mixed>>               $items Ban key => block.
+	 */
+	private static function queue_add( $c, $items ) {
+		$entry = array(
+			'id'       => self::new_id(),
+			'provider' => $c['provider'],
+			'zone'     => $c['zone'],
+			'items'    => $items,
+		);
+		if ( self::is_config_token( $c['token'] ) ) {
+			$entry['token_source'] = 'config'; // Read from wp-config.php when needed, never stored.
+		} else {
+			$entry['token'] = $c['token'];
+		}
+		$queue   = self::retire_queue( true );
+		$queue[] = $entry;
+		self::save_queue( $queue );
+	}
+
+	/**
+	 * Is this the token set in wp-config.php?
+	 *
+	 * @param string $token Token.
+	 * @return bool
+	 */
+	private static function is_config_token( $token ) {
+		return self::token_from_config() && '' !== (string) $token && hash_equals( self::clean_token( (string) SCRAPELOCK_EDGE_TOKEN ), (string) $token );
+	}
+
+	/**
+	 * A short random ID for a queue entry, so a run can update its own entry while other requests add theirs.
+	 *
+	 * @return string
+	 */
+	private static function new_id() {
+		return strtolower( wp_generate_password( 12, false, false ) );
+	}
+
+	/**
+	 * Blocks still to be removed from previous configurations.
+	 *
+	 * @param bool $fresh Read from the database, not from what this request read before.
+	 * @return array<int, array<string, mixed>>
+	 */
+	private static function retire_queue( $fresh = false ) {
+		$queue = $fresh ? self::fresh_option( self::RETIRE ) : get_option( self::RETIRE, array() );
+		return is_array( $queue ) ? array_values( $queue ) : array();
+	}
+
+	/**
+	 * Saves the removal queue, or deletes it when it is empty.
+	 *
+	 * @param array<int, array<string, mixed>> $queue Queue.
+	 */
+	private static function save_queue( $queue ) {
+		$queue = array_values( $queue );
+		if ( ! $queue ) {
+			delete_option( self::RETIRE );
+		} elseif ( false === get_option( self::RETIRE, false ) ) {
+			add_option( self::RETIRE, $queue, '', false );
+		} else {
+			update_option( self::RETIRE, $queue, false );
+		}
+	}
+
+	/**
+	 * The credentials of a queue entry. A token that comes from wp-config.php is read from there now.
+	 *
+	 * @param array<string, mixed> $entry Queue entry.
+	 * @return array{provider:string, zone:string, token:string}
+	 */
+	private static function entry_config( $entry ) {
+		if ( isset( $entry['token_source'] ) && 'config' === $entry['token_source'] ) {
+			$token = self::token_from_config() ? self::clean_token( (string) SCRAPELOCK_EDGE_TOKEN ) : '';
+		} else {
+			$token = isset( $entry['token'] ) ? self::clean_token( (string) $entry['token'] ) : '';
+		}
+		return array(
+			'provider' => isset( $entry['provider'] ) && isset( self::providers()[ $entry['provider'] ] ) ? (string) $entry['provider'] : '',
+			'zone'     => isset( $entry['zone'] ) ? (string) $entry['zone'] : '',
+			'token'    => $token,
+		);
+	}
+
+	/**
+	 * Up to 3.3.2 the removal queue held a copy of the token, even when it was set in wp-config.php. Such copies
+	 * are removed: the entry now notes that the token comes from wp-config.php. Entries also get an ID. Runs on
+	 * upgrade and before every run, and changes nothing once done.
+	 */
+	public static function migrate_queue() {
+		$queue   = self::retire_queue( true );
+		$changed = false;
+		foreach ( $queue as $i => $entry ) {
+			if ( ! is_array( $entry ) ) {
+				unset( $queue[ $i ] );
+				$changed = true;
+				continue;
+			}
+			if ( empty( $entry['id'] ) ) {
+				$queue[ $i ]['id'] = self::new_id();
+				$changed           = true;
+			}
+			if ( isset( $entry['token'] ) && self::is_config_token( (string) $entry['token'] ) ) {
+				unset( $queue[ $i ]['token'] );
+				$queue[ $i ]['token_source'] = 'config';
+				$changed                     = true;
+			}
+		}
+		if ( $changed ) {
+			self::save_queue( $queue );
+		}
+	}
+
+	/**
+	 * Updates one block in one queue entry, on a fresh copy of the queue, so entries that other requests added
+	 * in the meantime are kept. An entry with nothing left is removed.
+	 *
+	 * @param string                    $entry_id Entry ID.
+	 * @param string                    $key      Ban key.
+	 * @param array<string, mixed>|null $item     The block, or null when it is gone.
+	 */
+	private static function commit_queue_item( $entry_id, $key, $item ) {
+		$queue = self::retire_queue( true );
+		foreach ( $queue as $i => $entry ) {
+			if ( ! isset( $entry['id'] ) || $entry_id !== $entry['id'] ) {
+				continue;
+			}
+			$items = isset( $entry['items'] ) && is_array( $entry['items'] ) ? $entry['items'] : array();
+			if ( null === $item ) {
+				unset( $items[ $key ] );
+			} else {
+				$items[ $key ] = $item;
+			}
+			if ( $items ) {
+				$queue[ $i ]['items'] = $items;
+			} else {
+				unset( $queue[ $i ] );
+			}
+			self::save_queue( $queue );
+			return;
+		}
+	}
+
+	/**
+	 * Removes a whole queue entry (its credentials no longer work).
+	 *
+	 * @param string $entry_id Entry ID.
+	 */
+	private static function drop_queue_entry( $entry_id ) {
+		$queue = self::retire_queue( true );
+		foreach ( $queue as $i => $entry ) {
+			if ( isset( $entry['id'] ) && $entry_id === $entry['id'] ) {
+				unset( $queue[ $i ] );
+			}
+		}
+		self::save_queue( $queue );
+	}
+
+	/**
+	 * Reads an option from the database, not from what this request read before: another request (the
+	 * settings page, a ban) may have changed it since. With a persistent object cache the request that changed
+	 * it has already updated the cache.
+	 *
+	 * @param string $name Option name.
+	 * @return mixed
+	 */
+	private static function fresh_option( $name ) {
+		wp_cache_delete( $name, 'options' );
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+		if ( is_array( $notoptions ) && isset( $notoptions[ $name ] ) ) {
+			unset( $notoptions[ $name ] );
+			wp_cache_set( 'notoptions', $notoptions, 'options' );
+		}
+		$alloptions = wp_cache_get( 'alloptions', 'options' );
+		if ( is_array( $alloptions ) && isset( $alloptions[ $name ] ) ) {
+			wp_cache_delete( 'alloptions', 'options' ); // Stored as autoloaded by an old version.
+		}
+		return get_option( $name, array() );
+	}
+
+	/* ---------- State ---------- */
+
+	/**
+	 * What is blocked at the CDN: ban key => [id (Cloudflare rule), until, own (made by ScrapeLock), pending
+	 * (the time an add was sent whose answer was not saved yet), fails (removals refused so far)]. Also the
+	 * configuration the blocks belong to (owner), the last run, the last error and the blocks that could not be
+	 * removed (dropped).
+	 *
+	 * @param bool $fresh Read from the database, not from what this request read before.
+	 * @return array{rules:array<string, array<string, mixed>>, time:int, error:string, error_time:int, owner:string|null, dropped:array<int, array<string, mixed>>}
+	 */
+	public static function state( $fresh = false ) {
+		$state = $fresh ? self::fresh_option( self::STATE ) : get_option( self::STATE, array() );
+		$state = is_array( $state ) ? $state : array();
+		return array(
+			'rules'      => isset( $state['rules'] ) && is_array( $state['rules'] ) ? $state['rules'] : array(),
+			'time'       => isset( $state['time'] ) ? (int) $state['time'] : 0,
+			'error'      => isset( $state['error'] ) ? (string) $state['error'] : '',
+			'error_time' => isset( $state['error_time'] ) ? (int) $state['error_time'] : 0,
+			// Null: saved by a version before 3.4, which did not record it.
+			'owner'      => isset( $state['owner'] ) ? (string) $state['owner'] : null,
+			'dropped'    => isset( $state['dropped'] ) && is_array( $state['dropped'] ) ? array_values( $state['dropped'] ) : array(),
+		);
+	}
+
+	/**
+	 * Saves the state (not autoloaded: only cron and the settings page read it).
+	 *
+	 * @param array<string, mixed> $state State.
+	 */
+	private static function save_state( $state ) {
+		if ( false === get_option( self::STATE, false ) ) {
+			add_option( self::STATE, $state, '', false );
+		} else {
+			update_option( self::STATE, $state, false );
+		}
+	}
+
+	/**
+	 * Which configuration blocks belong to: provider and zone.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c Configuration.
+	 * @return string
+	 */
+	private static function fingerprint( $c ) {
+		return $c['provider'] . ':' . $c['zone'];
+	}
+
+	/**
+	 * Saves one block right after the API call that made, changed or removed it (on a fresh copy of the state),
+	 * so a run that stops halfway (time limit, fatal error) never forgets a block it made. If the configuration
+	 * changed while the run was busy, the block belongs to the old one: a block ScrapeLock made goes to the
+	 * removal queue instead.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c    Configuration of the run.
+	 * @param string                                            $key  Ban key.
+	 * @param array<string, mixed>|null                         $rule The block, or null when it is gone.
+	 */
+	private static function commit_rule( $c, $key, $rule ) {
+		$state = self::state( true );
+		if ( self::fingerprint( $c ) !== $state['owner'] ) {
+			if ( is_array( $rule ) && ! empty( $rule['own'] ) && self::usable( $c ) ) {
+				self::queue_add( $c, array( $key => $rule ) );
+			}
+			return;
+		}
+		if ( null === $rule ) {
+			unset( $state['rules'][ $key ] );
+		} else {
+			$state['rules'][ $key ] = $rule;
+		}
+		self::save_state( $state );
+	}
+
+	/**
+	 * Notes a block that could not be removed by ScrapeLock, so the site owner can remove it by hand (the
+	 * newest 20).
+	 *
+	 * @param string $provider Provider.
+	 * @param string $key      Ban key.
+	 * @param string $message  What the CDN answered.
+	 */
+	private static function record_dropped( $provider, $key, $message ) {
+		$state = self::state( true );
+		array_unshift(
+			$state['dropped'],
+			array(
+				'key'      => $key,
+				'provider' => $provider,
+				'time'     => time(),
+				'message'  => $message,
+			)
+		);
+		$state['dropped'] = array_slice( $state['dropped'], 0, 20 );
+		self::save_state( $state );
+	}
+
+	/**
+	 * How many addresses ScrapeLock has blocked at the CDN now.
+	 *
+	 * @return int
+	 */
+	public static function count() {
+		return count(
+			array_filter(
+				self::state()['rules'],
+				static function ( $rule ) {
+					return ! empty( $rule['own'] ) && empty( $rule['pending'] );
+				}
+			)
+		);
+	}
+
+	/**
+	 * At most this many addresses are blocked at the CDN (the newest bans). Filter `pncp_edge_max` (1–5000).
+	 *
+	 * @return int
+	 */
+	public static function max() {
+		return max( 1, min( 5000, (int) apply_filters( 'pncp_edge_max', 500 ) ) );
+	}
+
+	/* ---------- Administrators ---------- */
+
+	/**
+	 * Remembers the IP of administrators who open wp-admin (30 days, the last 20). A block at the CDN also
+	 * covers wp-admin and the login page, which a ban by ScrapeLock itself does not: an administrator must
+	 * never lock themselves out that way. An IP address is personal data: every write keeps only the last
+	 * 30 days, and prune_staff() removes older entries also when nobody opens wp-admin.
+	 */
+	public static function remember_staff() {
+		if ( ! current_user_can( 'manage_options' ) || wp_doing_ajax() ) {
+			return;
+		}
+		$ip = PNCP_Ip::client_ip();
+		if ( '' === $ip || ! PNCP_Ip::reliable() ) {
+			return;
+		}
+		$key   = PNCP_Ip::limit_key( $ip );
+		$staff = self::staff();
+		if ( isset( $staff[ $key ] ) && $staff[ $key ] > time() - 12 * HOUR_IN_SECONDS ) {
+			self::prune_staff(); // Seen recently: no new entry, but entries older than 30 days still go.
+			return;
+		}
+		$staff[ $key ] = time();
+		arsort( $staff );
+		self::save_staff( array_slice( $staff, 0, 20, true ) );
+	}
+
+	/**
+	 * Removes the administrators' IPs not seen for 30 days from the database (only when there are any: no
+	 * write otherwise).
+	 */
+	public static function prune_staff() {
+		$stored = get_option( self::STAFF, array() );
+		if ( ! is_array( $stored ) || ! $stored ) {
+			return;
+		}
+		$fresh = self::staff();
+		if ( count( $fresh ) !== count( $stored ) ) {
+			self::save_staff( $fresh );
+		}
+	}
+
+	/**
+	 * Stores the administrators' IPs (not autoloaded: read only in wp-admin and when blocking at the CDN).
+	 *
+	 * @param array<string, int> $staff Ban key => last seen, only the last 30 days.
+	 */
+	private static function save_staff( $staff ) {
+		if ( false === get_option( self::STAFF, false ) ) {
+			add_option( self::STAFF, $staff, '', false );
+		} else {
+			update_option( self::STAFF, $staff, false );
+		}
+	}
+
+	/**
+	 * The administrators' IPs of the last 30 days: ban key => last seen.
+	 *
+	 * @return array<string, int>
+	 */
+	public static function staff() {
+		$staff = get_option( self::STAFF, array() );
+		$staff = is_array( $staff ) ? $staff : array();
+		$since = time() - 30 * DAY_IN_SECONDS;
+		$out   = array();
+		foreach ( $staff as $key => $time ) {
+			if ( (int) $time > $since ) {
+				$out[ (string) $key ] = (int) $time;
+			}
+		}
+		return $out;
+	}
+
+	/* ---------- Running ---------- */
+
+	/**
+	 * A ban was added or lifted: run in the background as soon as possible (with the next request to the
+	 * site, by WordPress's cron), not while the visitor waits. The change is also noted, so a run that is busy
+	 * right now runs again when it ends.
+	 */
+	public static function soon() {
+		if ( ! self::usable() && ! self::retire_queue() ) {
+			return;
+		}
+		update_option( self::DIRTY, uniqid( '', true ), false );
+		// 3.4.1: while the CDN asked to wait (or refused the token), a new ban does not start a run any earlier.
+		$when = max( time(), self::not_before() );
+		$next = wp_next_scheduled( self::CRON );
+		if ( $next && $next <= $when + 30 ) {
+			return;
+		}
+		if ( $next ) {
+			wp_unschedule_event( $next, self::CRON );
+		}
+		wp_schedule_single_event( $when, self::CRON );
+	}
+
+	/**
+	 * 3.4.1: the time before which no API call is made (0 = none), as it is in the database now.
+	 *
+	 * @return int
+	 */
+	private static function not_before() {
+		$time = (int) self::fresh_option_raw( self::NOT_BEFORE );
+		return $time > time() + DAY_IN_SECONDS ? 0 : $time; // A value from far in the future is not ours.
+	}
+
+	/**
+	 * After activation (or an upgrade): blocks left in the removal queue by a deactivation that ran out of
+	 * time are removed now, and the CDN is brought in step with the bans again.
+	 */
+	public static function resume() {
+		self::migrate_queue();
+		// A token saved in the settings before the same one was put in wp-config.php: the copy in the database
+		// is no longer used, so it is removed.
+		$stored = get_option( self::CONFIG, array() );
+		if ( is_array( $stored ) && isset( $stored['token'] ) && '' !== $stored['token'] && self::is_config_token( self::clean_token( (string) $stored['token'] ) ) ) {
+			$stored['token'] = '';
+			update_option( self::CONFIG, $stored, false );
+		}
+		self::soon();
+	}
+
+	/**
+	 * Takes the lock: one atomic UPDATE that only one request can win, and only once the lock is free or has
+	 * expired (a run that died).
+	 *
+	 * @return bool
+	 */
+	private static function lock() {
+		global $wpdb;
+		if ( false === self::fresh_option_raw( self::LOCK ) ) {
+			add_option( self::LOCK, '0', '', false );
+		}
+		$now   = time();
+		$value = (string) ( $now + self::LOCK_TTL );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- An atomic compare-and-set on our own row; no cache to update.
+		$rows = $wpdb->query( $wpdb->prepare( 'UPDATE %i SET option_value = %s WHERE option_name = %s AND option_value + 0 < %d', $wpdb->options, $value, self::LOCK, $now ) );
+		wp_cache_delete( self::LOCK, 'options' );
+		if ( 1 !== (int) $rows ) {
+			return false;
+		}
+		self::$lock = $value;
+		return true;
+	}
+
+	/**
+	 * Releases the lock, if this request still holds it.
+	 */
+	private static function unlock() {
+		global $wpdb;
+		if ( '' === self::$lock ) {
+			return;
+		}
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Releases our own lock only.
+		$wpdb->query( $wpdb->prepare( "UPDATE %i SET option_value = '0' WHERE option_name = %s AND option_value = %s", $wpdb->options, self::LOCK, self::$lock ) );
+		wp_cache_delete( self::LOCK, 'options' );
+		self::$lock = '';
+	}
+
+	/**
+	 * An option as it is in the database now, false if missing.
+	 *
+	 * @param string $name Option name.
+	 * @return mixed
+	 */
+	private static function fresh_option_raw( $name ) {
+		self::fresh_option( $name );
+		return get_option( $name, false );
+	}
+
+	/**
+	 * Schedules the next run at this time, unless one is already due earlier (a ban that came in during this
+	 * run, for example). With $force, earlier runs are moved to this time (the CDN asked to slow down).
+	 *
+	 * @param int  $time  Time; 0 for none.
+	 * @param bool $force Move earlier runs too.
+	 */
+	private static function schedule( $time, $force = false ) {
+		if ( ! $time ) {
+			return;
+		}
+		$next = wp_next_scheduled( self::CRON );
+		if ( $next && $next <= $time && ! $force ) {
+			return;
+		}
+		if ( $next ) {
+			wp_clear_scheduled_hook( self::CRON );
+		}
+		wp_schedule_single_event( $time, self::CRON );
+	}
+
+	/**
+	 * 3.12.2: a block at the CDN of one of the server's own addresses (sent before 3.12.1 knew them, or before the
+	 * address was detected) is removed at once, not only by the run after the next ban change: the CDN refused the
+	 * site's own requests in the meantime. Checked on wp-admin pages (at most every 10 minutes) and when a new
+	 * outbound address of the server is detected (PNCP_Server_Ips::note_outbound()).
+	 *
+	 * @param bool $now Check now, also within the 10 minutes.
+	 * @return bool Whether a run was started for it.
+	 */
+	public static function spare_server_ips( $now = false ) {
+		if ( ! $now && false !== get_transient( 'pncp_edge_spare' ) ) {
+			return false;
+		}
+		set_transient( 'pncp_edge_spare', 1, 10 * MINUTE_IN_SECONDS );
+		foreach ( array_keys( self::state()['rules'] ) as $key ) {
+			$key  = (string) $key;
+			$base = false === strpos( $key, '/' ) ? $key : (string) strstr( $key, '/', true );
+			if ( '' !== $base && PNCP_Server_Ips::is_server_ip( $base ) ) {
+				self::soon();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * The addresses that should be blocked at the CDN: the newest active bans, without the administrators'
+	 * IPs, the server's own (3.12.1) and the addresses of search engines, AI search services or the CDNs
+	 * themselves. Bunny CDN blocks single addresses only, so a banned IPv6 network (/64) is left to ScrapeLock there.
+	 *
+	 * @param string $provider Provider.
+	 * @return array<string, array{until:int, reason:string}>
+	 */
+	public static function wanted( $provider ) {
+		// "Monitor only" blocks nothing, also at the CDN: the blocks made there are removed, and come back
+		// with the next run after blocking starts (every settings change schedules one).
+		if ( ! self::active() || PNCP_Options::monitoring() ) {
+			return array();
+		}
+		$staff = self::staff();
+		$max   = self::max();
+		$out   = array();
+		// 3.9: with "Send temporary blocks to the CDN" off, only the blocks already at the CDN are kept (until
+		// their ban ends); nothing new is sent. An add whose answer never came is not kept: it is removed.
+		$send = self::send_blocks();
+		$sent = array();
+		if ( ! $send ) {
+			foreach ( self::state( true )['rules'] as $key => $rule ) {
+				if ( empty( $rule['pending'] ) ) {
+					$sent[ (string) $key ] = true;
+				}
+			}
+			if ( ! $sent ) {
+				return array();
+			}
+		}
+		// A few more than the maximum, so the addresses left out below do not take room from the others.
+		foreach ( PNCP_Log::active_bans( 2 * $max + 50 ) as $key => $ban ) {
+			if ( count( $out ) >= $max ) {
+				break;
+			}
+			$key  = (string) $key;
+			$base = false === strpos( $key, '/' ) ? $key : strstr( $key, '/', true );
+			// 3.12.1: never the server's own addresses (PNCP_Server_Ips): blocked at the CDN, the site's requests to
+			// itself through it (Vulnerable points, Site Health, cron, cache preloads) got a 403 from the CDN.
+			if ( isset( $staff[ $key ] ) || ! filter_var( $base, FILTER_VALIDATE_IP ) || PNCP_Ip::is_local( $base ) || PNCP_Ip::is_private( $base ) || '' !== PNCP_Ip::official_owner( $base ) || PNCP_Options::crawler_fallback_ip( $base ) || PNCP_Server_Ips::is_server_ip( $base ) ) {
+				continue;
+			}
+			if ( 'bunny' === $provider && $base !== $key ) {
+				continue;
+			}
+			if ( ! $send && ! isset( $sent[ $key ] ) ) {
+				continue;
+			}
+			$out[ $key ] = array(
+				'until'  => (int) $ban['until'],
+				'reason' => (string) $ban['reason'],
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * One run: removes the blocks of previous configurations, then adds the new bans and removes the ended
+	 * ones, at most BATCH API calls and BUDGET seconds. Each block is saved right after its API call. Schedules
+	 * the next run: soon if work is left or something changed during the run, otherwise when the next block
+	 * ends.
+	 */
+	public static function sync() {
+		if ( ! self::lock() ) {
+			// Another run is busy: try again in a minute (it may end before the change that queued this run).
+			self::schedule( time() + MINUTE_IN_SECONDS );
+			return;
+		}
+		$next = 0;
+		$wait = 0;
+		try {
+			$dirty = self::fresh_option_raw( self::DIRTY );
+			self::migrate_queue();
+			$deadline = self::deadline( self::BUDGET );
+			$calls    = 0;
+			$left     = self::run_retire( $calls, $wait, $deadline );
+			$c        = self::config();
+			$error    = null;
+			if ( self::usable( $c ) && ! $wait ) {
+				$result = self::run_config( $c, $calls, $deadline );
+				$left   = $left || $result['left'];
+				$wait   = $result['wait'];
+				$error  = $result['error'];
+			}
+			$state         = self::state( true );
+			$state['time'] = time();
+			if ( null !== $error ) {
+				if ( '' !== $error ) {
+					$state['error']      = $error;
+					$state['error_time'] = time();
+				} else {
+					$state['error'] = '';
+				}
+			}
+			self::save_state( $state );
+
+			if ( $wait ) {
+				$next = time() + $wait;
+			} elseif ( $left ) {
+				$next = time() + MINUTE_IN_SECONDS;
+			} else {
+				foreach ( $state['rules'] as $rule ) {
+					if ( ! empty( $rule['own'] ) ) {
+						$end  = (int) $rule['until'] + 5;
+						$next = $next ? min( $next, $end ) : $end;
+					}
+				}
+				$next = $next ? max( $next, time() + MINUTE_IN_SECONDS ) : 0;
+			}
+			// A ban or a setting changed while this run was busy: what it changed may not be done yet. 3.4.1: not
+			// when the CDN asked to wait or refused the token; then the next run waits as it asked.
+			if ( ! $wait && self::fresh_option_raw( self::DIRTY ) !== $dirty ) {
+				$next = time();
+			}
+			if ( $wait ) {
+				update_option( self::NOT_BEFORE, $next, false );
+			} elseif ( self::fresh_option_raw( self::NOT_BEFORE ) ) {
+				delete_option( self::NOT_BEFORE );
+			}
+		} finally {
+			self::unlock();
+		}
+		self::schedule( $next, (bool) $wait );
+	}
+
+	/**
+	 * Removes the blocks of previous configurations.
+	 *
+	 * @param int $calls    API calls made so far in this run (updated).
+	 * @param int $wait     Seconds to wait before the next run, if the CDN asked to slow down (updated).
+	 * @param int $deadline No new API call after this time.
+	 * @return bool Whether some are left.
+	 */
+	private static function run_retire( &$calls, &$wait, $deadline ) {
+		$queue = self::retire_queue( true );
+		if ( ! $queue ) {
+			return false;
+		}
+		foreach ( $queue as $entry ) {
+			$id    = isset( $entry['id'] ) ? (string) $entry['id'] : '';
+			$c     = self::entry_config( $entry );
+			$items = isset( $entry['items'] ) && is_array( $entry['items'] ) ? $entry['items'] : array();
+			if ( '' === $id ) {
+				continue; // Not migrated yet (migrate_queue() gives every entry an ID).
+			}
+			if ( ! self::usable( $c ) ) {
+				// The token was in wp-config.php and is not there any more: these blocks cannot be removed from
+				// here. They are listed on the settings page, to be removed by hand.
+				foreach ( $items as $key => $rule ) {
+					self::record_dropped( $c['provider'], (string) $key, __( 'The API token is no longer set in wp-config.php.', 'scrapelock' ) );
+				}
+				self::drop_queue_entry( $id );
+				continue;
+			}
+			foreach ( $items as $key => $rule ) {
+				$key = (string) $key;
+				if ( $calls >= self::BATCH || time() >= $deadline ) {
+					break 2;
+				}
+				$rule = is_array( $rule ) ? $rule : array();
+				$res  = self::remove( $c, $key, $rule, $calls );
+				if ( 'ok' === $res['status'] ) {
+					self::commit_queue_item( $id, $key, null );
+					unset( $items[ $key ] ); // Gone: never listed below as left at the CDN.
+				} elseif ( 'wait' === $res['status'] ) {
+					$wait = self::wait_for( $res['status'] );
+					break 2;
+				} elseif ( 'denied' === $res['status'] ) {
+					// The old credentials no longer work: nothing more can be done with them.
+					foreach ( $items as $gone => $unused ) {
+						self::record_dropped( $c['provider'], (string) $gone, $res['message'] );
+					}
+					self::drop_queue_entry( $id );
+					break;
+				} elseif ( 'refused' === $res['status'] ) {
+					// This one block only: tried again a few times, then given up (and listed), so it never holds
+					// up the rest of the queue for good.
+					$rule['fails'] = isset( $rule['fails'] ) ? (int) $rule['fails'] + 1 : 1;
+					if ( $rule['fails'] >= self::TRIES ) {
+						self::commit_queue_item( $id, $key, null );
+						self::record_dropped( $c['provider'], $key, $res['message'] );
+						unset( $items[ $key ] ); // Listed once already.
+					} else {
+						self::commit_queue_item( $id, $key, $rule );
+					}
+				} else {
+					// Network or server error: the next run in a few minutes (3.4.3: not every minute, each with a
+					// call that may wait 10 seconds, while the CDN cannot be reached), as for the current blocks.
+					$wait = self::wait_for( $res['status'] );
+					break 2;
+				}
+			}
+		}
+		return (bool) self::retire_queue( true );
+	}
+
+	/**
+	 * Brings the CDN in step with the active bans, for the current configuration.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c        Configuration.
+	 * @param int                                               $calls    API calls made so far (updated).
+	 * @param int                                               $deadline No new API call after this time.
+	 * @return array{left:bool, wait:int, error:string}
+	 */
+	private static function run_config( $c, &$calls, $deadline ) {
+		$fp    = self::fingerprint( $c );
+		$state = self::state( true );
+		if ( $fp !== $state['owner'] ) {
+			// Empty (after a change of configuration, whose blocks went to the removal queue) or saved by an older
+			// version: the blocks in the state belong to this configuration from now on.
+			$state['owner'] = $fp;
+		}
+		$wanted = self::wanted( $c['provider'] );
+		$todo   = array();
+		foreach ( $state['rules'] as $key => $rule ) {
+			if ( ! isset( $wanted[ $key ] ) ) {
+				$todo[] = array( 'remove', (string) $key );
+			}
+		}
+		foreach ( $wanted as $key => $ban ) {
+			if ( isset( $state['rules'][ $key ] ) ) {
+				$state['rules'][ $key ]['until'] = $ban['until']; // A renewed ban.
+				if ( ! empty( $state['rules'][ $key ]['pending'] ) ) {
+					$todo[] = array( 'add', (string) $key ); // An add whose answer was never saved: checked first.
+				}
+			} else {
+				$todo[] = array( 'add', (string) $key );
+			}
+		}
+		self::save_state( $state );
+		if ( ! $todo ) {
+			return array(
+				'left'  => false,
+				'wait'  => 0,
+				'error' => '',
+			);
+		}
+		$rules    = $state['rules'];
+		$error    = '';
+		$wait     = 0;
+		$done     = 0;
+		$existing = null;
+		foreach ( $todo as $job ) {
+			if ( $calls >= self::BATCH || time() >= $deadline ) {
+				break;
+			}
+			list( $op, $key ) = $job;
+			$res              = null;
+			if ( 'remove' === $op ) {
+				$rule = $rules[ $key ];
+				if ( empty( $rule['own'] ) ) {
+					self::commit_rule( $c, $key, null ); // Blocked by the site owner before ScrapeLock: left as it is.
+					++$done;
+					continue;
+				}
+				$res = self::remove( $c, $key, $rule, $calls );
+				if ( 'ok' === $res['status'] ) {
+					self::commit_rule( $c, $key, null );
+					++$done;
+					continue;
+				}
+				if ( 'refused' === $res['status'] ) {
+					// The CDN does not accept removing this one: tried again a few times (a passing problem), then
+					// given up and listed on the settings page, to be removed by hand.
+					$rule['fails'] = isset( $rule['fails'] ) ? (int) $rule['fails'] + 1 : 1;
+					if ( $rule['fails'] >= self::TRIES ) {
+						self::commit_rule( $c, $key, null );
+						self::record_dropped( $c['provider'], $key, $res['message'] );
+					} else {
+						self::commit_rule( $c, $key, $rule );
+					}
+					$error = $res['message'];
+					++$done; // This one address only; the others go on.
+					continue;
+				}
+			} else {
+				$ban     = $wanted[ $key ];
+				$pending = isset( $rules[ $key ] ) && ! empty( $rules[ $key ]['pending'] );
+				if ( 'bunny' === $c['provider'] && null === $existing ) {
+					// The addresses already in the pull zone's list: those were put there by the site owner,
+					// so ScrapeLock does not add them again and never removes them.
+					++$calls;
+					$list = self::bunny_blocked( $c );
+					if ( ! is_array( $list['list'] ) ) {
+						$error = $list['message'];
+						$wait  = self::wait_for( $list['status'] );
+						break;
+					}
+					$existing = $list['list'];
+				}
+				if ( is_array( $existing ) && in_array( $key, $existing, true ) ) {
+					// Already listed. If ScrapeLock had sent this add (pending), the address was not in the list
+					// before, so the block is ScrapeLock's: it is removed when the ban ends.
+					self::commit_rule(
+						$c,
+						$key,
+						array(
+							'id'    => '',
+							'until' => $ban['until'],
+							'own'   => $pending,
+						)
+					);
+					++$done;
+					continue;
+				}
+				if ( 'cloudflare' === $c['provider'] && $pending ) {
+					// The answer to an earlier add was lost: the rule may exist at Cloudflare already.
+					$found = self::cloudflare_find( $c, $key, $calls );
+					if ( 'ok' !== $found['status'] ) {
+						$res = $found; // Handled below as an error of this call.
+					} elseif ( '' !== $found['id'] ) {
+						self::commit_rule(
+							$c,
+							$key,
+							array(
+								'id'    => $found['id'],
+								'until' => $ban['until'],
+								'own'   => $found['ours'],
+							)
+						);
+						++$done;
+						continue;
+					}
+				}
+				if ( null === $res ) {
+					// Saved before the call: if the answer never arrives (time limit, timeout), the next run
+					// looks for the block instead of thinking it is someone else's.
+					self::commit_rule(
+						$c,
+						$key,
+						array(
+							'id'      => '',
+							'until'   => $ban['until'],
+							'own'     => true,
+							'pending' => time(),
+						)
+					);
+					++$calls;
+					$res = self::add( $c, $key, $ban );
+					if ( 'exists' === $res['status'] && 'cloudflare' === $c['provider'] ) {
+						// A rule for this address exists. One with the note "ScrapeLock" was made by ScrapeLock (a
+						// run whose answer was lost): it is adopted. Any other is the site owner's: never removed.
+						$found = self::cloudflare_find( $c, $key, $calls );
+						if ( 'ok' === $found['status'] && '' !== $found['id'] ) {
+							$res['id'] = $found['id'];
+							if ( $found['ours'] ) {
+								$res['status'] = 'ok';
+							}
+						} elseif ( 'ok' !== $found['status'] ) {
+							$res = $found; // Still pending: the next run looks again.
+						}
+					}
+					if ( in_array( $res['status'], array( 'ok', 'exists', 'refused' ), true ) ) {
+						// Not ours ("exists": the site owner's own rule; "refused": the CDN does not accept this one
+						// address) are kept as such, so they are not tried again and never removed.
+						self::commit_rule(
+							$c,
+							$key,
+							array(
+								'id'    => $res['id'],
+								'until' => $ban['until'],
+								'own'   => 'ok' === $res['status'],
+							)
+						);
+					}
+				}
+				if ( 'ok' === $res['status'] || 'exists' === $res['status'] ) {
+					++$done;
+					continue;
+				}
+				if ( 'refused' === $res['status'] ) {
+					$error = $res['message'];
+					++$done; // This one address only; the others go on.
+					continue;
+				}
+			}
+			// Wrong token or zone: no point retrying every few minutes. Rate limit, network or server error:
+			// a few minutes. A pending add stays pending: the next run checks whether it arrived.
+			$error = $res['message'];
+			$wait  = self::wait_for( $res['status'] );
+			break;
+		}
+		return array(
+			'left'  => $done < count( $todo ),
+			'wait'  => $wait,
+			'error' => $error,
+		);
+	}
+
+	/**
+	 * Seconds to wait before the next run after an answer of this status: an hour for a refused token, otherwise
+	 * 5 minutes (Cloudflare blocks every call for 5 minutes after its limit), or longer if the CDN asked so.
+	 *
+	 * @param string $status Status of the answer (denied | wait | error | …).
+	 * @return int
+	 */
+	private static function wait_for( $status ) {
+		if ( 'denied' === $status ) {
+			return HOUR_IN_SECONDS;
+		}
+		return max( 5 * MINUTE_IN_SECONDS, min( HOUR_IN_SECONDS, self::$retry_after ) );
+	}
+
+	/**
+	 * The time after which a run starts no new API call: $seconds from now, or earlier when PHP's time limit would
+	 * end the request before the last call (up to its 10-second timeout) is answered. What is left is done by the
+	 * next run, which is scheduled a minute later (3.4.2).
+	 *
+	 * @param int $seconds Seconds the run would like.
+	 * @return int Unix time.
+	 */
+	private static function deadline( $seconds ) {
+		$left = PNCP_Time::left( $seconds + self::CALL_TIMEOUT ) - self::CALL_TIMEOUT;
+		return time() + (int) max( 0, min( $seconds, floor( $left ) ) );
+	}
+
+	/**
+	 * Deactivation: removes the blocks ScrapeLock made (current and previous configurations), for at most
+	 * the given number of seconds. Blocks that are left stay in the removal queue: they are removed when the
+	 * plugin is activated again, or on uninstall. Cloudflare rules carry the note "ScrapeLock" and can also be
+	 * removed from the Cloudflare dashboard.
+	 *
+	 * @param int $seconds Time limit.
+	 */
+	public static function remove_all( $seconds = 20 ) {
+		self::retire( self::config() );
+		self::migrate_queue();
+		$deadline = self::deadline( max( 1, (int) $seconds ) );
+		// A run that is busy right now removes the same blocks; a block removed twice is "not found" the second
+		// time, which counts as done. So this goes on even without the lock.
+		$locked             = self::lock();
+		self::$removing_all = true;
+		try {
+			while ( self::retire_queue( true ) && time() < $deadline ) {
+				$calls = 0;
+				$wait  = 0;
+				self::run_retire( $calls, $wait, $deadline );
+				if ( $wait || $calls < self::BATCH ) {
+					break; // Finished, or stopped by an error: no point hammering the CDN.
+				}
+			}
+		} finally {
+			self::$removing_all = false;
+			if ( $locked ) {
+				self::unlock();
+			}
+		}
+		// No run after deactivation (the plugin's code does not run then); the queue stays for resume().
+		wp_clear_scheduled_hook( self::CRON );
+	}
+
+	/* ---------- The CDN APIs ---------- */
+
+	/**
+	 * Blocks one address (IPv4, IPv6, or an IPv6 /64 on Cloudflare).
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c   Configuration.
+	 * @param string                                            $key Ban key.
+	 * @param array{until:int, reason:string}                   $ban The ban.
+	 * @return array{status:string, id:string, message:string} status: ok | exists | refused | denied | wait | error.
+	 */
+	private static function add( $c, $key, $ban ) {
+		if ( 'cloudflare' === $c['provider'] ) {
+			$value  = self::cloudflare_value( $key );
+			$target = false !== strpos( $value, '/' ) ? 'ip_range' : ( false !== strpos( $value, ':' ) ? 'ip6' : 'ip' );
+			$res    = self::request(
+				$c,
+				'POST',
+				self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/firewall/access_rules/rules',
+				array(
+					'mode'          => 'block',
+					'configuration' => array(
+						'target' => $target,
+						'value'  => $value,
+					),
+					'notes'         => 'ScrapeLock: ' . $ban['reason'] . ', until ' . gmdate( 'Y-m-d H:i', $ban['until'] ) . ' UTC',
+				)
+			);
+			if ( 'ok' === $res['status'] ) {
+				$id = isset( $res['json']['result']['id'] ) ? (string) $res['json']['result']['id'] : '';
+				return array(
+					'status'  => '' !== $id ? 'ok' : 'error',
+					'id'      => $id,
+					'message' => '' !== $id ? '' : __( 'The CDN did not return the new block.', 'scrapelock' ),
+				);
+			}
+			// The address already has a rule (made by the site owner): it is left alone.
+			if ( 'refused' === $res['status'] && preg_match( '/duplicate|already exist/i', $res['message'] ) ) {
+				$res['status'] = 'exists';
+			}
+			return array(
+				'status'  => $res['status'],
+				'id'      => '',
+				'message' => $res['message'],
+			);
+		}
+		$res = self::request( $c, 'POST', self::BUNNY_API . '/pullzone/' . rawurlencode( $c['zone'] ) . '/addBlockedIp', array( 'BlockedIp' => $key ) );
+		return array(
+			'status'  => $res['status'],
+			'id'      => '',
+			'message' => $res['message'],
+		);
+	}
+
+	/**
+	 * Removes one block that ScrapeLock made. A Cloudflare block whose rule ID is not known (an add whose answer
+	 * was lost) is looked up first, and removed only if its note says ScrapeLock made it.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c     Configuration.
+	 * @param string                                            $key   Ban key.
+	 * @param array<string, mixed>                              $rule  The block.
+	 * @param int                                               $calls API calls made so far (updated).
+	 * @return array{status:string, message:string}
+	 */
+	private static function remove( $c, $key, $rule, &$calls ) {
+		if ( 'cloudflare' === $c['provider'] ) {
+			$id = isset( $rule['id'] ) ? (string) $rule['id'] : '';
+			if ( '' === $id ) {
+				$found = self::cloudflare_find( $c, $key, $calls );
+				if ( 'ok' !== $found['status'] ) {
+					return array(
+						'status'  => $found['status'],
+						'message' => $found['message'],
+					);
+				}
+				$id = $found['ours'] ? $found['id'] : '';
+			}
+			if ( ! preg_match( '/^[A-Za-z0-9]{1,64}$/', $id ) ) {
+				return array(
+					'status'  => 'ok', // Nothing of ScrapeLock's at the CDN for this address.
+					'message' => '',
+				);
+			}
+			++$calls;
+			// 3.4.1: with an empty JSON object as the body, which Cloudflare's API description marks as required.
+			$res = self::request( $c, 'DELETE', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/firewall/access_rules/rules/' . $id, (object) array() );
+		} else {
+			++$calls;
+			$res = self::request( $c, 'POST', self::BUNNY_API . '/pullzone/' . rawurlencode( $c['zone'] ) . '/removeBlockedIp', array( 'BlockedIp' => $key ) );
+		}
+		// Already gone (removed by hand at the CDN): done.
+		if ( 'refused' === $res['status'] && 404 === $res['code'] ) {
+			$res['status'] = 'ok';
+		}
+		return array(
+			'status'  => $res['status'],
+			'message' => $res['message'],
+		);
+	}
+
+	/**
+	 * Looks up the Cloudflare rule for exactly this address (one API call): its ID, and whether ScrapeLock
+	 * made it (every rule ScrapeLock makes has a note that starts with "ScrapeLock").
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c     Configuration.
+	 * @param string                                            $key   Ban key (IP or IPv6 /64).
+	 * @param int                                               $calls API calls made so far (updated).
+	 * @return array{status:string, id:string, ours:bool, message:string} id is empty when there is no rule.
+	 */
+	private static function cloudflare_find( $c, $key, &$calls ) {
+		$value = self::cloudflare_value( $key );
+		$want  = self::same_value( $value );
+		$out   = array(
+			'status'  => 'ok',
+			'id'      => '',
+			'ours'    => false,
+			'message' => '',
+		);
+		// 3.4.1: the value is compared as an address (Cloudflare may write IPv6 in another spelling), and up to
+		// three pages are read (a search that ignores the value lists every rule, newest first). For IPv6, when
+		// the search by value finds nothing, ScrapeLock's own rules (note "ScrapeLock") are searched as well.
+		$target   = false !== strpos( $value, '/' ) ? 'ip_range' : ( false !== strpos( $value, ':' ) ? 'ip6' : 'ip' );
+		$searches = array( array( 'configuration.value' => $value ) );
+		if ( false !== strpos( $value, ':' ) ) {
+			$searches[] = array( 'notes' => 'ScrapeLock' );
+		}
+		foreach ( $searches as $search ) {
+			$found = self::cloudflare_search( $c, $target, $search, $want, $calls, $out );
+			if ( 'ok' !== $out['status'] || $found ) {
+				return $out;
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * One search of cloudflare_find(): up to three pages. Fills $out with the rule found (ScrapeLock's first).
+	 *
+	 * @param array{provider:string, zone:string, token:string}          $c      Configuration.
+	 * @param string                                                     $target ip | ip6 | ip_range.
+	 * @param array<string, string>                                      $search Search arguments.
+	 * @param string                                                     $want   The value, in the spelling of same_value().
+	 * @param int                                                        $calls  API calls made so far (updated).
+	 * @param array{status:string, id:string, ours:bool, message:string} $out    The result (updated).
+	 * @return bool Whether a rule for the value was found.
+	 */
+	private static function cloudflare_search( $c, $target, $search, $want, &$calls, &$out ) {
+		$filter = true;
+		for ( $page = 1; $page <= 3; $page++ ) {
+			++$calls;
+			$args = array_merge(
+				$filter ? array( 'configuration.target' => $target ) : array(),
+				$search,
+				array(
+					'per_page' => 50,
+					'page'     => $page,
+				)
+			);
+			$res  = self::request( $c, 'GET', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/firewall/access_rules/rules?' . http_build_query( $args ) );
+			if ( 'refused' === $res['status'] && 400 === $res['code'] && 1 === $page && 'ip6' === $target && $filter ) {
+				// 3.4.2: Cloudflare's API description lists only ip, ip_range, asn and country for this search
+				// filter. Should it refuse ip6, the same search runs without the filter (the value is compared
+				// below anyway).
+				$filter = false;
+				unset( $args['configuration.target'] );
+				++$calls;
+				$res = self::request( $c, 'GET', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/firewall/access_rules/rules?' . http_build_query( $args ) );
+			}
+			if ( 'ok' !== $res['status'] ) {
+				$out['status']  = $res['status'];
+				$out['message'] = $res['message'];
+				return false;
+			}
+			$rules = isset( $res['json']['result'] ) && is_array( $res['json']['result'] ) ? $res['json']['result'] : array();
+			foreach ( $rules as $rule ) {
+				if ( ! is_array( $rule ) || ! isset( $rule['configuration']['value'], $rule['id'] ) || self::same_value( (string) $rule['configuration']['value'] ) !== $want ) {
+					continue;
+				}
+				$id   = (string) $rule['id'];
+				$ours = isset( $rule['notes'] ) && 0 === strpos( (string) $rule['notes'], 'ScrapeLock' ) && ( ! isset( $rule['mode'] ) || 'block' === $rule['mode'] );
+				if ( '' === $out['id'] || $ours ) {
+					$out['id']   = $id;
+					$out['ours'] = $ours;
+				}
+				if ( $ours ) {
+					return true;
+				}
+			}
+			// 3.4.2: without result_info (or without total_pages in it), a full page means there may be another.
+			$pages = isset( $res['json']['result_info']['total_pages'] ) && is_numeric( $res['json']['result_info']['total_pages'] ) ? (int) $res['json']['result_info']['total_pages'] : ( count( $rules ) >= 50 ? $page + 1 : $page );
+			if ( '' !== $out['id'] || $page >= $pages || count( $rules ) < 50 ) {
+				break;
+			}
+		}
+		return '' !== $out['id'];
+	}
+
+	/**
+	 * 3.4.1: the value sent to Cloudflare for a ban key. Cloudflare accepts IPv6 ranges of /32, /48 and /64 only:
+	 * a ban of a /49 to /63 (filter pncp_ipv6_prefix) is blocked as its /48, one of a /65 to /127 as its /64.
+	 *
+	 * @param string $key Ban key.
+	 * @return string
+	 */
+	private static function cloudflare_value( $key ) {
+		if ( ! preg_match( '#^([0-9a-f:]+)/(\d{1,3})$#i', $key, $m ) ) {
+			return $key;
+		}
+		$bits = (int) $m[2];
+		if ( in_array( $bits, array( 32, 48, 64 ), true ) ) {
+			return $key;
+		}
+		$to = $bits < 48 ? 32 : ( $bits < 64 ? 48 : 64 );
+		return PNCP_Ip::limit_key( $m[1], $to );
+	}
+
+	/**
+	 * One spelling of an address or range for comparing (IPv6 upper or lower case, long or short).
+	 *
+	 * @param string $value Address or range.
+	 * @return string
+	 */
+	private static function same_value( $value ) {
+		$value = strtolower( trim( (string) $value ) );
+		$bits  = '';
+		if ( false !== strpos( $value, '/' ) ) {
+			list( $value, $bits ) = explode( '/', $value, 2 );
+			$bits                 = '/' . $bits;
+		}
+		$bin = @inet_pton( $value ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Invalid value = false.
+		return ( false === $bin ? $value : (string) inet_ntop( $bin ) ) . $bits;
+	}
+
+	/**
+	 * The addresses in the Bunny pull zone's block list.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c Configuration.
+	 * @return array{status:string, list:string[]|null, message:string}
+	 */
+	private static function bunny_blocked( $c ) {
+		$res  = self::request( $c, 'GET', self::BUNNY_API . '/pullzone/' . rawurlencode( $c['zone'] ) );
+		$list = null;
+		if ( 'ok' === $res['status'] ) {
+			$list = array();
+			if ( isset( $res['json']['BlockedIps'] ) && is_array( $res['json']['BlockedIps'] ) ) {
+				foreach ( $res['json']['BlockedIps'] as $ip ) {
+					$list[] = (string) $ip;
+				}
+			}
+		}
+		return array(
+			'status'  => $res['status'],
+			'list'    => $list,
+			'message' => $res['message'],
+		);
+	}
+
+	/**
+	 * Checks the configuration: the token, its permissions and the zone (3.4.2: every step of diagnose(), with a
+	 * test block, so a token that can only read is refused when the settings are saved).
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c Configuration.
+	 * @return string Empty if it works, otherwise what went wrong and what to do.
+	 */
+	public static function test( $c ) {
+		return self::diagnosis_error( self::diagnose( $c ) );
+	}
+
+	/**
+	 * Tests the whole path with an address that belongs to nobody (203.0.113.0/24, reserved for
+	 * documentation): blocks it at the CDN, checks that the CDN lists it, removes it and checks that it is
+	 * gone. No setting changes and no visitor is affected.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c Configuration.
+	 * @return array{ok:bool, message:string}
+	 */
+	public static function test_block( $c ) {
+		$fail = static function ( $step, $message ) {
+			return array(
+				'ok'      => false,
+				/* translators: 1: the step that failed, 2: what the CDN answered */
+				'message' => sprintf( __( '%1$s failed: %2$s', 'scrapelock' ), $step, $message ),
+			);
+		};
+		if ( ! self::usable( $c ) ) {
+			return $fail( __( 'Connection', 'scrapelock' ), __( 'Fill in the zone ID and the token.', 'scrapelock' ) );
+		}
+		$ip     = '203.0.113.' . wp_rand( 200, 254 );
+		$ban    = array(
+			'until'  => time() + MINUTE_IN_SECONDS,
+			'reason' => 'test',
+		);
+		$before = self::listed( $c, $ip );
+		if ( is_string( $before ) ) {
+			return $fail( __( 'Connection', 'scrapelock' ), $before );
+		}
+		if ( true === $before ) {
+			return $fail( __( 'Connection', 'scrapelock' ), __( 'The test address is already blocked at the CDN; try again.', 'scrapelock' ) );
+		}
+		$add = self::add( $c, $ip, $ban );
+		if ( 'ok' !== $add['status'] ) {
+			return $fail( __( 'Adding the test block', 'scrapelock' ), $add['message'] );
+		}
+		$rule   = array(
+			'id'  => $add['id'],
+			'own' => true,
+		);
+		$listed = self::listed( $c, $ip );
+		$calls  = 0;
+		$remove = self::remove( $c, $ip, $rule, $calls );
+		if ( true !== $listed ) {
+			return $fail( __( 'Finding the test block at the CDN', 'scrapelock' ), is_string( $listed ) ? $listed : __( 'The CDN accepted the block but does not list it.', 'scrapelock' ) );
+		}
+		// 3.4.2: a test block that could not be removed goes to the removal queue, like the blocks of an earlier
+		// configuration: the next runs remove it (and list it on the settings page, to remove by hand, if the
+		// CDN keeps refusing). It was left at the CDN for good before.
+		$later = static function () use ( $c, $ip, $rule ) {
+			self::queue_add( $c, array( $ip => $rule ) );
+			self::soon();
+			/* translators: %s: test IP address */
+			return sprintf( __( 'ScrapeLock will remove %s in its next run, in a few minutes. If the CDN keeps refusing, the address is listed on this page, to remove by hand at the CDN.', 'scrapelock' ), $ip );
+		};
+		if ( 'ok' !== $remove['status'] ) {
+			return $fail( __( 'Removing the test block', 'scrapelock' ), $remove['message'] . ' ' . $later() );
+		}
+		$gone = self::listed( $c, $ip );
+		if ( false !== $gone ) {
+			return $fail( __( 'Removing the test block', 'scrapelock' ), ( is_string( $gone ) ? $gone : __( 'The CDN still lists it.', 'scrapelock' ) ) . ' ' . $later() );
+		}
+		return array(
+			'ok'      => true,
+			/* translators: 1: test IP address, 2: CDN name */
+			'message' => sprintf( __( 'The test address %1$s was blocked at %2$s, found there and removed again. Blocking at the CDN works.', 'scrapelock' ), $ip, self::providers()[ $c['provider'] ] ),
+		);
+	}
+
+	/**
+	 * Does the CDN list a block for this exact address?
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c  Configuration.
+	 * @param string                                            $ip IP.
+	 * @return bool|string True / false, or what went wrong.
+	 */
+	private static function listed( $c, $ip ) {
+		if ( 'bunny' === $c['provider'] ) {
+			$res = self::bunny_blocked( $c );
+			return is_array( $res['list'] ) ? in_array( $ip, $res['list'], true ) : $res['message'];
+		}
+		$calls = 0;
+		$found = self::cloudflare_find( $c, $ip, $calls );
+		return 'ok' === $found['status'] ? '' !== $found['id'] : $found['message'];
+	}
+
+	/**
+	 * The error codes of a Cloudflare answer, with those in each error_chain.
+	 *
+	 * @param array<string, mixed> $json The answer.
+	 * @return int[]
+	 */
+	private static function cf_codes( $json ) {
+		$codes = array();
+		$walk  = static function ( $errors ) use ( &$walk, &$codes ) {
+			foreach ( is_array( $errors ) ? $errors : array() as $error ) {
+				if ( is_array( $error ) ) {
+					if ( isset( $error['code'] ) && is_numeric( $error['code'] ) ) {
+						$codes[] = (int) $error['code'];
+					}
+					if ( isset( $error['error_chain'] ) ) {
+						$walk( $error['error_chain'] );
+					}
+				}
+			}
+		};
+		$walk( isset( $json['errors'] ) ? $json['errors'] : array() );
+		return array_values( array_unique( $codes ) );
+	}
+
+	/**
+	 * 3.4.2: what a Cloudflare error answer says is wrong. Cloudflare answers the same problem with different
+	 * HTTP statuses on different endpoints, so the error codes decide first:
+	 * - token_format: 6003 with 6100–6112 in its error_chain (HTTP 400): not an API token (mistyped, cut off, a
+	 *   Global API Key or another key in the token field).
+	 * - token_missing: 9106, 9107 (HTTP 400): no credentials at all.
+	 * - token_invalid: 1000 "Invalid API Token" (HTTP 401), 9109 "Invalid access token", 9103 (unknown key).
+	 * - permission: 10000 "Authentication error", 9109 "Unauthorized to access requested resource" (HTTP 403):
+	 *   the token is known, but may not do this here.
+	 * - zone: 7003 "Could not route to …, perhaps your object identifier is invalid?" (with 7000), 1001 "Invalid
+	 *   zone identifier", 1003.
+	 *
+	 * @param int                  $code HTTP status.
+	 * @param array<string, mixed> $json The answer.
+	 * @return string The kind, or '' when the codes say nothing about the token or the zone.
+	 */
+	private static function cf_kind( $code, $json ) {
+		$codes = self::cf_codes( $json );
+		$text  = '';
+		foreach ( isset( $json['errors'] ) && is_array( $json['errors'] ) ? $json['errors'] : array() as $error ) {
+			$text .= is_array( $error ) && isset( $error['message'] ) && is_string( $error['message'] ) ? ' ' . strtolower( $error['message'] ) : '';
+		}
+		if ( array_intersect( $codes, array( 9106, 9107 ) ) ) {
+			return 'token_missing';
+		}
+		if ( in_array( 6003, $codes, true ) || array_intersect( $codes, range( 6100, 6112 ) ) ) {
+			return 'token_format';
+		}
+		if ( array_intersect( $codes, array( 1000, 9103 ) ) || ( in_array( 9109, $codes, true ) && false !== strpos( $text, 'invalid' ) ) ) {
+			return 'token_invalid';
+		}
+		if ( array_intersect( $codes, array( 7000, 7003, 1001, 1003 ) ) ) {
+			return 'zone';
+		}
+		if ( array_intersect( $codes, array( 9109, 10000 ) ) ) {
+			return 'permission';
+		}
+		if ( 401 === $code ) {
+			return 'token_invalid';
+		}
+		if ( 403 === $code ) {
+			return 'permission';
+		}
+		return '';
+	}
+
+	/**
+	 * 3.4.2: the message for a refused token or zone, by kind (see cf_kind()).
+	 *
+	 * @param string $kind     Kind.
+	 * @param string $provider Provider.
+	 * @return string
+	 */
+	private static function denied_message( $kind, $provider ) {
+		if ( 'cloudflare' !== $provider ) {
+			return __( 'The CDN refused the token: check that it is correct, that it belongs to this zone and that it has the permission described under “API token”.', 'scrapelock' );
+		}
+		switch ( $kind ) {
+			case 'token_format':
+				return __( 'Cloudflare refused the token: it is not in the format of an API token (mistyped, cut off, or a Global API Key or another key instead of an API token).', 'scrapelock' );
+			case 'token_missing':
+				return __( 'Cloudflare received no API token.', 'scrapelock' );
+			case 'token_invalid':
+				return __( 'Cloudflare does not know this API token: it was deleted, rolled (given a new value) or mistyped. Create a new token and enter it again.', 'scrapelock' );
+			case 'zone':
+				return __( 'Cloudflare does not know this zone ID: copy the Zone ID from the Overview page of the site in the Cloudflare dashboard.', 'scrapelock' );
+			default:
+				return __( 'Cloudflare refused the request: the token is not allowed to do this for this zone. It needs the permission Zone → Firewall Services → Edit, with this zone under “Zone Resources”.', 'scrapelock' );
+		}
+	}
+
+	/**
+	 * 3.4.2: what the last answer of this request said besides its body: Cloudflare's Ray ID, the rate-limit
+	 * headers, the time it took and the kind of error. Used by the connection check (diagnose()).
+	 *
+	 * @var array<string, mixed>
+	 */
+	private static $last = array();
+
+	/**
+	 * A response header as one string (a header sent twice comes back as an array).
+	 *
+	 * @param array<string, mixed>|WP_Error $response Response.
+	 * @param string                        $name     Header.
+	 * @return string
+	 */
+	private static function header( $response, $name ) {
+		$value = wp_remote_retrieve_header( $response, $name );
+		if ( is_array( $value ) ) {
+			$value = (string) reset( $value );
+		}
+		return trim( (string) $value );
+	}
+
+	/**
+	 * 3.4.2: why the CDN could not be reached, in words an owner (or their host) can act on.
+	 *
+	 * @param WP_Error $error The error of the HTTP request.
+	 * @param string   $token The token, never part of the message.
+	 * @return string
+	 */
+	private static function network_message( $error, $token = '' ) {
+		// 3.4.3: the token is taken out before the text is cut to 200 characters; cut first, a token across the cut
+		// was no longer found whole and its first part was saved and shown.
+		$text = self::redact( (string) $error->get_error_message(), $token );
+		$hint = '';
+		if ( 'http_request_not_executed' === $error->get_error_code() ) {
+			$hint = __( 'WordPress blocks requests to other sites on this server (WP_HTTP_BLOCK_EXTERNAL in wp-config.php): add the CDN\'s API host (api.cloudflare.com or api.bunny.net) to WP_ACCESSIBLE_HOSTS.', 'scrapelock' );
+		} elseif ( preg_match( '/cURL error 28\b|timed out|timeout/i', $text ) ) {
+			$hint = __( 'It did not answer within 10 seconds; it will try again in a few minutes.', 'scrapelock' );
+		} elseif ( preg_match( '/cURL error 6\b|resolve host|getaddrinfo/i', $text ) ) {
+			$hint = __( 'The server could not look up the CDN\'s address (DNS). Ask your host to check the server\'s DNS.', 'scrapelock' );
+		} elseif ( preg_match( '/cURL error 7\b|failed to connect|connection refused|could not connect/i', $text ) ) {
+			$hint = __( 'The server could not open a connection to the CDN: the host\'s firewall may block outgoing connections. Ask your host to allow HTTPS to the CDN\'s API.', 'scrapelock' );
+		} elseif ( preg_match( '/cURL error (35|51|58|60|77)\b|ssl|certificate/i', $text ) ) {
+			$hint = __( 'The secure connection failed: the server\'s certificate store or OpenSSL may be out of date. Ask your host.', 'scrapelock' );
+		}
+		/* translators: %s: error message */
+		$message = sprintf( __( 'The CDN could not be reached: %s', 'scrapelock' ), substr( sanitize_text_field( $text ), 0, 200 ) );
+		return '' !== $hint ? $message . ' ' . $hint : $message;
+	}
+
+	/**
+	 * Replaces the token in a text from the CDN or the HTTP layer with "[token]".
+	 *
+	 * @param string $text  Text.
+	 * @param string $token Token.
+	 * @return string
+	 */
+	private static function redact( $text, $token ) {
+		$text  = (string) $text;
+		$token = (string) $token;
+		return strlen( $token ) >= 8 ? str_replace( $token, '[token]', $text ) : $text;
+	}
+
+	/**
+	 * One request to the CDN's API, with the site owner's token.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c      Configuration.
+	 * @param string                                            $method Method.
+	 * @param string                                            $url    URL.
+	 * @param array<string, mixed>|object|null                  $body   JSON body.
+	 * @return array{status:string, code:int, json:array<string, mixed>, message:string, kind:string}
+	 */
+	private static function request( $c, $method, $url, $body = null ) {
+		self::$retry_after = 0;
+		self::$last        = array(
+			'ray'  => '',
+			'kind' => '',
+			'ms'   => 0,
+		);
+		// 3.4.1: at most CALL_BUDGET calls in 5 minutes, whatever starts them (runs, deactivation, the tests).
+		$now    = time();
+		$window = get_option( self::CALLS, array() );
+		$window = is_array( $window ) && isset( $window[0], $window[1] ) && (int) $window[0] > $now - 5 * MINUTE_IN_SECONDS && (int) $window[0] <= $now ? array( (int) $window[0], (int) $window[1] ) : array( $now, 0 );
+		/**
+		 * Filters the most API calls ScrapeLock makes to the CDN in 5 minutes (300 by default; Cloudflare allows
+		 * 1200 for the whole account).
+		 *
+		 * @param int $budget Calls.
+		 */
+		$budget = max( 30, (int) apply_filters( 'pncp_edge_call_budget', self::CALL_BUDGET ) );
+		if ( ! self::$removing_all && $window[1] >= $budget ) {
+			self::$retry_after  = $window[0] + 5 * MINUTE_IN_SECONDS - $now;
+			self::$last['kind'] = 'budget';
+			return array(
+				'status'  => 'wait',
+				'code'    => 0,
+				'json'    => array(),
+				'message' => __( 'ScrapeLock made many calls to the CDN in the last 5 minutes; it will continue in a few minutes.', 'scrapelock' ),
+				'kind'    => 'budget',
+			);
+		}
+		if ( ! self::$removing_all ) {
+			++$window[1];
+			update_option( self::CALLS, $window, false );
+		}
+		$headers = array(
+			'Accept'       => 'application/json',
+			'Content-Type' => 'application/json',
+		);
+		if ( 'cloudflare' === $c['provider'] ) {
+			$headers['Authorization'] = 'Bearer ' . $c['token'];
+		} else {
+			$headers['AccessKey'] = $c['token'];
+		}
+		$args = array(
+			'method'      => $method,
+			'timeout'     => self::CALL_TIMEOUT,
+			'redirection' => 0,
+			// PNCP_VERSION is not defined while uninstall.php runs (the plugin itself is not loaded then).
+			'user-agent'  => 'ScrapeLock/' . ( defined( 'PNCP_VERSION' ) ? PNCP_VERSION : '' ),
+			'headers'     => $headers,
+		);
+		if ( null !== $body ) {
+			$args['body'] = (string) wp_json_encode( $body );
+		}
+		$url              = self::api_url( $c['provider'], $url );
+		$start            = microtime( true );
+		$response         = wp_remote_request( $url, $args );
+		self::$last['ms'] = (int) round( ( microtime( true ) - $start ) * 1000 );
+		if ( is_wp_error( $response ) ) {
+			self::$last['kind'] = 'network';
+			return array(
+				'status'  => 'error',
+				'code'    => 0,
+				'json'    => array(),
+				'message' => self::redact( self::network_message( $response, $c['token'] ), $c['token'] ),
+				'kind'    => 'network',
+			);
+		}
+		$code               = (int) wp_remote_retrieve_response_code( $response );
+		self::$last['ray']  = substr( sanitize_text_field( self::header( $response, 'cf-ray' ) ), 0, 40 );
+		self::$last['rate'] = self::header( $response, 'ratelimit' );
+		self::$last['pol']  = self::header( $response, 'ratelimit-policy' );
+		$retry              = self::header( $response, 'retry-after' );
+		if ( '' !== $retry ) {
+			$retry             = ctype_digit( $retry ) ? (int) $retry : (int) strtotime( $retry ) - time();
+			self::$retry_after = max( 0, min( DAY_IN_SECONDS, $retry ) );
+		}
+		$raw  = (string) wp_remote_retrieve_body( $response );
+		$json = json_decode( $raw, true );
+		$json = is_array( $json ) ? $json : array();
+		// 3.4.2: an answer of Cloudflare's API always has "success". Anything else (an HTML error page of the
+		// Cloudflare edge, a page of a proxy or firewall in between, an empty body) is not an answer of the API,
+		// whatever its HTTP status says: it never counts as a refused token or a missing block.
+		$api = 'cloudflare' !== $c['provider'] || array_key_exists( 'success', $json );
+		if ( $code >= 200 && $code < 300 && $api && ( 'cloudflare' !== $c['provider'] || true === $json['success'] ) ) {
+			return array(
+				'status'  => 'ok',
+				'code'    => $code,
+				'json'    => $json,
+				'message' => '',
+				'kind'    => '',
+			);
+		}
+		$detail = '';
+		if ( isset( $json['errors'][0]['message'] ) && is_scalar( $json['errors'][0]['message'] ) ) {
+			$detail = (string) $json['errors'][0]['message']; // Cloudflare.
+			$codes  = self::cf_codes( $json );
+			$detail = $codes ? $detail . ' [' . implode( ', ', array_slice( $codes, 0, 4 ) ) . ']' : $detail;
+		} elseif ( isset( $json['Message'] ) && is_scalar( $json['Message'] ) ) {
+			$detail = (string) $json['Message']; // Bunny.
+		}
+		// Never the token, even if an answer quoted it back: the message is saved (last error) and shown.
+		$detail = substr( sanitize_text_field( self::redact( $detail, $c['token'] ) ), 0, 200 );
+		$kind   = '';
+		if ( 429 === $code ) {
+			$status  = 'wait';
+			$kind    = 'rate';
+			$message = __( 'The CDN asked to slow down; it will continue in a few minutes.', 'scrapelock' );
+		} elseif ( ! $api ) {
+			$status = 'error';
+			$kind   = 'not_api';
+			$html   = false !== stripos( self::header( $response, 'content-type' ), 'html' ) || false !== stripos( substr( $raw, 0, 500 ), '<html' ) || false !== stripos( substr( $raw, 0, 500 ), '<!doctype' );
+			if ( 403 === $code && $html ) {
+				/* translators: %d: HTTP status code */
+				$message = sprintf( __( 'Cloudflare answered with a web page that refuses access (HTTP %d) instead of an API answer: Cloudflare\'s own protection may be blocking this server\'s address. It will try again in a few minutes; if this keeps happening, ask your host or Cloudflare support.', 'scrapelock' ), $code );
+			} elseif ( $code >= 500 || 0 === $code ) {
+				/* translators: %d: HTTP status code */
+				$message = sprintf( __( 'The CDN answered with an error (HTTP %d, an error page instead of an API answer); it will try again in a few minutes.', 'scrapelock' ), $code );
+			} else {
+				/* translators: %d: HTTP status code */
+				$message = sprintf( __( 'The CDN\'s API did not answer as expected (HTTP %d, not an API answer): a proxy or firewall between this server and the CDN may have answered instead. It will try again in a few minutes.', 'scrapelock' ), $code );
+			}
+		} elseif ( 'cloudflare' === $c['provider'] && $code >= 400 && $code < 500 && '' !== self::cf_kind( $code, $json ) ) {
+			$status  = 'denied';
+			$kind    = self::cf_kind( $code, $json );
+			$message = self::denied_message( $kind, $c['provider'] );
+		} elseif ( 401 === $code || 403 === $code ) {
+			$status  = 'denied';
+			$kind    = 'permission';
+			$message = self::denied_message( $kind, $c['provider'] );
+		} elseif ( $code >= 500 || 0 === $code ) {
+			$status = 'error';
+			/* translators: %d: HTTP status code */
+			$message = sprintf( __( 'The CDN answered with an error (HTTP %d); it will try again in a few minutes.', 'scrapelock' ), $code );
+		} elseif ( $code >= 200 && $code < 300 ) {
+			// Cloudflare: HTTP 2xx with "success": false.
+			$status = 'error';
+			/* translators: %d: HTTP status code */
+			$message = sprintf( __( 'The CDN answered that the request did not succeed (HTTP %d); it will try again in a few minutes.', 'scrapelock' ), $code );
+		} else {
+			$status = 'refused';
+			/* translators: %d: HTTP status code */
+			$message = sprintf( __( 'The CDN did not accept the request (HTTP %d).', 'scrapelock' ), $code );
+			if ( 404 === $code && 'cloudflare' !== $c['provider'] ) {
+				$message = __( 'The CDN does not know this zone ID.', 'scrapelock' );
+			}
+		}
+		if ( 'denied' === $status && 'cloudflare' === $c['provider'] && preg_match( '/^[0-9a-f]{37}$/i', (string) $c['token'] ) ) {
+			$message .= ' ' . __( 'This looks like a Global API Key: ScrapeLock needs an API token (My Profile > API Tokens), not the Global API Key.', 'scrapelock' );
+		}
+		if ( '' !== self::$last['ray'] ) {
+			$detail .= ( '' !== $detail ? '; ' : '' ) . 'Ray ID ' . self::$last['ray'];
+		}
+		self::$last['kind'] = $kind;
+		return array(
+			'status'  => $status,
+			'code'    => $code,
+			'json'    => $json,
+			'message' => '' !== $detail ? $message . ' (' . $detail . ')' : $message,
+			'kind'    => $kind,
+		);
+	}
+
+	/**
+	 * 3.9: the address of an API call, with the base address from the filter `pncp_edge_api_base` (for a test
+	 * server or a proxy in front of the CDN's API; an https or http address without a trailing slash). The token
+	 * is sent to that address, so only code on this site (a plugin, an mu-plugin) can change it.
+	 *
+	 * @param string $provider cloudflare | bunny.
+	 * @param string $url      Address built on CLOUDFLARE_API or BUNNY_API.
+	 * @return string
+	 */
+	private static function api_url( $provider, $url ) {
+		$def = 'cloudflare' === $provider ? self::CLOUDFLARE_API : self::BUNNY_API;
+		if ( 0 !== strpos( $url, $def ) ) {
+			return $url;
+		}
+		/**
+		 * Filters the base address of the CDN's API used by "Blocking at the CDN".
+		 *
+		 * @since 3.9.0
+		 *
+		 * @param string $base     https://api.cloudflare.com/client/v4 or https://api.bunny.net.
+		 * @param string $provider cloudflare | bunny.
+		 */
+		$base = untrailingslashit( (string) apply_filters( 'pncp_edge_api_base', $def, $provider ) );
+		if ( '' === $base || ! preg_match( '#^https?://[^\s/?\#]+(/[^\s?\#]*)?$#i', $base ) ) {
+			$base = $def;
+		}
+		return $base . substr( $url, strlen( $def ) );
+	}
+
+	/* ---------- Purge (3.12.6) ---------- */
+
+	/**
+	 * 3.12.6: the hosts of this site (home and WordPress addresses), lowercase.
+	 *
+	 * @return string[]
+	 */
+	public static function site_hosts() {
+		$hosts = array();
+		foreach ( array( home_url( '/' ), site_url( '/' ) ) as $url ) {
+			$host = strtolower( (string) wp_parse_url( $url, PHP_URL_HOST ) );
+			if ( '' !== $host ) {
+				$hosts[] = $host;
+			}
+		}
+		return array_values( array_unique( $hosts ) );
+	}
+
+	/**
+	 * 3.12.6: an address of this site to purge: a full http(s) address on one of its hosts, or a path ("/x.txt",
+	 * on the home address). '' when it is not this site's (another host, credentials in it, not http(s)).
+	 *
+	 * 3.12.8: a path is a path of the home address, also where WordPress is in a folder (home https://host/blog:
+	 * "/about/" is https://host/blog/about/; before, https://host/about/). A path that already starts with that
+	 * folder is taken as it is, and so are the files that live at the root of the host: the verification files
+	 * of PNCP_Verify_Files and everything under /.well-known/.
+	 *
+	 * @param string $url Address or path.
+	 * @return string The full address, or ''.
+	 */
+	public static function own_url( $url ) {
+		$url = trim( (string) $url );
+		if ( '' === $url || strlen( $url ) > 2048 || preg_match( '/[\x00-\x20\x7f]/', $url ) ) {
+			return '';
+		}
+		if ( '/' === $url[0] && ( ! isset( $url[1] ) || '/' !== $url[1] ) ) {
+			$home = wp_parse_url( home_url( '/' ) );
+			if ( ! is_array( $home ) || empty( $home['host'] ) ) {
+				return '';
+			}
+			$folder = isset( $home['path'] ) ? untrailingslashit( (string) $home['path'] ) : '';
+			$path   = explode( '?', $url, 2 )[0];
+			if ( '' !== $folder && 0 !== strpos( $path . '/', $folder . '/' ) && ! self::root_path( $path ) ) {
+				$url = $folder . $url;
+			}
+			$url = ( isset( $home['scheme'] ) ? $home['scheme'] : 'https' ) . '://' . $home['host'] . ( isset( $home['port'] ) ? ':' . $home['port'] : '' ) . $url;
+		}
+		$parts = wp_parse_url( $url );
+		if ( ! is_array( $parts ) || empty( $parts['host'] ) || ! isset( $parts['scheme'] ) || ! in_array( strtolower( $parts['scheme'] ), array( 'http', 'https' ), true )
+			|| isset( $parts['user'] ) || isset( $parts['pass'] ) || isset( $parts['fragment'] ) ) {
+			return '';
+		}
+		return in_array( strtolower( $parts['host'] ), self::site_hosts(), true ) ? $url : '';
+	}
+
+	/**
+	 * 3.12.8: a path that is served at the root of the host even when WordPress is in a folder: a verification
+	 * file (PNCP_Verify_Files) or an address under /.well-known/.
+	 *
+	 * @param string $path Path, from "/".
+	 * @return bool
+	 */
+	private static function root_path( $path ) {
+		if ( 0 === strpos( $path, '/.well-known/' ) ) {
+			return true;
+		}
+		return class_exists( 'PNCP_Verify_Files' ) && isset( PNCP_Verify_Files::all()[ $path ] );
+	}
+
+	/**
+	 * 3.12.6: is a Cloudflare zone connected ("Blocking at the CDN" set to Cloudflare, with zone ID and token)?
+	 *
+	 * @return bool
+	 */
+	public static function cloudflare_connected() {
+		$c = self::config();
+		return 'cloudflare' === $c['provider'] && self::usable( $c );
+	}
+
+	/**
+	 * 3.12.6: purges addresses from Cloudflare's cache (purge_cache with files, 30 per call), with the stored
+	 * token. Rate limits and refusals as request() reports them; the token is never in the answer.
+	 *
+	 * @param string[] $urls Addresses of this site.
+	 * @return array{status:string, done:int, message:string}
+	 */
+	public static function purge_urls( $urls ) {
+		$c = self::config();
+		if ( ! self::cloudflare_connected() ) {
+			return array(
+				'status'  => 'none',
+				'done'    => 0,
+				'message' => __( 'No Cloudflare connection is set.', 'scrapelock' ),
+			);
+		}
+		$done = 0;
+		foreach ( array_chunk( array_values( array_unique( array_map( 'strval', (array) $urls ) ) ), 30 ) as $chunk ) {
+			$r = self::request( $c, 'POST', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/purge_cache', array( 'files' => $chunk ) );
+			if ( 'ok' !== $r['status'] ) {
+				return array(
+					'status'  => $r['status'],
+					'done'    => $done,
+					'message' => $r['message'],
+				);
+			}
+			$done += count( $chunk );
+		}
+		return array(
+			'status'  => 'ok',
+			'done'    => $done,
+			'message' => '',
+		);
+	}
+
+	/**
+	 * 3.12.6: purges everything from the Cloudflare zone's cache (purge_everything).
+	 *
+	 * @return array{status:string, done:int, message:string}
+	 */
+	public static function purge_all() {
+		$c = self::config();
+		if ( ! self::cloudflare_connected() ) {
+			return array(
+				'status'  => 'none',
+				'done'    => 0,
+				'message' => __( 'No Cloudflare connection is set.', 'scrapelock' ),
+			);
+		}
+		$r = self::request( $c, 'POST', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/purge_cache', array( 'purge_everything' => true ) );
+		return array(
+			'status'  => $r['status'],
+			'done'    => 'ok' === $r['status'] ? 1 : 0,
+			'message' => $r['message'],
+		);
+	}
+
+	/**
+	 * 3.12.6: purges at every CDN the plugin has credentials for (Bunny CDN: the pull zone of "Blocking at the CDN"
+	 * or of the Bunny card; Cloudflare: the zone of "Blocking at the CDN"). Only addresses of this site; none
+	 * given with $all false purges nothing.
+	 *
+	 * @param string[] $urls Addresses or paths (own_url()).
+	 * @param bool     $all  Purge everything instead.
+	 * @return array{rows:array<string, array{status:string, done:int, message:string}>, refused:string[]} rows:
+	 *         provider name => result; refused: the addresses that are not this site's (nothing was purged then).
+	 */
+	public static function cdn_purge( $urls, $all = false ) {
+		$out  = array(
+			'rows'    => array(),
+			'refused' => array(),
+		);
+		$good = array();
+		if ( ! $all ) {
+			foreach ( (array) $urls as $url ) {
+				$own = self::own_url( (string) $url );
+				if ( '' === $own ) {
+					$out['refused'][] = (string) $url;
+				} else {
+					$good[] = $own;
+				}
+			}
+			if ( $out['refused'] || ! $good ) {
+				return $out;
+			}
+		}
+		if ( null !== PNCP_Bunny::credentials() ) {
+			$out['rows']['Bunny CDN'] = $all ? PNCP_Bunny::purge_all() : PNCP_Bunny::purge_urls( $good );
+		}
+		if ( self::cloudflare_connected() ) {
+			$out['rows']['Cloudflare'] = $all ? self::purge_all() : self::purge_urls( $good );
+		}
+		return $out;
+	}
+
+	/* ---------- Connection check ---------- */
+
+	/**
+	 * 3.4.2: the most IP Access rules a Cloudflare account may hold: 50,000 on every plan, as Cloudflare documents
+	 * it (developers.cloudflare.com/waf/tools/ip-access-rules/, "Availability"); Enterprise accounts can buy more.
+	 * Filter `pncp_edge_rule_limit`.
+	 *
+	 * @return int
+	 */
+	public static function rule_limit() {
+		return max( 1, (int) apply_filters( 'pncp_edge_rule_limit', 50000 ) );
+	}
+
+	/**
+	 * 3.4.2: the rate-limit headroom Cloudflare reported in its last answer (headers Ratelimit and
+	 * Ratelimit-Policy): calls left, the limit and the window in seconds; null when it did not say.
+	 *
+	 * @return array{left:int, limit:int, window:int, reset:int}|null
+	 */
+	private static function last_rate() {
+		$rate = isset( self::$last['rate'] ) ? (string) self::$last['rate'] : '';
+		$pol  = isset( self::$last['pol'] ) ? (string) self::$last['pol'] : '';
+		if ( ! preg_match( '/\br=(\d+)/', $rate, $r ) ) {
+			return null;
+		}
+		$t = preg_match( '/\bt=(\d+)/', $rate, $m ) ? (int) $m[1] : 0;
+		$q = preg_match( '/\bq=(\d+)/', $pol, $m ) ? (int) $m[1] : 1200;
+		$w = preg_match( '/\bw=(\d+)/', $pol, $m ) ? (int) $m[1] : 300;
+		return array(
+			'left'   => (int) $r[1],
+			'limit'  => $q,
+			'window' => $w,
+			'reset'  => $t,
+		);
+	}
+
+	/**
+	 * 3.4.2: checks the connection to the CDN step by step, so the owner sees in one click what works and what
+	 * to change: Cloudflare is reachable, the token is valid and active (and when it expires), the zone exists,
+	 * is active and which plan it has, the token may read and edit the IP Access rules (a test block at
+	 * 203.0.113.x is added, found and removed again), and how much of the API rate limit is left. Stops at the
+	 * first step that makes the following ones pointless. Nothing is saved; no setting changes.
+	 *
+	 * @param array{provider:string, zone:string, token:string} $c Configuration.
+	 * @return array{ok:bool, provider:string, zone:string, time:int, checks:array<int, array{id:string, status:string, label:string, detail:string, fix:string}>, facts:array<string, string>}
+	 */
+	public static function diagnose( $c ) {
+		$out                          = array(
+			'ok'       => false,
+			'provider' => isset( $c['provider'] ) ? (string) $c['provider'] : '',
+			'zone'     => isset( $c['zone'] ) ? (string) $c['zone'] : '',
+			'time'     => time(),
+			'checks'   => array(),
+			'facts'    => array(),
+		);
+		$labels                       = self::check_labels( $out['provider'] );
+		$add                          = static function ( $id, $status, $detail, $fix = '' ) use ( &$out, $labels ) {
+			$out['checks'][] = array(
+				'id'     => $id,
+				'status' => $status,
+				'label'  => isset( $labels[ $id ] ) ? $labels[ $id ] : $id,
+				'detail' => (string) $detail,
+				'fix'    => (string) $fix,
+			);
+		};
+		$finish                       = static function () use ( &$out, $labels, $add ) {
+			$done = array_column( $out['checks'], 'id' );
+			foreach ( array_keys( $labels ) as $id ) {
+				if ( ! in_array( $id, $done, true ) ) {
+					$add( $id, 'skip', __( 'Not checked: an earlier step failed.', 'scrapelock' ) );
+				}
+			}
+			$out['ok'] = ! in_array( 'fail', array_column( $out['checks'], 'status' ), true );
+			return $out;
+		};
+		$out['facts']['token_source'] = self::token_from_config() && isset( $c['token'] ) && self::is_config_token( (string) $c['token'] ) ? 'wp-config.php' : 'settings';
+		$out['facts']['token_length'] = (string) strlen( isset( $c['token'] ) ? (string) $c['token'] : '' );
+		if ( ! self::usable( $c ) ) {
+			$add( 'setup', 'fail', __( 'Fill in the zone ID and the token.', 'scrapelock' ) );
+			return $finish();
+		}
+		if ( 'bunny' === $c['provider'] ) {
+			$res = self::request( $c, 'GET', self::BUNNY_API . '/pullzone/' . rawurlencode( $c['zone'] ) );
+			if ( 'ok' !== $res['status'] ) {
+				$add( 'zone', 'fail', $res['message'], 'denied' === $res['status'] ? __( 'Use the API key from Account settings → API in the bunny.net dashboard, and the ID of the pull zone that serves this site.', 'scrapelock' ) : '' );
+				return $finish();
+			}
+			$name = isset( $res['json']['Name'] ) && is_scalar( $res['json']['Name'] ) ? sanitize_text_field( (string) $res['json']['Name'] ) : '';
+			/* translators: %s: pull zone name */
+			$add( 'zone', 'ok', '' !== $name ? sprintf( __( 'Pull zone “%s” found.', 'scrapelock' ), $name ) : __( 'Pull zone found.', 'scrapelock' ) );
+			$block = self::test_block( $c );
+			$add( 'edit', $block['ok'] ? 'ok' : 'fail', $block['message'] );
+			return $finish();
+		}
+		if ( preg_match( '/^[0-9a-f]{37}$/i', $c['token'] ) ) {
+			$add( 'token', 'fail', __( 'This looks like a Global API Key (37 characters), not an API token.', 'scrapelock' ), __( 'In the Cloudflare dashboard: My Profile → API Tokens → Create Token → Custom token, with the permission Zone → Firewall Services → Edit for this zone. Enter that token instead.', 'scrapelock' ) );
+			return $finish();
+		}
+		$fix_token = __( 'In the Cloudflare dashboard: My Profile → API Tokens (or Manage Account → Account API Tokens) → Create Token → Custom token, with the permission Zone → Firewall Services → Edit and this zone under “Zone Resources”. Enter the new token here.', 'scrapelock' );
+		$fix_perm  = __( 'Edit the token in the Cloudflare dashboard (My Profile → API Tokens): add the permission Zone → Firewall Services → Edit, and this zone (or “All zones”) under “Zone Resources”.', 'scrapelock' );
+		$rays      = array();
+
+		// 1. Cloudflare reachable, token valid (the verify call needs no permission).
+		$verify                     = self::request( $c, 'GET', self::CLOUDFLARE_API . '/user/tokens/verify' );
+		$rays[]                     = self::$last['ray'];
+		$out['facts']['latency_ms'] = (string) self::$last['ms'];
+		if ( in_array( $verify['status'], array( 'error', 'wait' ), true ) ) {
+			$add( 'connection', 'fail', $verify['message'] );
+			$out['facts']['ray'] = implode( ' ', array_filter( $rays ) );
+			return $finish();
+		}
+		/* translators: %d: milliseconds */
+		$add( 'connection', 'ok', sprintf( __( 'api.cloudflare.com answered in %d ms.', 'scrapelock' ), self::$last['ms'] ) );
+		$deferred = false;
+		if ( 'ok' === $verify['status'] ) {
+			$out['facts']['token_owner'] = 'user';
+			if ( ! self::token_status_check( $verify['json'], $add, $out, $fix_token ) ) {
+				return $finish();
+			}
+		} elseif ( 'denied' === $verify['status'] && in_array( $verify['kind'], array( 'token_format', 'token_missing' ), true ) ) {
+			$add( 'token', 'fail', $verify['message'], $fix_token );
+			return $finish();
+		} else {
+			// Not a user token, or not a token at all: an account-owned token is verified at its account, which
+			// the zone tells (below).
+			$deferred = true;
+		}
+
+		// 2. The zone: found, active, plan (any zone permission, Firewall Services included, may read it).
+		$zone   = self::request( $c, 'GET', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) );
+		$rays[] = self::$last['ray'];
+		if ( 'ok' !== $zone['status'] ) {
+			if ( in_array( $zone['status'], array( 'error', 'wait' ), true ) ) {
+				$add( 'zone', 'fail', $zone['message'] );
+			} elseif ( $deferred ) {
+				$add( 'token', 'fail', $verify['message'], $fix_token );
+			} elseif ( 'zone' === $zone['kind'] || 404 === $zone['code'] ) {
+				$add( 'zone', 'fail', self::denied_message( 'zone', 'cloudflare' ), __( 'The Zone ID is on the Overview page of the site in the Cloudflare dashboard (right column, “API”). It is 32 characters; the Account ID next to it is not the zone ID.', 'scrapelock' ) );
+			} else {
+				$add( 'zone', 'fail', __( 'The token is valid, but it has no access to this zone: the zone ID belongs to another account, or this zone is not under “Zone Resources” of the token.', 'scrapelock' ) . ' (' . $zone['message'] . ')', $fix_perm );
+			}
+			$out['facts']['ray'] = implode( ' ', array_filter( $rays ) );
+			return $finish();
+		}
+		$z       = isset( $zone['json']['result'] ) && is_array( $zone['json']['result'] ) ? $zone['json']['result'] : array();
+		$name    = isset( $z['name'] ) && is_scalar( $z['name'] ) ? sanitize_text_field( (string) $z['name'] ) : '';
+		$zstatus = isset( $z['status'] ) && is_scalar( $z['status'] ) ? sanitize_key( (string) $z['status'] ) : '';
+		$paused  = ! empty( $z['paused'] );
+		$plan    = '';
+		if ( isset( $z['plan'] ) && is_array( $z['plan'] ) ) {
+			$plan = isset( $z['plan']['name'] ) && is_scalar( $z['plan']['name'] ) ? (string) $z['plan']['name'] : ( isset( $z['plan']['legacy_id'] ) && is_scalar( $z['plan']['legacy_id'] ) ? (string) $z['plan']['legacy_id'] : '' );
+		}
+		$plan    = sanitize_text_field( $plan );
+		$account = isset( $z['account']['id'] ) && is_scalar( $z['account']['id'] ) && preg_match( '/^[0-9a-f]{32}$/i', (string) $z['account']['id'] ) ? strtolower( (string) $z['account']['id'] ) : '';
+
+		$out['facts']['zone_name']   = $name;
+		$out['facts']['zone_status'] = $zstatus . ( $paused ? ', paused' : '' );
+		$out['facts']['plan']        = $plan;
+		if ( $deferred ) {
+			// The token works for this zone but is not a user token: an account-owned token (Manage Account →
+			// Account API Tokens), verified at its account.
+			$done = false;
+			if ( '' !== $account ) {
+				$averify = self::request( $c, 'GET', self::CLOUDFLARE_API . '/accounts/' . $account . '/tokens/verify' );
+				$rays[]  = self::$last['ray'];
+				if ( 'ok' === $averify['status'] ) {
+					$out['facts']['token_owner'] = 'account';
+					$done                        = true;
+					if ( ! self::token_status_check( $averify['json'], $add, $out, $fix_token ) ) {
+						$out['facts']['ray'] = implode( ' ', array_filter( $rays ) );
+						return $finish();
+					}
+				}
+			}
+			if ( ! $done ) {
+				$add( 'token', 'warn', __( 'The token works for this zone, but Cloudflare did not confirm that it is active, or when it expires.', 'scrapelock' ) . ' (' . $verify['message'] . ')' );
+			}
+		}
+		$shown = '' !== $name ? $name : $c['zone'];
+		if ( 'active' === $zstatus && ! $paused ) {
+			/* translators: 1: domain, 2: plan name */
+			$add( 'zone', 'ok', sprintf( __( '%1$s is active on Cloudflare (plan: %2$s).', 'scrapelock' ), $shown, '' !== $plan ? $plan : __( 'unknown', 'scrapelock' ) ) );
+		} elseif ( $paused ) {
+			/* translators: %s: domain */
+			$add( 'zone', 'warn', sprintf( __( 'Cloudflare is paused for %s: traffic does not go through Cloudflare, so blocks made there have no effect until it is resumed.', 'scrapelock' ), $shown ), __( 'Resume Cloudflare on the Overview page of the site (Advanced actions → Resume Cloudflare on site), or leave blocking at the CDN off.', 'scrapelock' ) );
+		} elseif ( in_array( $zstatus, array( 'pending', 'initializing' ), true ) ) {
+			/* translators: 1: domain, 2: zone status */
+			$add( 'zone', 'warn', sprintf( __( '%1$s is not active on Cloudflare yet (status: %2$s): until the domain uses Cloudflare\'s name servers, blocks made there have no effect.', 'scrapelock' ), $shown, $zstatus ), __( 'Finish the setup of the site in the Cloudflare dashboard (change the name servers at your domain registrar).', 'scrapelock' ) );
+		} elseif ( '' === $zstatus ) {
+			/* translators: %s: domain */
+			$add( 'zone', 'warn', sprintf( __( '%s found, but Cloudflare did not say whether it is active.', 'scrapelock' ), $shown ) );
+		} else {
+			/* translators: 1: domain, 2: zone status */
+			$add( 'zone', 'fail', sprintf( __( '%1$s is not in use on Cloudflare (status: %2$s): blocks made there would have no effect.', 'scrapelock' ), $shown, $zstatus ), __( 'Check the zone ID: it must be the zone that serves this site now.', 'scrapelock' ) );
+			$out['facts']['ray'] = implode( ' ', array_filter( $rays ) );
+			return $finish();
+		}
+
+		// 3. Permission to read the IP Access rules (Zone → Firewall Services: Read or Edit).
+		$list   = self::request( $c, 'GET', self::CLOUDFLARE_API . '/zones/' . rawurlencode( $c['zone'] ) . '/firewall/access_rules/rules?per_page=1' );
+		$rays[] = self::$last['ray'];
+		if ( 'ok' !== $list['status'] ) {
+			$add( 'read', 'fail', $list['message'], 'denied' === $list['status'] ? $fix_perm : '' );
+			$out['facts']['ray'] = implode( ' ', array_filter( $rays ) );
+			return $finish();
+		}
+		$total = isset( $list['json']['result_info']['total_count'] ) && is_numeric( $list['json']['result_info']['total_count'] ) ? (int) $list['json']['result_info']['total_count'] : -1;
+		$add( 'read', 'ok', __( 'The token may read the IP Access rules of this zone.', 'scrapelock' ) );
+		$rate = self::last_rate();
+
+		// 4. Permission to block: a test block, added, found and removed again.
+		$block  = self::test_block( $c );
+		$bkind  = isset( self::$last['kind'] ) ? (string) self::$last['kind'] : '';
+		$rays[] = self::$last['ray'];
+		if ( $block['ok'] ) {
+			$add( 'edit', 'ok', $block['message'] );
+		} else {
+			$add( 'edit', 'fail', $block['message'], in_array( $bkind, array( 'permission', 'token_invalid' ), true ) ? __( 'The token can read but not edit the IP Access rules. Edit the token in the Cloudflare dashboard: change Zone → Firewall Services from Read to Edit.', 'scrapelock' ) : '' );
+		}
+		$rate = self::last_rate() ? self::last_rate() : $rate;
+
+		// 5. Room for ScrapeLock's blocks.
+		$max = self::max();
+		if ( $total >= 0 ) {
+			$out['facts']['access_rules'] = (string) $total;
+			/* translators: 1: number of IP Access rules, 2: most addresses ScrapeLock blocks, 3: Cloudflare's limit */
+			$text = sprintf( __( 'This zone has %1$s IP Access rules. ScrapeLock adds at most %2$s (filter pncp_edge_max); Cloudflare allows %3$s per account, for all its zones together.', 'scrapelock' ), number_format_i18n( $total ), number_format_i18n( $max ), number_format_i18n( self::rule_limit() ) );
+			if ( $total + $max > self::rule_limit() ) {
+				$add( 'room', 'warn', $text, __( 'Remove IP Access rules you no longer need in the Cloudflare dashboard (Security → WAF → Tools), or lower the number ScrapeLock blocks with the filter pncp_edge_max.', 'scrapelock' ) );
+			} else {
+				$add( 'room', 'ok', $text );
+			}
+		} else {
+			$add( 'room', 'warn', __( 'Cloudflare did not say how many IP Access rules this zone has.', 'scrapelock' ) );
+		}
+
+		// 6. API rate limit (shared with the dashboard and every other tool of the account).
+		$window = get_option( self::CALLS, array() );
+		$used   = is_array( $window ) && isset( $window[0], $window[1] ) && (int) $window[0] > time() - 5 * MINUTE_IN_SECONDS ? (int) $window[1] : 0;
+		$budget = max( 30, (int) apply_filters( 'pncp_edge_call_budget', self::CALL_BUDGET ) );
+		/* translators: 1: calls made, 2: most calls */
+		$own = sprintf( __( 'ScrapeLock made %1$d of its %2$d calls in the last 5 minutes.', 'scrapelock' ), $used, $budget );
+		if ( $rate ) {
+			$out['facts']['rate_limit'] = $rate['left'] . '/' . $rate['limit'] . ' per ' . $rate['window'] . 's';
+			/* translators: 1: calls left, 2: limit, 3: seconds */
+			$text = sprintf( __( 'Cloudflare: %1$d of %2$d calls left in the current %3$d-second window.', 'scrapelock' ), $rate['left'], $rate['limit'], $rate['window'] ) . ' ' . $own;
+			if ( $rate['left'] < max( 50, (int) ( $rate['limit'] / 10 ) ) ) {
+				$add( 'rate', 'warn', $text, __( 'Other tools use most of the account\'s API limit. ScrapeLock slows down by itself, but blocks may then reach the CDN later.', 'scrapelock' ) );
+			} else {
+				$add( 'rate', 'ok', $text );
+			}
+		} else {
+			$add( 'rate', 'ok', __( 'Cloudflare did not report the rate limit in its answer; it allows 1,200 calls per 5 minutes per user.', 'scrapelock' ) . ' ' . $own );
+		}
+		$out['facts']['ray'] = implode( ' ', array_filter( $rays ) );
+		return $finish();
+	}
+
+	/**
+	 * The checks of diagnose(), in order, with their names.
+	 *
+	 * @param string $provider Provider.
+	 * @return array<string, string>
+	 */
+	private static function check_labels( $provider ) {
+		if ( 'bunny' === $provider ) {
+			return array(
+				'zone' => __( 'API key and pull zone', 'scrapelock' ),
+				'edit' => __( 'Test block', 'scrapelock' ),
+			);
+		}
+		return array(
+			'connection' => __( 'Connection to Cloudflare', 'scrapelock' ),
+			'token'      => __( 'API token', 'scrapelock' ),
+			'zone'       => __( 'Zone', 'scrapelock' ),
+			'read'       => __( 'Permission to read IP Access rules', 'scrapelock' ),
+			'edit'       => __( 'Permission to block (test block)', 'scrapelock' ),
+			'room'       => __( 'Room for blocks', 'scrapelock' ),
+			'rate'       => __( 'API rate limit', 'scrapelock' ),
+		);
+	}
+
+	/**
+	 * Adds the check of the token's status (active, disabled, expired, not yet valid) from a verify answer.
+	 *
+	 * @param array<string, mixed> $json      The answer of tokens/verify.
+	 * @param callable             $add       Adds a check.
+	 * @param array<string, mixed> $out       The diagnosis (facts updated).
+	 * @param string               $fix_token What to do about a token that does not work.
+	 * @return bool Whether the token may be used.
+	 */
+	private static function token_status_check( $json, $add, &$out, $fix_token ) {
+		$r                             = isset( $json['result'] ) && is_array( $json['result'] ) ? $json['result'] : array();
+		$status                        = isset( $r['status'] ) && is_scalar( $r['status'] ) ? sanitize_key( (string) $r['status'] ) : '';
+		$expires                       = isset( $r['expires_on'] ) && is_scalar( $r['expires_on'] ) ? (int) strtotime( (string) $r['expires_on'] ) : 0;
+		$before                        = isset( $r['not_before'] ) && is_scalar( $r['not_before'] ) ? (int) strtotime( (string) $r['not_before'] ) : 0;
+		$format                        = get_option( 'date_format' );
+		$out['facts']['token_status']  = $status;
+		$out['facts']['token_expires'] = $expires ? gmdate( 'Y-m-d H:i', $expires ) . ' UTC' : 'never';
+		if ( 'disabled' === $status ) {
+			$add( 'token', 'fail', __( 'The token is valid but disabled in Cloudflare.', 'scrapelock' ), __( 'Enable it again in the Cloudflare dashboard (My Profile → API Tokens), or create a new one.', 'scrapelock' ) );
+			return false;
+		}
+		if ( 'expired' === $status || ( $expires && $expires <= time() ) ) {
+			/* translators: %s: date */
+			$add( 'token', 'fail', $expires ? sprintf( __( 'The token expired on %s.', 'scrapelock' ), wp_date( $format, $expires ) ) : __( 'The token has expired.', 'scrapelock' ), $fix_token );
+			return false;
+		}
+		if ( $before && $before > time() ) {
+			/* translators: %s: date */
+			$add( 'token', 'fail', sprintf( __( 'The token is not valid before %s (its “Start date” in Cloudflare).', 'scrapelock' ), wp_date( $format . ' ' . get_option( 'time_format' ), $before ) ), __( 'Wait until then, or change the token\'s TTL in the Cloudflare dashboard.', 'scrapelock' ) );
+			return false;
+		}
+		if ( '' !== $status && 'active' !== $status ) {
+			/* translators: %s: status */
+			$add( 'token', 'fail', sprintf( __( 'Cloudflare says the token is not active (status: %s).', 'scrapelock' ), $status ), $fix_token );
+			return false;
+		}
+		if ( $expires && $expires < time() + 14 * DAY_IN_SECONDS ) {
+			/* translators: %s: date */
+			$add( 'token', 'warn', sprintf( __( 'The token is valid and active, but it expires on %s. After that, blocking at the CDN stops.', 'scrapelock' ), wp_date( $format, $expires ) ), __( 'Extend the token\'s TTL in the Cloudflare dashboard (My Profile → API Tokens → Edit), or create a new token and enter it here.', 'scrapelock' ) );
+			return true;
+		}
+		if ( '' === $status ) {
+			$add( 'token', 'warn', __( 'Cloudflare accepted the token but did not say whether it is active.', 'scrapelock' ) );
+			return true;
+		}
+		$add(
+			'token',
+			'ok',
+			$expires
+				/* translators: %s: date */
+				? sprintf( __( 'The token is valid and active (expires on %s).', 'scrapelock' ), wp_date( $format, $expires ) )
+				: __( 'The token is valid and active (no expiry date).', 'scrapelock' )
+		);
+		return true;
+	}
+
+	/**
+	 * 3.4.2: what went wrong according to a diagnosis: the first problem and what to do, or '' when nothing
+	 * stops blocking at the CDN (warnings do not).
+	 *
+	 * @param array<string, mixed> $diag The result of diagnose().
+	 * @return string
+	 */
+	public static function diagnosis_error( $diag ) {
+		foreach ( isset( $diag['checks'] ) && is_array( $diag['checks'] ) ? $diag['checks'] : array() as $check ) {
+			if ( 'fail' === $check['status'] ) {
+				return trim( $check['label'] . ': ' . $check['detail'] . ( '' !== $check['fix'] ? ' ' . $check['fix'] : '' ) );
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * 3.4.2: the diagnosis as plain text, to copy into a support request. Holds no secret: never the token
+	 * (only where it is set and its length), nothing about visitors.
+	 *
+	 * @param array<string, mixed> $diag The result of diagnose().
+	 * @return string
+	 */
+	public static function diagnosis_text( $diag ) {
+		global $wp_version;
+		$words    = array(
+			'ok'   => __( 'OK', 'scrapelock' ),
+			'warn' => __( 'WARNING', 'scrapelock' ),
+			'fail' => __( 'PROBLEM', 'scrapelock' ),
+			'skip' => __( 'NOT CHECKED', 'scrapelock' ),
+		);
+		$provider = isset( $diag['provider'], self::providers()[ $diag['provider'] ] ) ? self::providers()[ $diag['provider'] ] : '-';
+		$lines    = array(
+			/* translators: 1: plugin version, 2: date and time */
+			sprintf( __( 'ScrapeLock %1$s: CDN connection check, %2$s', 'scrapelock' ), defined( 'PNCP_VERSION' ) ? PNCP_VERSION : '', gmdate( 'Y-m-d H:i', isset( $diag['time'] ) ? (int) $diag['time'] : time() ) . ' UTC' ),
+			'CDN: ' . $provider . ' | Zone ID: ' . ( isset( $diag['zone'] ) ? $diag['zone'] : '' ),
+			'',
+		);
+		foreach ( isset( $diag['checks'] ) && is_array( $diag['checks'] ) ? $diag['checks'] : array() as $check ) {
+			$lines[] = '[' . ( isset( $words[ $check['status'] ] ) ? $words[ $check['status'] ] : $check['status'] ) . '] ' . $check['label'] . ': ' . $check['detail'];
+			if ( '' !== $check['fix'] ) {
+				$lines[] = '    -> ' . $check['fix'];
+			}
+		}
+		$lines[] = '';
+		foreach ( isset( $diag['facts'] ) && is_array( $diag['facts'] ) ? $diag['facts'] : array() as $key => $value ) {
+			if ( '' !== (string) $value ) {
+				$lines[] = $key . ': ' . $value;
+			}
+		}
+		$curl    = function_exists( 'curl_version' ) ? curl_version() : array();
+		$lines[] = 'WordPress ' . $wp_version . ', PHP ' . PHP_VERSION . ( isset( $curl['version'] ) ? ', cURL ' . $curl['version'] . ( isset( $curl['ssl_version'] ) ? ' ' . $curl['ssl_version'] : '' ) : '' );
+		$lines[] = 'WP_HTTP_BLOCK_EXTERNAL: ' . ( defined( 'WP_HTTP_BLOCK_EXTERNAL' ) && WP_HTTP_BLOCK_EXTERNAL ? 'yes' : 'no' ) . ', proxy: ' . ( defined( 'WP_PROXY_HOST' ) ? 'yes' : 'no' );
+		$lines[] = 'Account rule lists: not used by ScrapeLock';
+		$lines[] = 'Send temporary blocks to the CDN: ' . ( self::send_blocks() ? 'on' : 'off' ); // 3.9.
+		$text    = implode( "\n", $lines );
+		// Never a secret, even if an answer quoted it back.
+		$config = self::config();
+		foreach ( array( $config['token'], self::token_from_config() ? (string) SCRAPELOCK_EDGE_TOKEN : '' ) as $secret ) {
+			if ( strlen( $secret ) >= 8 ) {
+				$text = str_replace( $secret, '[token]', $text );
+			}
+		}
+		return $text;
+	}
+
+	/* ---------- 3.9: "Send temporary blocks to the CDN" ---------- */
+
+	/**
+	 * The notices of the switch, for the settings page (PNCP_Admin::upgrade_notices()).
+	 *
+	 * @return array<string, array{0:string, 1:string}>
+	 */
+	public static function notices() {
+		return array(
+			'edge_send_on'  => array( 'success', __( '“Send temporary blocks to the CDN” is on: the IPs ScrapeLock blocks temporarily are also blocked at the CDN from now on (within a minute or two).', 'scrapelock' ) ),
+			'edge_send_off' => array( 'success', __( '“Send temporary blocks to the CDN” is off: no new block is sent. The blocks sent before stay at the CDN until their temporary block ends.', 'scrapelock' ) ),
+			'edge_send_nc'  => array( 'error', __( 'Connect the CDN first (“Save and test the connection”), then turn on sending.', 'scrapelock' ) ),
+			'edge_trust_on' => array( 'success', __( '“Trust Bunny CDN addresses” is on: the real-IP header is now read from requests that come from Bunny CDN edge servers.', 'scrapelock' ) ),
+			'edge_trust_nl' => array( 'warning', __( 'No Bunny address is trusted until its edge server list downloads: use “Refresh now” under “Official IP lists”.', 'scrapelock' ) ),
+		);
+	}
+
+	/**
+	 * Where the switch and its notices send the administrator back to: the "Blocking at the CDN" part of the
+	 * "Bots and limits" tab.
+	 *
+	 * @param string $message Notice code.
+	 */
+	private static function switch_back( $message ) {
+		wp_safe_redirect( self::section_url( array( 'pncp_message' => $message ), in_array( $message, array( 'edge_send_on', 'edge_send_off' ), true ) ? 'pncp-edge-send' : 'pncp-sec-edge' ) );
+		exit;
+	}
+
+	/**
+	 * 3.9: the address of the "Blocking at the CDN (advanced)" part of the "Bots and limits" tab, opened (see
+	 * OPEN_ARG), at an anchor inside it.
+	 *
+	 * @param array<string, string> $args   More query arguments (e.g. pncp_message).
+	 * @param string                $anchor Element id to go to: pncp-sec-edge, pncp-edge-send, pncp-bunny.
+	 * @return string
+	 */
+	public static function section_url( $args = array(), $anchor = 'pncp-sec-edge' ) {
+		return PNCP_Status::settings_url(
+			array_merge(
+				array(
+					'tab'          => 'bots',
+					self::OPEN_ARG => 'edge',
+				),
+				$args
+			)
+		) . '#' . sanitize_html_class( $anchor );
+	}
+
+	/**
+	 * 3.9: a return address (the referer of a form) that opens the "Blocking at the CDN" part again: the
+	 * settings page gets OPEN_ARG and the anchor; any other page in wp-admin only the anchor.
+	 *
+	 * @param string $url    Address.
+	 * @param string $anchor Element id.
+	 * @return string
+	 */
+	public static function reopen( $url, $anchor = 'pncp-sec-edge' ) {
+		$url   = (string) strtok( (string) $url, '#' );
+		$query = array();
+		wp_parse_str( (string) wp_parse_url( $url, PHP_URL_QUERY ), $query );
+		if ( isset( $query['page'] ) && PNCP_Status::SETTINGS_PAGE === $query['page'] ) {
+			$url = add_query_arg(
+				array(
+					'tab'          => 'bots',
+					self::OPEN_ARG => 'edge',
+				),
+				$url
+			);
+		}
+		return $url . '#' . sanitize_html_class( $anchor );
+	}
+
+	/**
+	 * 3.9: whether this page load comes back from an action of the "Blocking at the CDN" part (OPEN_ARG).
+	 *
+	 * @return bool
+	 */
+	public static function section_requested() {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Only decides whether a part is shown open.
+		return isset( $_GET[ self::OPEN_ARG ] ) && 'edge' === sanitize_key( wp_unslash( $_GET[ self::OPEN_ARG ] ) );
+	}
+
+	/**
+	 * The nonce fields of the switch's forms, without the id="_wpnonce" that would repeat on the page.
+	 */
+	private static function switch_nonce() {
+		echo preg_replace( '/ id="_wpnonce"/', '', wp_nonce_field( self::SWITCH_ACTION, '_wpnonce', true, false ), 1 ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Core markup.
+	}
+
+	/**
+	 * The switch, under the connection (only once a connection is saved). Its own small form: turning it on or off
+	 * is always a click of the administrator, never a side effect of saving or testing the connection.
+	 *
+	 * @param array<string, mixed> $s Settings.
+	 */
+	public static function render_send_switch( $s ) {
+		if ( ! self::usable() ) {
+			return;
+		}
+		$on     = self::send_blocks();
+		$cdn    = self::providers()[ self::config()['provider'] ];
+		$locked = PNCP_Lockdown::is_locked();
+		echo '<div class="pncp-edge-send" id="pncp-edge-send">';
+		echo '<h3>' . esc_html__( 'Send temporary blocks to the CDN', 'scrapelock' ) . '</h3>';
+		echo '<p class="pncp-edge-send__state"><strong>' . esc_html( $on ? __( 'On', 'scrapelock' ) : __( 'Off', 'scrapelock' ) ) . ':</strong> ';
+		if ( $on ) {
+			/* translators: %s: CDN name */
+			echo esc_html( sprintf( __( 'the IPs ScrapeLock blocks temporarily are also blocked at %s, and the block there is removed when the temporary block ends.', 'scrapelock' ), $cdn ) );
+		} else {
+			/* translators: %s: CDN name */
+			echo esc_html( sprintf( __( 'the connection to %s is only kept and tested; none of the temporary blocks are sent to it.', 'scrapelock' ), $cdn ) );
+		}
+		echo '</p><ul class="pncp-list-status">';
+		if ( $on && PNCP_Options::monitoring() ) {
+			echo '<li>' . esc_html__( '“Monitor only” is on: nothing is sent to the CDN until ScrapeLock starts blocking.', 'scrapelock' ) . '</li>';
+		} elseif ( $on && empty( $s['enabled'] ) ) {
+			echo '<li>' . esc_html__( 'Protection is off: nothing is sent to the CDN until it is turned on.', 'scrapelock' ) . '</li>';
+		}
+		if ( ! $on && self::count() ) {
+			/* translators: %s: number of addresses */
+			echo '<li>' . esc_html( sprintf( _n( '%s block sent earlier stays at the CDN until its temporary block ends (lifting it on the Log tab removes it there too).', '%s blocks sent earlier stay at the CDN until their temporary block ends (lifting one on the Log tab removes it there too).', self::count(), 'scrapelock' ), number_format_i18n( self::count() ) ) ) . '</li>';
+		}
+		echo '<li>' . esc_html__( 'Not affected by this switch: the Edge Rules you lock in the Bunny CDN card or under “Vulnerable points”, and the rules you made yourself at the CDN. Saving or testing the connection never turns it on.', 'scrapelock' ) . '</li>';
+		echo '</ul>';
+		if ( ! $locked ) {
+			printf( '<form method="post" action="%s" class="pncp-edge-send-form">', esc_url( admin_url( 'admin-post.php' ) ) );
+			printf( '<input type="hidden" name="action" value="%s">', esc_attr( self::SWITCH_ACTION ) );
+			printf( '<input type="hidden" name="op" value="%s">', esc_attr( $on ? 'send_off' : 'send_on' ) );
+			self::switch_nonce();
+			echo '<p>';
+			submit_button( $on ? __( 'Stop sending temporary blocks to the CDN', 'scrapelock' ) : __( 'Send temporary blocks to the CDN', 'scrapelock' ), $on ? 'secondary' : 'primary', 'submit', false, array( 'id' => 'pncp-edge-send-submit' ) );
+			echo '</p></form>';
+		}
+		echo '</div>';
+	}
+
+	/**
+	 * The switch and the upgrade notice (admin-post). Administrators only, with a nonce; not while the site is
+	 * locked with Lockdown (dismissing the notice changes no setting and is allowed).
+	 */
+	public static function handle_switch() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'You are not allowed to change this setting.', 'scrapelock' ), '', array( 'response' => 403 ) );
+		}
+		check_admin_referer( self::SWITCH_ACTION );
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Checked just above.
+		$op = isset( $_POST['op'] ) ? sanitize_key( wp_unslash( $_POST['op'] ) ) : '';
+		if ( 'dismiss' === $op ) {
+			delete_option( self::NOTICE );
+			$back = wp_get_referer();
+			wp_safe_redirect( $back ? $back : admin_url() );
+			exit;
+		}
+		if ( PNCP_Lockdown::is_locked() || ! in_array( $op, array( 'send_on', 'send_off', 'trust_bunny' ), true ) ) {
+			self::switch_back( 'error' );
+		}
+		if ( 'trust_bunny' === $op ) {
+			self::trust_bunny();
+		}
+		$on = 'send_on' === $op;
+		if ( $on && ! self::usable() ) {
+			self::switch_back( 'edge_send_nc' );
+		}
+		update_option( PNCP_OPTION, array_merge( PNCP_Options::stored(), array( 'edge_send_blocks' => $on ? 1 : 0 ) ) );
+		PNCP_Options::flush();
+		delete_option( self::NOTICE ); // The administrator has seen the switch and decided.
+		self::soon();
+		self::switch_back( $on ? 'edge_send_on' : 'edge_send_off' );
+	}
+
+	/**
+	 * Is Bunny CDN in use here: the CDN of "Blocking at the CDN", or the own connection of the Bunny card?
+	 *
+	 * @return bool
+	 */
+	public static function bunny_in_use() {
+		return 'bunny' === self::config()['provider'] || ( class_exists( 'PNCP_Bunny' ) && null !== PNCP_Bunny::credentials() );
+	}
+
+	/**
+	 * 3.9: is the warning of render_trust_warning() due (also opens "Blocking at the CDN", so it is seen)?
+	 *
+	 * @param array<string, mixed> $s Settings.
+	 * @return bool
+	 */
+	public static function trust_warning_due( $s ) {
+		return empty( $s['trust_bunny'] ) && self::bunny_in_use();
+	}
+
+	/**
+	 * 3.9: Bunny CDN is in use but "Trust Bunny CDN addresses" is off (every site installed before 2.6 got it off
+	 * on upgrade, see PNCP_Options::new_in_260()). Then X-Real-IP / X-Forwarded-For from Bunny are not read and
+	 * Bunny's country header is ignored: ScrapeLock may see Bunny's servers instead of the visitors, and limit,
+	 * block and send to the CDN the wrong address. Never turned on silently: a warning with a one-click fix.
+	 *
+	 * @param array<string, mixed> $s Settings.
+	 */
+	public static function render_trust_warning( $s ) {
+		if ( ! self::trust_warning_due( $s ) ) {
+			return;
+		}
+		$remote = PNCP_Ip::remote_addr();
+		$via    = PNCP_Ip::remote_is_bunny();
+		echo '<div class="notice notice-warning inline pncp-edge-trust-warning" id="pncp-edge-trust-warning"><p><strong>' . esc_html__( 'Bunny CDN is in use, but “Trust Bunny CDN addresses” is off.', 'scrapelock' ) . '</strong> ';
+		if ( $via ) {
+			/* translators: %s: IP address */
+			echo esc_html( sprintf( __( 'This page came through a Bunny server (%s), and ScrapeLock does not read the real visitor IP from it: limits, blocks, the attack record and the blocks sent to Bunny would hit Bunny\'s servers instead of the visitors, unless that address is in “Other trusted proxies”.', 'scrapelock' ), $remote ) );
+		} else {
+			esc_html_e( 'If visitors reach this site through Bunny and “Real visitor IP” is X-Real-IP or X-Forwarded-For, the header is not read from Bunny\'s servers: limits, blocks, the attack record and the blocks sent to Bunny would hit Bunny\'s servers instead of the visitors. Bunny\'s country header is ignored too.', 'scrapelock' );
+		}
+		echo '</p><p>';
+		/* translators: 1: IP address ScrapeLock uses, 2: REMOTE_ADDR */
+		echo esc_html( sprintf( __( 'IP ScrapeLock uses for you now: %1$s (REMOTE_ADDR: %2$s).', 'scrapelock' ), PNCP_Ip::client_ip(), $remote ) ) . ' ';
+		esc_html_e( 'Sites installed before version 2.6 got this setting off when they were upgraded; new installs have it on. It is not turned on without you.', 'scrapelock' );
+		echo '</p>';
+		if ( ! PNCP_Lockdown::is_locked() ) {
+			printf( '<form method="post" action="%s">', esc_url( admin_url( 'admin-post.php' ) ) );
+			printf( '<input type="hidden" name="action" value="%s"><input type="hidden" name="op" value="trust_bunny">', esc_attr( self::SWITCH_ACTION ) );
+			self::switch_nonce();
+			echo '<p>';
+			submit_button( __( 'Trust Bunny CDN addresses', 'scrapelock' ), 'primary', 'submit', false, array( 'id' => 'pncp-edge-trust-submit' ) );
+			echo ' <a href="' . esc_url( PNCP_Status::settings_url( array( 'tab' => 'bots' ) ) . '#pncp-sec-ip' ) . '">' . esc_html__( 'Check “Real visitor IP”', 'scrapelock' ) . '</a></p></form>';
+		}
+		echo '</div>';
+	}
+
+	/**
+	 * The one click of render_trust_warning(): "Trust Bunny CDN addresses" on (only that setting), and the list of
+	 * Bunny edge servers downloaded now if it is missing.
+	 */
+	private static function trust_bunny() {
+		update_option( PNCP_OPTION, array_merge( PNCP_Options::stored(), array( 'trust_bunny' => 1 ) ) );
+		PNCP_Options::flush();
+		PNCP_Ip::reset();
+		$listed = (bool) PNCP_Ip::list_of( 'bunny' );
+		if ( ! $listed ) {
+			$result = PNCP_Ip::refresh_lists();
+			$listed = ! empty( $result['bunny'] );
+		}
+		self::switch_back( $listed ? 'edge_trust_on' : 'edge_trust_nl' );
+	}
+
+	/**
+	 * After the upgrade to 3.9, on a site that already sent its blocks to the CDN: the new switch, kept on, once
+	 * for administrators, until one of them dismisses it or uses the switch.
+	 */
+	public static function render_upgrade_notice() {
+		if ( ! current_user_can( 'manage_options' ) || ! get_option( self::NOTICE ) ) {
+			return;
+		}
+		$c   = self::config();
+		$cdn = isset( self::providers()[ $c['provider'] ] ) ? self::providers()[ $c['provider'] ] : __( 'the CDN', 'scrapelock' );
+		echo '<div class="notice notice-info pncp-edge-send-notice"><p><strong>' . esc_html__( 'ScrapeLock: “Send temporary blocks to the CDN” is now a switch of its own.', 'scrapelock' ) . '</strong> ';
+		/* translators: %s: CDN name */
+		echo esc_html( sprintf( __( 'Until now the temporary blocks went to the CDN as soon as a connection was saved. On this site it is on, so nothing changed: blocked IPs are still blocked at %s. New installs start with it off. You can turn it off under “Bots and limits” → “Blocking at the CDN”.', 'scrapelock' ), $cdn ) );
+		echo '</p><p>';
+		printf( '<a class="button button-secondary" href="%s">%s</a> ', esc_url( self::section_url( array(), 'pncp-edge-send' ) ), esc_html__( 'Open the setting', 'scrapelock' ) );
+		printf( '<form method="post" action="%s" style="display:inline">', esc_url( admin_url( 'admin-post.php' ) ) );
+		printf( '<input type="hidden" name="action" value="%s"><input type="hidden" name="op" value="dismiss">', esc_attr( self::SWITCH_ACTION ) );
+		self::switch_nonce();
+		echo '<button type="submit" class="button-link">' . esc_html__( 'Dismiss', 'scrapelock' ) . '</button></form></p></div>';
+	}
+}
